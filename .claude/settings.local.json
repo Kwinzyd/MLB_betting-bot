@@ -4,7 +4,8 @@
       "Read(//c/Users/louis/.gemini/antigravity/scratch/**)",
       "Read(//c/Users/louis/.gemini/**)",
       "Bash(pip install:*)",
-      "Bash(python -m pytest tests/ -v)"
+      "Bash(python -m pytest tests/ -v)",
+      "WebSearch"
     ]
   }
 }

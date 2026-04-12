@@ -1,0 +1,86 @@
+from src.clients.mlb_stats import MLBStatsClient
+from src.data.db import get_db_connection
+from src.utils.time_utils import get_eastern_local_date
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+
+def sync_lineups():
+    """
+    Fetch today's starting lineups and probable pitchers from BDL /lineups endpoint.
+
+    Stores:
+    - Batting order positions in daily_lineups (drives projected PAs)
+    - Probable pitchers in probable_pitchers (drives platoon adjustments)
+
+    Lineups typically appear 1-2 hours before first pitch.
+    """
+    logger.info("Executing pipeline: sync_lineups")
+    bdl_client = MLBStatsClient()
+    today = str(get_eastern_local_date())
+
+    # Get today's games from DB
+    with get_db_connection() as conn:
+        games = conn.execute(
+            "SELECT game_id, bdl_game_id, home_team, away_team FROM games WHERE status != 'COMPLETED' AND date LIKE ?",
+            (f"{today}%",)
+        ).fetchall()
+
+    if not games:
+        logger.info("No games today for lineup sync.")
+        return
+
+    lineup_count = 0
+    pitcher_count = 0
+
+    for game in games:
+        bdl_game_id = game['bdl_game_id']
+        if not bdl_game_id:
+            continue
+
+        lineup_data = bdl_client.get_lineups(bdl_game_id)
+        if not lineup_data:
+            logger.debug(f"No lineup data yet for game {game['game_id']}")
+            continue
+
+        with get_db_connection() as conn:
+            for entry in lineup_data:
+                player = entry.get('player', {})
+                team_data = entry.get('team', {})
+                if not player or not team_data:
+                    continue
+
+                player_name = f"{player.get('first_name', '')} {player.get('last_name', '')}".strip()
+                player_id = player.get('id')
+                team_name = team_data.get('full_name', '') if isinstance(team_data, dict) else ''
+                throws = player.get('throws', '')
+                is_probable_pitcher = entry.get('is_probable_pitcher', False)
+                batting_order = entry.get('batting_order') or entry.get('lineup_position')
+
+                if is_probable_pitcher:
+                    conn.execute('''
+                        INSERT INTO probable_pitchers (game_id, team, player_name, player_id, throws, date)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(game_id, team) DO UPDATE SET
+                            player_name=excluded.player_name,
+                            player_id=excluded.player_id,
+                            throws=excluded.throws,
+                            date=excluded.date
+                    ''', (game['game_id'], team_name, player_name, player_id, throws, today))
+                    pitcher_count += 1
+                    logger.info(f"Probable pitcher: {player_name} ({throws}) for {team_name}")
+
+                if batting_order:
+                    conn.execute('''
+                        INSERT INTO daily_lineups (game_id, team, player_name, player_id, lineup_position, date)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(game_id, player_name) DO UPDATE SET
+                            lineup_position=excluded.lineup_position,
+                            date=excluded.date
+                    ''', (game['game_id'], team_name, player_name, player_id, int(batting_order), today))
+                    lineup_count += 1
+
+            conn.commit()
+
+    logger.info(f"Synced {lineup_count} lineup entries and {pitcher_count} probable pitchers for {today}.")

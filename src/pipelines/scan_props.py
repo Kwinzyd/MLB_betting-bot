@@ -1,9 +1,11 @@
 import uuid
 import json
 from datetime import datetime
-from src.config import MARKETS_MAPPING
+from src.config import MARKETS_MAPPING, UMP_MIN_GAMES, UMP_K_WEIGHT
 from src.clients.odds_api import OddsAPIClient
+from src.clients.weather import WeatherClient
 from src.data.db import get_db_connection
+from src.data.park_factors import get_stadium_meta
 from src.models.devig import devig_multiplicative
 from src.models.projections import ProjectionModel
 from src.models.edge_ranker import rank_edge
@@ -19,6 +21,7 @@ def scan_props():
     """
     logger.info("Executing pipeline: scan_props")
     odds_client = OddsAPIClient()
+    weather_client = WeatherClient()
     proj_model = ProjectionModel()
 
     # 1. Get active games from DB
@@ -39,6 +42,15 @@ def scan_props():
         away_team = game['away_team']
         venue = game['venue']
         logger.info(f"Scanning: {away_team} @ {home_team}")
+
+        # Fetch live weather for this stadium
+        weather = None
+        meta = get_stadium_meta(venue)
+        if meta and meta.get("roof") != "dome":
+            weather = weather_client.get_game_weather(meta["lat"], meta["lon"])
+
+        # Umpire K factor — looked up once per game, applied to all pitcher props
+        ump_k_factor = _get_ump_k_factor(game_id)
 
         try:
             event_odds = odds_client.get_event_odds(game_id, markets)
@@ -71,7 +83,8 @@ def scan_props():
                 # Look up player stats and build projection
                 projection = _build_projection(
                     proj_model, player_name, market_key, line,
-                    home_team, away_team, venue
+                    game_id, home_team, away_team, venue,
+                    weather=weather, ump_k_factor=ump_k_factor,
                 )
 
                 if not projection:
@@ -173,7 +186,9 @@ def _parse_odds_by_player(event_odds: dict) -> dict:
 
 def _build_projection(proj_model: ProjectionModel, player_name: str,
                       market_key: str, line: float,
-                      home_team: str, away_team: str, venue: str) -> dict:
+                      game_id: str, home_team: str, away_team: str,
+                      venue: str, weather: dict = None,
+                      ump_k_factor: float = 1.0) -> dict:
     """Build a projection for a player+market by looking up their stats in the DB."""
     with get_db_connection() as conn:
         # Find the player
@@ -216,10 +231,17 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
             ).fetchall()
             logs = [dict(l) for l in logs]
 
-            # Get opponent team K rate (approximate from batter logs)
-            opp_k_rate = _get_team_k_rate(conn, away_team)
+            # Get opponent team K rate.
+            # NOTE: _get_team_stats performs a heavy aggregation. For better performance,
+            # this value should be pre-calculated by a separate pipeline and stored in a
+            # `team_stats` table. The call would then be a simple lookup.
+            from src.config import LEAGUE_AVG_K_RATE
+            opp_team_stats = _get_team_stats(conn, away_team)
+            opp_k_rate = opp_team_stats.get('k_rate', LEAGUE_AVG_K_RATE)
 
-            proj = proj_model.project_pitcher_strikeouts(logs, opp_k_rate, venue, line)
+            proj = proj_model.project_pitcher_strikeouts(
+                logs, opp_k_rate, venue, line, weather=weather, ump_k_factor=ump_k_factor,
+            )
             if proj:
                 proj['injury_status'] = injury_status
             return proj
@@ -231,9 +253,13 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
             ).fetchall()
             logs = [dict(l) for l in logs]
 
-            opp_runs_pg = _get_team_runs_per_game(conn, away_team)
+            from src.config import LEAGUE_AVG_RUNS_PER_GAME
+            opp_team_stats = _get_team_stats(conn, away_team)
+            opp_runs_pg = opp_team_stats.get('runs_per_game', LEAGUE_AVG_RUNS_PER_GAME)
 
-            proj = proj_model.project_pitcher_earned_runs(logs, opp_runs_pg, venue, line)
+            proj = proj_model.project_pitcher_earned_runs(
+                logs, opp_runs_pg, venue, line, weather=weather, ump_k_factor=ump_k_factor,
+            )
             if proj:
                 proj['injury_status'] = injury_status
             return proj
@@ -251,11 +277,16 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
                 'batter_home_runs': 'home_runs',
             }[market_key]
 
-            # Get opposing pitcher's throwing hand (if available)
-            pitcher_hand = _get_opposing_pitcher_hand(conn, home_team, away_team, player)
+            # Get opposing pitcher's throwing hand from probable pitchers
+            pitcher_hand = _get_opposing_pitcher_hand(conn, game_id, home_team, away_team, player)
+
+            # Look up today's lineup position for PA projection
+            lineup_position = _get_lineup_position(conn, player_name, game_id)
 
             proj = proj_model.project_batter_stat(
-                logs, stat_type, pitcher_hand, bats, venue, line
+                logs, stat_type, pitcher_hand, bats, venue, line,
+                lineup_position=lineup_position,
+                weather=weather,
             )
             if proj:
                 proj['injury_status'] = injury_status
@@ -264,80 +295,43 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
     return None
 
 
-def _get_team_k_rate(conn, team_name: str) -> float:
-    """Estimate a team's strikeout rate from batter game logs."""
-    from src.config import LEAGUE_AVG_K_RATE
-
+def _get_team_stats(conn, team_name: str) -> dict:
+    """
+    Look up pre-calculated team offensive stats from the `team_stats` table.
+    This table is populated by the `calculate_team_stats` pipeline.
+    """
     # Find team ID
     team = conn.execute(
         "SELECT team_id FROM teams WHERE name LIKE ? COLLATE NOCASE",
         (f"%{team_name}%",)
     ).fetchone()
-
+ 
     if not team:
-        return LEAGUE_AVG_K_RATE
-
-    # Get batters on this team and their K rates
-    batters = conn.execute(
-        "SELECT player_id FROM players WHERE team_id = ?", (team['team_id'],)
-    ).fetchall()
-
-    if not batters:
-        return LEAGUE_AVG_K_RATE
-
-    batter_ids = [b['player_id'] for b in batters]
-    placeholders = ','.join('?' * len(batter_ids))
-
-    totals = conn.execute(f'''
-        SELECT SUM(strikeouts) as total_k, SUM(plate_appearances) as total_pa
-        FROM batter_game_logs WHERE player_id IN ({placeholders})
-    ''', batter_ids).fetchone()
-
-    if totals and totals['total_pa'] and totals['total_pa'] > 0:
-        return totals['total_k'] / totals['total_pa']
-
-    return LEAGUE_AVG_K_RATE
-
-
-def _get_team_runs_per_game(conn, team_name: str) -> float:
-    """Estimate a team's runs per game."""
-    from src.config import LEAGUE_AVG_RUNS_PER_GAME
-
-    team = conn.execute(
-        "SELECT team_id FROM teams WHERE name LIKE ? COLLATE NOCASE",
-        (f"%{team_name}%",)
+        return {}
+ 
+    # Look up stats from the pre-calculated table
+    stats = conn.execute(
+        "SELECT k_rate, runs_per_game FROM team_stats WHERE team_id = ?",
+        (team['team_id'],)
     ).fetchone()
-
-    if not team:
-        return LEAGUE_AVG_RUNS_PER_GAME
-
-    batters = conn.execute(
-        "SELECT player_id FROM players WHERE team_id = ?", (team['team_id'],)
-    ).fetchall()
-
-    if not batters:
-        return LEAGUE_AVG_RUNS_PER_GAME
-
-    batter_ids = [b['player_id'] for b in batters]
-    placeholders = ','.join('?' * len(batter_ids))
-
-    # Sum RBIs as a proxy for team run production per game
-    totals = conn.execute(f'''
-        SELECT SUM(rbis) as total_rbis, COUNT(DISTINCT game_id) as games
-        FROM batter_game_logs WHERE player_id IN ({placeholders})
-    ''', batter_ids).fetchone()
-
-    if totals and totals['games'] and totals['games'] > 0:
-        return totals['total_rbis'] / totals['games']
-
-    return LEAGUE_AVG_RUNS_PER_GAME
+ 
+    if not stats:
+        return {}
+ 
+    return {'k_rate': stats['k_rate'], 'runs_per_game': stats['runs_per_game']}
 
 
-def _get_opposing_pitcher_hand(conn, home_team: str, away_team: str, batter_player) -> str:
-    """Try to find the opposing starting pitcher's throwing hand."""
-    # If the batter is on the home team, the opposing pitcher is on the away team, and vice versa
+def _get_opposing_pitcher_hand(conn, game_id: str, home_team: str, away_team: str, batter_player) -> str:
+    """
+    Look up the opposing probable pitcher's throwing hand.
+
+    Priority:
+    1. probable_pitchers table (from BDL /lineups endpoint) — the correct answer
+    2. Fallback: most recent pitcher on opposing team from game logs (old heuristic)
+    """
     batter_team_id = batter_player['team_id']
 
+    # Determine which team the batter is on to find the opposing team
     home = conn.execute(
         "SELECT team_id FROM teams WHERE name LIKE ? COLLATE NOCASE",
         (f"%{home_team}%",)
@@ -348,15 +342,26 @@ def _get_opposing_pitcher_hand(conn, home_team: str, away_team: str, batter_play
     else:
         opp_team_name = home_team
 
+    # --- Primary: look up probable pitcher from today's lineup sync ---
+    pitcher = conn.execute(
+        "SELECT throws FROM probable_pitchers WHERE game_id = ? AND team LIKE ? COLLATE NOCASE",
+        (game_id, f"%{opp_team_name}%")
+    ).fetchone()
+
+    if pitcher and pitcher['throws']:
+        return pitcher['throws']
+
+    # --- Fallback: most recent pitcher on opposing team (old heuristic) ---
+    logger.debug(f"No probable pitcher for {opp_team_name} in game {game_id}, using fallback")
+
     opp_team = conn.execute(
         "SELECT team_id FROM teams WHERE name LIKE ? COLLATE NOCASE",
         (f"%{opp_team_name}%",)
     ).fetchone()
 
     if not opp_team:
-        return 'R'  # default to right-handed
+        return 'R'
 
-    # Find a pitcher on the opposing team (best guess: most recent starter)
     pitcher = conn.execute('''
         SELECT p.throws FROM players p
         JOIN pitcher_game_logs pgl ON p.player_id = pgl.player_id
@@ -365,3 +370,63 @@ def _get_opposing_pitcher_hand(conn, home_team: str, away_team: str, batter_play
     ''', (opp_team['team_id'],)).fetchone()
 
     return pitcher['throws'] if pitcher and pitcher['throws'] else 'R'
+
+
+def _get_ump_k_factor(game_id: str) -> float:
+    """
+    Look up the home-plate umpire's K factor for a game and return a
+    blended adjustment suitable for use in pitcher projections.
+
+    Returns 1.0 (neutral) when:
+      - No umpire assignment exists for this game
+      - The umpire has fewer than UMP_MIN_GAMES games called (too small a sample)
+
+    Otherwise returns:
+      1 + (raw_k_factor - 1) * UMP_K_WEIGHT
+
+    The partial-weight blend (default 0.5) prevents overconfidence in a single
+    umpire's historical tendency and smooths regression to the mean.
+    """
+    with get_db_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT us.k_factor, us.games_called
+            FROM umpire_game_assignments uga
+            JOIN umpire_stats us ON uga.umpire_id = us.umpire_id
+            WHERE uga.game_id = ?
+            """,
+            (game_id,),
+        ).fetchone()
+
+    if not row or row['k_factor'] is None:
+        return 1.0
+    if row['games_called'] < UMP_MIN_GAMES:
+        return 1.0
+
+    raw_factor = row['k_factor']
+    return 1.0 + (raw_factor - 1.0) * UMP_K_WEIGHT
+
+
+def _get_lineup_position(conn, player_name: str, game_id: str) -> int:
+    """
+    Look up a player's lineup position for today's game.
+    Returns None if not found (projection will use DEFAULT_PROJECTED_PA).
+    """
+    row = conn.execute(
+        "SELECT lineup_position FROM daily_lineups WHERE player_name = ? AND game_id = ? COLLATE NOCASE",
+        (player_name, game_id)
+    ).fetchone()
+
+    if row and row['lineup_position']:
+        return int(row['lineup_position'])
+
+    # Try partial name match
+    row = conn.execute(
+        "SELECT lineup_position FROM daily_lineups WHERE player_name LIKE ? AND game_id = ? COLLATE NOCASE",
+        (f"%{player_name}%", game_id)
+    ).fetchone()
+
+    if row and row['lineup_position']:
+        return int(row['lineup_position'])
+
+    return None

@@ -64,12 +64,35 @@ CREATE TABLE IF NOT EXISTS batter_game_logs (
     doubles INTEGER,
     triples INTEGER,
     home_runs INTEGER,
+    runs INTEGER,
     rbis INTEGER,
     walks INTEGER,
     strikeouts INTEGER,
     total_bases INTEGER,
     plate_appearances INTEGER,
     PRIMARY KEY (game_id, player_id)
+);
+
+CREATE TABLE IF NOT EXISTS daily_lineups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_id TEXT,
+    team TEXT,
+    player_name TEXT,
+    player_id INTEGER,
+    lineup_position INTEGER,
+    date TEXT,
+    UNIQUE(game_id, player_name)
+);
+
+CREATE TABLE IF NOT EXISTS probable_pitchers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_id TEXT,
+    team TEXT,
+    player_name TEXT,
+    player_id INTEGER,
+    throws TEXT,
+    date TEXT,
+    UNIQUE(game_id, team)
 );
 
 CREATE TABLE IF NOT EXISTS prop_snapshots (
@@ -85,6 +108,8 @@ CREATE TABLE IF NOT EXISTS prop_snapshots (
     devigged_over REAL,
     devigged_under REAL
 );
+
+CREATE INDEX IF NOT EXISTS idx_prop_snapshots_timestamp ON prop_snapshots(timestamp);
 
 CREATE TABLE IF NOT EXISTS projections (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -134,3 +159,33 @@ CREATE TABLE IF NOT EXISTS park_factors (
     hits_factor REAL DEFAULT 1.0,
     strikeouts_factor REAL DEFAULT 1.0
 );
+
+-- Per-umpire historical K and BB rates, computed from completed game box scores.
+-- k_factor = k_per_game / LEAGUE_AVG_K_PER_GAME; used as a multiplier in projections.
+CREATE TABLE IF NOT EXISTS umpire_stats (
+    umpire_id   INTEGER PRIMARY KEY,
+    umpire_name TEXT    NOT NULL,
+    games_called      INTEGER NOT NULL DEFAULT 0,
+    total_strikeouts  INTEGER NOT NULL DEFAULT 0,
+    total_walks       INTEGER NOT NULL DEFAULT 0,
+    k_per_game  REAL,          -- rolling average: total_strikeouts / games_called
+    bb_per_game REAL,          -- rolling average: total_walks / games_called
+    k_factor    REAL NOT NULL DEFAULT 1.0,  -- k_per_game / LEAGUE_AVG_K_PER_GAME
+    updated_date TEXT
+);
+
+-- One row per MLB game (keyed by mlb_game_pk).
+-- Historical rows (game_id IS NULL) serve as a processing log so box scores are
+-- never fetched twice. Active rows (game_id IS NOT NULL) link today's games to
+-- their umpire for live projection lookups.
+CREATE TABLE IF NOT EXISTS umpire_game_assignments (
+    mlb_game_pk INTEGER PRIMARY KEY,
+    game_id     TEXT,   -- Odds API game_id; NULL for historical-only rows
+    umpire_id   INTEGER NOT NULL,
+    umpire_name TEXT    NOT NULL,
+    date        TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_uga_game_id ON umpire_game_assignments(game_id)
+    WHERE game_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_uga_date   ON umpire_game_assignments(date);

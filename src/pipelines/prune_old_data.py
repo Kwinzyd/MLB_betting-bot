@@ -1,0 +1,89 @@
+from datetime import datetime, timedelta
+from src.data.db import get_db_connection
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+# Tables that are never pruned — reference/configuration data.
+# teams, players, park_factors: small and required for every query.
+_STATIC_TABLES = {'teams', 'players', 'park_factors'}
+
+
+def prune_old_data(
+    game_logs_days: int = 90,
+    completed_games_days: int = 90,
+    alerts_days: int = 90,
+    hot_data_days: int = 3,
+) -> dict:
+    """
+    Remove old rows from every time-bounded table.
+
+    Retention windows (all configurable):
+      hot_data_days       — prop_snapshots, projections, daily_lineups,
+                            probable_pitchers, injury_reports  (default 3)
+      game_logs_days      — pitcher_game_logs, batter_game_logs         (default 90)
+      completed_games_days — games with status='COMPLETED'               (default 90)
+      alerts_days         — alerts_sent + cascaded bet_results           (default 90)
+
+    Static reference tables (teams, players, park_factors) are never touched.
+
+    Returns a dict mapping table name → rows deleted, for logging and tests.
+    """
+    logger.info("Executing pipeline: prune_old_data")
+
+    now = datetime.utcnow()
+
+    hot_cutoff       = (now - timedelta(days=hot_data_days)).isoformat()
+    logs_cutoff      = (now - timedelta(days=game_logs_days)).isoformat()
+    games_cutoff     = (now - timedelta(days=completed_games_days)).isoformat()
+    alerts_cutoff    = (now - timedelta(days=alerts_days)).isoformat()
+
+    deleted: dict = {}
+
+    with get_db_connection() as conn:
+        # 1. Hot / transient data (same tables as _cleanup_stale_data in sync_events)
+        hot_tables = {
+            "prop_snapshots":   "timestamp",
+            "projections":      "timestamp",
+            "daily_lineups":    "date",
+            "probable_pitchers":"date",
+            "injury_reports":   "date",
+        }
+        for table, col in hot_tables.items():
+            cur = conn.execute(f"DELETE FROM {table} WHERE {col} < ?", (hot_cutoff,))
+            deleted[table] = cur.rowcount
+
+        # 2. Game logs — keep enough history for the 20-game projection lookback
+        for table in ("pitcher_game_logs", "batter_game_logs"):
+            cur = conn.execute(f"DELETE FROM {table} WHERE date < ?", (logs_cutoff,))
+            deleted[table] = cur.rowcount
+
+        # 3. Completed games only — never remove scheduled or in-progress games
+        cur = conn.execute(
+            "DELETE FROM games WHERE date < ? AND status = 'COMPLETED'",
+            (games_cutoff,)
+        )
+        deleted["games"] = cur.rowcount
+
+        # 4. Settled bet records — cascade child rows first to respect the FK
+        cur = conn.execute(
+            "DELETE FROM bet_results WHERE alert_id IN "
+            "(SELECT alert_id FROM alerts_sent WHERE timestamp < ?)",
+            (alerts_cutoff,)
+        )
+        deleted["bet_results"] = cur.rowcount
+
+        cur = conn.execute(
+            "DELETE FROM alerts_sent WHERE timestamp < ?",
+            (alerts_cutoff,)
+        )
+        deleted["alerts_sent"] = cur.rowcount
+
+        conn.commit()
+
+    total = sum(deleted.values())
+    logger.info(
+        f"prune_old_data complete — {total} rows removed. "
+        f"Breakdown: { {k: v for k, v in deleted.items() if v > 0} }"
+    )
+    return deleted

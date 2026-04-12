@@ -74,19 +74,78 @@ class MLBStatsClient:
         """Fetch all MLB teams."""
         return self._get("teams", cache_key="bdl_mlb_teams", cache_ttl=86400)
 
-    def get_games(self, season=None, dates=None):
-        """Fetch games for a season and/or specific dates."""
+    def get_games(self, season=None, dates=None, team_ids=None):
+        """Fetch games for a season and/or specific dates, optionally filtered by team."""
         season = season or MLB_SEASON
         params = {"seasons[]": season}
         if dates:
             params["dates[]"] = dates
-        cache_key = f"bdl_mlb_games_{season}_{dates}"
+        if team_ids:
+            params["team_ids[]"] = team_ids
+        cache_key = f"bdl_mlb_games_{season}_{dates}_{team_ids}"
         return self._get("games", params=params, cache_key=cache_key, cache_ttl=3600)
 
     def get_game_stats(self, game_id):
         """Fetch box score stats for a specific game."""
         cache_key = f"bdl_mlb_stats_{game_id}"
         return self._get("stats", params={"game_ids[]": game_id}, cache_key=cache_key, cache_ttl=21600)
+
+    def get_stats_batch(self, game_ids, chunk_size=50):
+        """Fetch stats for multiple game IDs in batched requests.
+
+        Checks per-game cache first; only fetches uncached IDs. Results are stored
+        back into the per-game cache so future single-game lookups are also fast.
+        """
+        game_ids = list(game_ids)
+        all_stats = []
+        uncached_ids = []
+
+        for gid in game_ids:
+            cached = cache.get(f"bdl_mlb_stats_{gid}")
+            if cached is not None:
+                all_stats.extend(cached)
+            else:
+                uncached_ids.append(gid)
+
+        if not uncached_ids:
+            logger.debug(f"All {len(game_ids)} game stat sets served from cache.")
+            return all_stats
+
+        logger.info(f"Fetching stats for {len(uncached_ids)} uncached games in batches of {chunk_size}.")
+
+        for i in range(0, len(uncached_ids), chunk_size):
+            chunk = uncached_ids[i:i + chunk_size]
+            params = {"game_ids[]": chunk}
+            chunk_stats = []
+            url = f"{self.base_url}/stats"
+
+            try:
+                while url:
+                    response = self.session.get(url, params=params, timeout=15)
+                    response.raise_for_status()
+                    body = response.json()
+                    chunk_stats.extend(body.get("data", []))
+                    next_cursor = body.get("meta", {}).get("next_cursor")
+                    if next_cursor:
+                        params = {"cursor": next_cursor}
+                    else:
+                        url = None
+            except requests.exceptions.RequestException as e:
+                logger.error(f"BDL API batch stats error (chunk {i // chunk_size + 1}): {e}")
+                continue
+
+            # Cache per game ID so individual lookups are warm on the next run
+            stats_by_game: dict[int, list] = {}
+            for stat in chunk_stats:
+                gid = stat.get("game", {}).get("id")
+                if gid:
+                    stats_by_game.setdefault(gid, []).append(stat)
+            for gid, stats in stats_by_game.items():
+                cache.set(f"bdl_mlb_stats_{gid}", stats, ttl_seconds=21600)
+
+            all_stats.extend(chunk_stats)
+
+        return all_stats
 
     def get_players(self, team_id=None, search=None):
         """Search or list players."""
@@ -97,6 +156,28 @@ class MLBStatsClient:
             params["search"] = search
         cache_key = f"bdl_mlb_players_{team_id}_{search}"
         return self._get("players", params=params, cache_key=cache_key, cache_ttl=21600)
+
+    def get_lineups(self, game_id):
+        """
+        Fetch pre-game batting lineups and probable pitchers for a game.
+        Returns list of lineup entries with batting_order, position, is_probable_pitcher.
+        Available from 2026 season; typically posted 1-2 hours before first pitch.
+        """
+        cache_key = f"bdl_mlb_lineups_{game_id}"
+        return self._get("lineups", params={"game_id": game_id}, cache_key=cache_key, cache_ttl=3600)
+
+    def get_player_injuries(self, team_ids=None, player_ids=None):
+        """
+        Fetch current player injuries from BDL /player_injuries endpoint.
+        Returns list of injury records with status, type, detail, return_date, etc.
+        """
+        params = {}
+        if team_ids:
+            params["team_ids[]"] = team_ids
+        if player_ids:
+            params["player_ids[]"] = player_ids
+        cache_key = f"bdl_mlb_injuries_{team_ids}_{player_ids}"
+        return self._get("player_injuries", params=params, cache_key=cache_key, cache_ttl=3600)
 
     def get_season_averages(self, player_ids, season=None):
         """Fetch season averages for one or more players."""
