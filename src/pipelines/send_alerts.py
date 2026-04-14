@@ -2,8 +2,7 @@ import json
 from datetime import datetime
 from src.clients.telegram_bot import TelegramClient
 from src.data.db import get_db_connection
-from src.config import EDGE_MIN
-from src.models.devig import devig_multiplicative
+from src.config import MAX_BETS_PER_GAME, MAX_BETS_PER_PLAYER
 from src.models.edge_ranker import rank_edge
 from src.utils.logging_utils import get_logger
 
@@ -38,16 +37,9 @@ def send_alerts():
         logger.info("No projections found for alerting.")
         return
 
-    alerts_sent_count = 0
+    # 1. Score every row — collect playable candidates with their best side/edge.
+    candidates = []
     for row in rows:
-        player_name = row['player_name']
-        market = row['market']
-        line = row['line']
-        bookmaker = row['bookmaker']
-        over_odds = row['over_odds']
-        under_odds = row['under_odds']
-
-        # Determine best side
         projection = {
             'prob_over': row['prob_over'],
             'prob_under': row['prob_under'],
@@ -56,14 +48,13 @@ def send_alerts():
             'sample_size': 10,
         }
 
-        # Check both sides and pick the one with the better edge
         best_side = None
         best_edge = None
         best_odds = None
 
         for side, odds_val, dev_prob in [
-            ('over', over_odds, row['devigged_over']),
-            ('under', under_odds, row['devigged_under']),
+            ('over', row['over_odds'], row['devigged_over']),
+            ('under', row['under_odds'], row['devigged_under']),
         ]:
             if not odds_val or odds_val <= 1.0:
                 continue
@@ -77,17 +68,47 @@ def send_alerts():
         if not best_edge or not best_side:
             continue
 
-        # Check if already alerted
+        candidates.append({
+            'row': row,
+            'projection': projection,
+            'side': best_side,
+            'odds': best_odds,
+            'edge': best_edge,
+        })
+
+    # 2. Rank by edge desc so correlation guards keep the highest-edge bet.
+    candidates.sort(key=lambda c: c['edge']['edge_pct'], reverse=True)
+
+    # 3. Apply correlation caps and send.
+    seen_players: dict = {}
+    game_counts: dict = {}
+    seen_prop_key: set = set()
+    alerts_sent_count = 0
+
+    for cand in candidates:
+        row = cand['row']
+        player_name = row['player_name']
+        market = row['market']
+        line = row['line']
+        bookmaker = row['bookmaker']
+        game_id = row['game_id']
+
+        prop_key = (player_name, market, line)
+        if prop_key in seen_prop_key:
+            continue
+        if seen_players.get(player_name, 0) >= MAX_BETS_PER_PLAYER:
+            continue
+        if game_counts.get(game_id, 0) >= MAX_BETS_PER_GAME:
+            continue
+
         with get_db_connection() as conn:
             existing = conn.execute(
                 "SELECT 1 FROM alerts_sent WHERE player_name=? AND market=? AND line=? AND bookmaker=?",
                 (player_name, market, line, bookmaker)
             ).fetchone()
-
             if existing:
                 continue
 
-            # Parse context for alert message
             context = {}
             if row['context_json']:
                 try:
@@ -95,16 +116,15 @@ def send_alerts():
                 except json.JSONDecodeError:
                     pass
 
-            # Format and send alert
             message = _format_alert_message(
                 player_name=player_name,
                 market=market,
-                side=best_side,
+                side=cand['side'],
                 line=line,
-                odds=best_odds,
+                odds=cand['odds'],
                 bookmaker=bookmaker,
-                edge=best_edge,
-                projection=projection,
+                edge=cand['edge'],
+                projection=cand['projection'],
                 context=context,
                 home_team=row['home_team'],
                 away_team=row['away_team'],
@@ -113,12 +133,11 @@ def send_alerts():
 
             try:
                 bot.send_message(message)
-                logger.info(f"Alert sent: {player_name} {market} {best_side.upper()} {line}")
+                logger.info(f"Alert sent: {player_name} {market} {cand['side'].upper()} {line}")
             except Exception as e:
                 logger.error(f"Failed to send Telegram alert: {e}")
                 continue
 
-            # Log the alert
             timestamp = datetime.utcnow().isoformat()
             conn.execute('''
                 INSERT INTO alerts_sent
@@ -127,13 +146,17 @@ def send_alerts():
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(player_name, market, line, bookmaker) DO NOTHING
             ''', (
-                player_name, market, line, best_side,
-                best_edge['edge_pct'], best_edge['ev'],
-                best_edge['kelly']['recommended_stake'],
-                bookmaker, best_odds, best_odds,
-                row['game_id'], timestamp,
+                player_name, market, line, cand['side'],
+                cand['edge']['edge_pct'], cand['edge']['ev'],
+                cand['edge']['kelly']['recommended_stake'],
+                bookmaker, cand['odds'], cand['odds'],
+                game_id, timestamp,
             ))
             conn.commit()
+
+            seen_prop_key.add(prop_key)
+            seen_players[player_name] = seen_players.get(player_name, 0) + 1
+            game_counts[game_id] = game_counts.get(game_id, 0) + 1
             alerts_sent_count += 1
 
     logger.info(f"Alerts pipeline complete. Sent {alerts_sent_count} new alerts.")

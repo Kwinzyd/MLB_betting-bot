@@ -16,7 +16,8 @@ logger = get_logger(__name__)
 
 def main():
     parser = argparse.ArgumentParser(description="MLB Player Prop Betting Bot")
-    parser.add_argument('command', choices=['sync', 'scan', 'run', 'settle', 'prune', 'backtest'],
+    parser.add_argument('command', choices=['sync', 'scan', 'run', 'settle', 'prune',
+                                             'backtest', 'backfill', 'train'],
                         help="Command to execute")
 
     # backtest-specific flags (ignored for other commands)
@@ -29,6 +30,12 @@ def main():
     parser.add_argument('--market', action='append', dest='markets', metavar='MARKET',
                         help="Restrict to specific market(s); repeatable. "
                              "E.g. --market pitcher_strikeouts --market batter_hits")
+
+    # backfill + train flags
+    parser.add_argument('--seasons', metavar='YYYY[,YYYY,...]',
+                        help="Seasons for backfill, comma-separated")
+    parser.add_argument('--compare', choices=['sklearn'], default=None,
+                        help="train: also fit sklearn RF/GB for comparison")
 
     args = parser.parse_args()
 
@@ -66,6 +73,21 @@ def main():
         elif args.command == 'prune':
             logger.info("Running PRUNE mode...")
             prune_old_data()
+
+        elif args.command == 'backfill':
+            if not args.seasons:
+                parser.error("backfill requires --seasons (e.g. --seasons 2022,2023,2024,2025)")
+            from src.pipelines.sync_historical import sync_historical
+            seasons = [int(s.strip()) for s in args.seasons.split(',') if s.strip()]
+            logger.info(f"Running BACKFILL for seasons={seasons} ...")
+            sync_historical(seasons)
+
+        elif args.command == 'train':
+            from src.pipelines.train_model import train_all
+            logger.info("Running TRAIN mode ...")
+            results = train_all(compare_sklearn=(args.compare == 'sklearn'))
+            for r in results:
+                logger.info(f"Training result: {r}")
 
         elif args.command == 'backtest':
             if not args.start or not args.end:

@@ -124,18 +124,19 @@ def sync_events():
                         ''', (venue, game_id))
 
             conn.execute('''
-                INSERT INTO games (game_id, bdl_game_id, date, home_team, away_team,
+                INSERT INTO games (game_id, bdl_game_id, date, game_time, home_team, away_team,
                                    home_team_id, away_team_id, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(game_id) DO UPDATE SET
                     bdl_game_id=COALESCE(excluded.bdl_game_id, games.bdl_game_id),
                     date=excluded.date,
+                    game_time=excluded.game_time,
                     home_team=excluded.home_team,
                     away_team=excluded.away_team,
                     home_team_id=COALESCE(excluded.home_team_id, games.home_team_id),
                     away_team_id=COALESCE(excluded.away_team_id, games.away_team_id),
                     status=excluded.status
-            ''', (game_id, bdl_game_id, commence_time, home_team, away_team,
+            ''', (game_id, bdl_game_id, commence_time, commence_time, home_team, away_team,
                   home_team_id, away_team_id, 'SCHEDULED'))
             saved_count += 1
         conn.commit()

@@ -18,8 +18,18 @@ def init_db():
 
     with get_db_connection() as conn:
         conn.executescript(schema_sql)
+        _migrate_games_columns(conn)
         conn.commit()
     logger.info("Database initialized successfully.")
+
+
+def _migrate_games_columns(conn):
+    """Add columns that postdate the original schema on existing DBs."""
+    existing = {row['name'] for row in conn.execute("PRAGMA table_info(games)").fetchall()}
+    if 'game_time' not in existing:
+        conn.execute("ALTER TABLE games ADD COLUMN game_time TEXT")
+    if 'historical' not in existing:
+        conn.execute("ALTER TABLE games ADD COLUMN historical INTEGER DEFAULT 0")
 
 @contextmanager
 def get_db_connection():

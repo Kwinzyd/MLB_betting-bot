@@ -1,5 +1,5 @@
 from typing import Dict, Any
-from src.config import EDGE_MIN
+from src.config import EDGE_MIN, MIN_ODDS, MIN_MODEL_PROB, MIN_SAMPLE_SIZE
 from src.models.kelly import fractional_kelly
 from src.utils.logging_utils import get_logger
 
@@ -31,15 +31,23 @@ def rank_edge(projection: Dict[str, Any], odds: float, side: str, devigged_prob:
         is_playable = False
         reasons.append(f"Edge too small ({edge_pct:.1f}% < {EDGE_MIN}%)")
 
+    if odds < MIN_ODDS:
+        is_playable = False
+        reasons.append(f"Odds too juicy ({odds:.2f} < {MIN_ODDS})")
+
+    if model_prob < MIN_MODEL_PROB:
+        is_playable = False
+        reasons.append(f"Low model confidence ({model_prob:.2f} < {MIN_MODEL_PROB})")
+
     injury_status = projection.get('injury_status', 'Healthy')
     if injury_status in ['IL', 'Out']:
         is_playable = False
         reasons.append(f"Injury status: {injury_status}")
 
     sample_size = projection.get('sample_size', 0)
-    if sample_size < 5:
+    if sample_size < MIN_SAMPLE_SIZE:
         is_playable = False
-        reasons.append(f"Insufficient sample ({sample_size} < 5 games)")
+        reasons.append(f"Insufficient sample ({sample_size} < {MIN_SAMPLE_SIZE} games)")
 
     if kelly['kelly_fraction'] <= 0:
         is_playable = False

@@ -64,90 +64,110 @@ def scan_props():
         # 2. Parse odds and group by player+market+line for devigging
         player_lines = _parse_odds_by_player(event_odds)
 
-        # 3. For each player+market+line, devig, project, and rank
+        # 3. For each player+market+line, pick best line across books, devig, project, rank
         for key, line_data in player_lines.items():
             player_name, market_key, line = key
 
-            for book, odds_pair in line_data.items():
-                over_odds = odds_pair.get('over')
-                under_odds = odds_pair.get('under')
+            best = _pick_best_line(line_data)
+            over_odds, over_book = best['over']
+            under_odds, under_book = best['under']
 
-                if not over_odds or not under_odds:
-                    continue
-                if over_odds <= 1.0 or under_odds <= 1.0:
-                    continue
+            if not over_odds or not under_odds:
+                continue
+            if over_odds <= 1.0 or under_odds <= 1.0:
+                continue
 
-                # Devig
-                devigged_over, devigged_under = devig_multiplicative(over_odds, under_odds)
+            # Devig using best-of-books pair
+            devigged_over, devigged_under = devig_multiplicative(over_odds, under_odds)
 
-                # Look up player stats and build projection
-                projection = _build_projection(
-                    proj_model, player_name, market_key, line,
-                    game_id, home_team, away_team, venue,
-                    weather=weather, ump_k_factor=ump_k_factor,
-                )
+            projection = _build_projection(
+                proj_model, player_name, market_key, line,
+                game_id, home_team, away_team, venue,
+                weather=weather, ump_k_factor=ump_k_factor,
+            )
 
-                if not projection:
-                    continue
+            if not projection:
+                continue
 
-                projection['player_name'] = player_name
+            projection['player_name'] = player_name
 
-                # Rank edge for both over and under
-                for side, odds_val, dev_prob in [
-                    ('over', over_odds, devigged_over),
-                    ('under', under_odds, devigged_under),
+            # Composite book label when over and under come from different books
+            book_label = over_book if over_book == under_book else f"{over_book}/{under_book}"
+
+            snapshot_id = str(uuid.uuid4())
+            timestamp = datetime.utcnow().isoformat()
+
+            with get_db_connection() as conn:
+                conn.execute('''
+                    INSERT INTO prop_snapshots
+                    (snapshot_id, game_id, player_name, market, line,
+                     over_odds, under_odds, bookmaker, timestamp,
+                     devigged_over, devigged_under)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    snapshot_id, game_id, player_name, market_key,
+                    line, over_odds, under_odds, book_label, timestamp,
+                    devigged_over, devigged_under,
+                ))
+
+                playable_any = False
+                for side, odds_val, dev_prob, side_book in [
+                    ('over', over_odds, devigged_over, over_book),
+                    ('under', under_odds, devigged_under, under_book),
                 ]:
                     edge_result = rank_edge(projection, odds_val, side, dev_prob)
 
-                    # Save snapshot regardless
-                    snapshot_id = str(uuid.uuid4())
-                    timestamp = datetime.utcnow().isoformat()
+                    if edge_result['is_playable']:
+                        total_edges += 1
+                        playable_any = True
+                        logger.info(
+                            f"EDGE FOUND: {player_name} {market_key} {side.upper()} {line} "
+                            f"@ {side_book} | Edge: {edge_result['edge_pct']:.1f}% | "
+                            f"EV: {edge_result['ev']:.3f} | "
+                            f"Kelly: ${edge_result['kelly']['recommended_stake']}"
+                        )
 
-                    with get_db_connection() as conn:
-                        conn.execute('''
-                            INSERT INTO prop_snapshots
-                            (snapshot_id, game_id, player_name, market, line,
-                             over_odds, under_odds, bookmaker, timestamp,
-                             devigged_over, devigged_under)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ''', (
-                            snapshot_id, game_id, player_name, market_key,
-                            line, over_odds, under_odds, book, timestamp,
-                            devigged_over, devigged_under,
-                        ))
+                if playable_any:
+                    context_json = json.dumps(projection.get('context', {}))
+                    conn.execute('''
+                        INSERT INTO projections
+                        (game_id, player_name, market, projected_mean,
+                         prob_over, prob_under, context_json, timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(game_id, player_name, market) DO UPDATE SET
+                            projected_mean=excluded.projected_mean,
+                            prob_over=excluded.prob_over,
+                            prob_under=excluded.prob_under,
+                            context_json=excluded.context_json,
+                            timestamp=excluded.timestamp
+                    ''', (
+                        game_id, player_name, market_key,
+                        projection['projected_mean'],
+                        projection['prob_over'], projection['prob_under'],
+                        context_json, timestamp,
+                    ))
 
-                        # Save projection if playable
-                        if edge_result['is_playable']:
-                            total_edges += 1
-                            context_json = json.dumps(projection.get('context', {}))
-                            conn.execute('''
-                                INSERT INTO projections
-                                (game_id, player_name, market, projected_mean,
-                                 prob_over, prob_under, context_json, timestamp)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                                ON CONFLICT(game_id, player_name, market) DO UPDATE SET
-                                    projected_mean=excluded.projected_mean,
-                                    prob_over=excluded.prob_over,
-                                    prob_under=excluded.prob_under,
-                                    context_json=excluded.context_json,
-                                    timestamp=excluded.timestamp
-                            ''', (
-                                game_id, player_name, market_key,
-                                projection['projected_mean'],
-                                projection['prob_over'], projection['prob_under'],
-                                context_json, timestamp,
-                            ))
-
-                            logger.info(
-                                f"EDGE FOUND: {player_name} {market_key} {side.upper()} {line} "
-                                f"@ {book} | Edge: {edge_result['edge_pct']:.1f}% | "
-                                f"EV: {edge_result['ev']:.3f} | "
-                                f"Kelly: ${edge_result['kelly']['recommended_stake']}"
-                            )
-
-                        conn.commit()
+                conn.commit()
 
     logger.info(f"Scan complete. Found {total_edges} playable edges.")
+
+
+def _pick_best_line(line_data: dict) -> dict:
+    """
+    Given {book: {'over': odds, 'under': odds}}, pick the max odds per side.
+    Returns {'over': (odds|None, book|None), 'under': (odds|None, book|None)}.
+    Over and under may come from different books — that's the point of shopping.
+    """
+    best_over = (None, None)
+    best_under = (None, None)
+    for book, pair in line_data.items():
+        over = pair.get('over')
+        under = pair.get('under')
+        if over is not None and (best_over[0] is None or over > best_over[0]):
+            best_over = (over, book)
+        if under is not None and (best_under[0] is None or under > best_under[0]):
+            best_under = (under, book)
+    return {'over': best_over, 'under': best_under}
 
 
 def _parse_odds_by_player(event_odds: dict) -> dict:

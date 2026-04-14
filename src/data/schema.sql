@@ -2,6 +2,7 @@ CREATE TABLE IF NOT EXISTS games (
     game_id TEXT PRIMARY KEY,
     bdl_game_id INTEGER,
     date TEXT,
+    game_time TEXT,
     home_team TEXT,
     away_team TEXT,
     home_team_id INTEGER,
@@ -9,7 +10,8 @@ CREATE TABLE IF NOT EXISTS games (
     venue TEXT,
     status TEXT DEFAULT 'SCHEDULED',
     home_score INTEGER,
-    away_score INTEGER
+    away_score INTEGER,
+    historical INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS teams (

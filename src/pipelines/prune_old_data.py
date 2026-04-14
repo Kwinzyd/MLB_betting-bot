@@ -53,14 +53,26 @@ def prune_old_data(
             cur = conn.execute(f"DELETE FROM {table} WHERE {col} < ?", (hot_cutoff,))
             deleted[table] = cur.rowcount
 
-        # 2. Game logs — keep enough history for the 20-game projection lookback
+        # 2. Game logs — keep enough history for the 20-game projection lookback.
+        # Rows whose game_id belongs to a historical backfill (games.historical=1)
+        # are preserved so we don't wipe training data.
         for table in ("pitcher_game_logs", "batter_game_logs"):
-            cur = conn.execute(f"DELETE FROM {table} WHERE date < ?", (logs_cutoff,))
+            cur = conn.execute(
+                f"""
+                DELETE FROM {table}
+                WHERE date < ?
+                  AND game_id NOT IN (
+                    SELECT bdl_game_id FROM games
+                     WHERE historical = 1 AND bdl_game_id IS NOT NULL
+                  )
+                """,
+                (logs_cutoff,),
+            )
             deleted[table] = cur.rowcount
 
-        # 3. Completed games only — never remove scheduled or in-progress games
+        # 3. Completed games only — never remove scheduled, in-progress, or historical-backfill games
         cur = conn.execute(
-            "DELETE FROM games WHERE date < ? AND status = 'COMPLETED'",
+            "DELETE FROM games WHERE date < ? AND status = 'COMPLETED' AND COALESCE(historical, 0) = 0",
             (games_cutoff,)
         )
         deleted["games"] = cur.rowcount

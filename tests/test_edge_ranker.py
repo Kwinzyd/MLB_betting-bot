@@ -28,14 +28,14 @@ def test_rank_edge_profitable_over(base_projection):
 
 def test_rank_edge_profitable_under(base_projection):
     """Test a clear profitable edge on the under."""
-    base_projection['prob_under'] = 0.50
-    # Odds 2.5 (implied 40%), Model 50%. Edge = 10%.
-    result = rank_edge(base_projection, odds=2.5, side='under', devigged_prob=0.40)
+    base_projection['prob_under'] = 0.60
+    # Odds 2.0 (implied 50%), Model 60%. Edge = 10%.
+    result = rank_edge(base_projection, odds=2.0, side='under', devigged_prob=0.50)
 
     assert result['is_playable'] is True
     assert result['edge_pct'] == pytest.approx(10.0)
-    assert result['ev'] == pytest.approx(0.25)
-    assert result['model_prob'] == 0.50
+    assert result['ev'] == pytest.approx(0.20)
+    assert result['model_prob'] == 0.60
 
 
 def test_rank_edge_unplayable_negative_ev(base_projection):
@@ -64,4 +64,4 @@ def test_rank_edge_unplayable_small_sample(base_projection):
     result = rank_edge(base_projection, odds=2.0, side='over', devigged_prob=0.50)
 
     assert result['is_playable'] is False
-    assert "Insufficient sample (4 < 5 games)" in result['reasons']
+    assert any("Insufficient sample" in r for r in result['reasons'])
