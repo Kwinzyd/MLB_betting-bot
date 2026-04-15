@@ -1,9 +1,32 @@
 from src.clients.mlb_stats import MLBStatsClient
 from src.data.db import get_db_connection
-from src.utils.time_utils import get_eastern_local_date
+from src.utils.time_utils import get_eastern_local_date, get_utc_now_iso
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
+
+def _stamp_confirmed_if_both_teams(conn, game_id: str, home_team: str, away_team: str):
+    """
+    Set games.lineups_confirmed_at to now (UTC ISO) the first time both
+    teams in this game have at least one row in daily_lineups. Idempotent —
+    never overwrites an existing timestamp.
+    """
+    teams_with_lineups = {
+        r['team'] for r in conn.execute(
+            "SELECT DISTINCT team FROM daily_lineups WHERE game_id = ?",
+            (game_id,)
+        ).fetchall()
+    }
+    home_present = any(home_team and home_team.lower() in (t or '').lower() for t in teams_with_lineups)
+    away_present = any(away_team and away_team.lower() in (t or '').lower() for t in teams_with_lineups)
+    if not (home_present and away_present):
+        return
+    conn.execute(
+        "UPDATE games SET lineups_confirmed_at = ? "
+        "WHERE game_id = ? AND lineups_confirmed_at IS NULL",
+        (get_utc_now_iso(), game_id),
+    )
 
 
 def sync_lineups():
@@ -81,6 +104,9 @@ def sync_lineups():
                     ''', (game['game_id'], team_name, player_name, player_id, int(batting_order), today))
                     lineup_count += 1
 
+            _stamp_confirmed_if_both_teams(
+                conn, game['game_id'], game['home_team'], game['away_team']
+            )
             conn.commit()
 
     logger.info(f"Synced {lineup_count} lineup entries and {pitcher_count} probable pitchers for {today}.")

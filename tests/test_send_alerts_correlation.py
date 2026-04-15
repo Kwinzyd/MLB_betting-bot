@@ -32,7 +32,8 @@ def _seed_schema(conn):
 
 
 def _add_candidate(conn, game_id, player, market, line, prob_over, snap_id, book='dk'):
-    """Insert a playable candidate: prob_over chosen to clear all filters."""
+    """Insert a playable candidate. devigged_* holds the sharp-devigged truth —
+    set equal to prob_* so the model/sharp agreement gate passes."""
     conn.execute(
         "INSERT OR IGNORE INTO games VALUES (?, 'Yankees', 'Red Sox', 'Yankee Stadium', 'SCHEDULED', '2024-05-15')",
         (game_id,)
@@ -42,13 +43,13 @@ def _add_candidate(conn, game_id, player, market, line, prob_over, snap_id, book
         (game_id, player_name, market, projected_mean, prob_over, prob_under, context_json, timestamp)
         VALUES (?, ?, ?, ?, ?, ?, '{}', '2024-05-15T12:00:00')
     ''', (game_id, player, market, line, prob_over, 1.0 - prob_over))
-    # odds=2.0 (implied 50%), devigged=0.50 → edge = (prob_over-0.50)*100
+    # odds=2.0 (implied 50%); sharp says prob_over → edge = (prob_over - 0.50)*100
     conn.execute('''
         INSERT INTO prop_snapshots
         (snapshot_id, game_id, player_name, market, line, over_odds, under_odds,
          bookmaker, timestamp, devigged_over, devigged_under)
-        VALUES (?, ?, ?, ?, ?, 2.0, 2.0, ?, '2024-05-15T12:00:00', 0.50, 0.50)
-    ''', (snap_id, game_id, player, market, line, book))
+        VALUES (?, ?, ?, ?, ?, 2.0, 2.0, ?, '2024-05-15T12:00:00', ?, ?)
+    ''', (snap_id, game_id, player, market, line, book, prob_over, 1.0 - prob_over))
 
 
 @pytest.fixture

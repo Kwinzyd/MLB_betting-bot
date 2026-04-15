@@ -4,7 +4,7 @@ from src.models.edge_ranker import rank_edge
 
 @pytest.fixture
 def base_projection():
-    """Provide a standard profitable base projection for testing."""
+    """Profitable base projection. model/sharp agree so agreement gate passes."""
     return {
         'prob_over': 0.60,
         'prob_under': 0.40,
@@ -15,22 +15,21 @@ def base_projection():
 
 
 def test_rank_edge_profitable_over(base_projection):
-    """Test a clear profitable edge on the over."""
-    # Odds 2.0 (implied 50%), Model 60%. Edge = 10%. EV = 0.20
-    result = rank_edge(base_projection, odds=2.0, side='over', devigged_prob=0.50)
+    """Sharp says 0.60, book implies 0.50 → 10% edge on the over."""
+    result = rank_edge(base_projection, odds=2.0, side='over', sharp_prob=0.60)
 
     assert result['is_playable'] is True
     assert result['edge_pct'] == pytest.approx(10.0)
     assert result['ev'] == pytest.approx(0.20)
     assert result['model_prob'] == 0.60
+    assert result['sharp_prob'] == 0.60
     assert result['book_implied'] == 0.50
 
 
 def test_rank_edge_profitable_under(base_projection):
-    """Test a clear profitable edge on the under."""
+    """Sharp says 0.60 on the under; book implies 0.50."""
     base_projection['prob_under'] = 0.60
-    # Odds 2.0 (implied 50%), Model 60%. Edge = 10%.
-    result = rank_edge(base_projection, odds=2.0, side='under', devigged_prob=0.50)
+    result = rank_edge(base_projection, odds=2.0, side='under', sharp_prob=0.60)
 
     assert result['is_playable'] is True
     assert result['edge_pct'] == pytest.approx(10.0)
@@ -39,29 +38,44 @@ def test_rank_edge_profitable_under(base_projection):
 
 
 def test_rank_edge_unplayable_negative_ev(base_projection):
-    """Test that negative EV bets are correctly flagged as unplayable."""
-    # Odds 1.5 (implied 66.6%), Model 60%. Edge = -6.6%
-    result = rank_edge(base_projection, odds=1.5, side='over', devigged_prob=0.666)
+    """Odds 1.5 (implied 66.6%) and sharp 0.60 → negative edge, unplayable."""
+    result = rank_edge(base_projection, odds=1.5, side='over', sharp_prob=0.60)
 
     assert result['is_playable'] is False
     assert result['edge_pct'] < 0
     assert result['ev'] < 0
-    assert any("Negative Kelly" in r or "Edge too small" in r for r in result['reasons'])
+    assert any("Negative Kelly" in r or "Edge too small" in r or "Odds too juicy" in r
+               for r in result['reasons'])
 
 
 def test_rank_edge_unplayable_due_to_injury(base_projection):
-    """Test that injured players are filtered out regardless of edge."""
     base_projection['injury_status'] = 'IL'
-    result = rank_edge(base_projection, odds=2.0, side='over', devigged_prob=0.50)
+    result = rank_edge(base_projection, odds=2.0, side='over', sharp_prob=0.60)
 
     assert result['is_playable'] is False
     assert "Injury status: IL" in result['reasons']
 
 
 def test_rank_edge_unplayable_small_sample(base_projection):
-    """Test that projections with small samples are filtered out."""
     base_projection['sample_size'] = 4
-    result = rank_edge(base_projection, odds=2.0, side='over', devigged_prob=0.50)
+    result = rank_edge(base_projection, odds=2.0, side='over', sharp_prob=0.60)
 
     assert result['is_playable'] is False
     assert any("Insufficient sample" in r for r in result['reasons'])
+
+
+def test_rank_edge_blocked_by_model_sharp_disagreement(base_projection):
+    """Model says 0.60, sharp says 0.75 → gap of 0.15 exceeds tol 0.05. Skip."""
+    result = rank_edge(base_projection, odds=2.0, side='over', sharp_prob=0.75)
+
+    assert result['is_playable'] is False
+    assert any("disagreement" in r.lower() for r in result['reasons'])
+    assert result['disagreement'] == pytest.approx(0.15)
+
+
+def test_rank_edge_agreement_within_tolerance(base_projection):
+    """Model 0.60 vs sharp 0.64 (gap 0.04) is within the default 0.05 tolerance."""
+    result = rank_edge(base_projection, odds=2.0, side='over', sharp_prob=0.64)
+
+    assert result['is_playable'] is True
+    assert not any("disagreement" in r.lower() for r in result['reasons'])

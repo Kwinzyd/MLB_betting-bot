@@ -30,11 +30,25 @@ def _migrate_games_columns(conn):
         conn.execute("ALTER TABLE games ADD COLUMN game_time TEXT")
     if 'historical' not in existing:
         conn.execute("ALTER TABLE games ADD COLUMN historical INTEGER DEFAULT 0")
+    if 'lineups_confirmed_at' not in existing:
+        conn.execute("ALTER TABLE games ADD COLUMN lineups_confirmed_at TEXT")
+    if 'last_scanned_at' not in existing:
+        conn.execute("ALTER TABLE games ADD COLUMN last_scanned_at TEXT")
 
 @contextmanager
 def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
+    # WAL allows concurrent readers while a writer holds the DB — critical when
+    # scan_props (live) overlaps with sync_stats / backfill / train_model (heavy
+    # writes). journal_mode is persisted at the DB-file level, so this is a no-op
+    # after the first run, but safe to re-issue.
+    # synchronous=NORMAL is the recommended pairing with WAL: durable across
+    # crashes, faster than FULL. busy_timeout waits up to 30s on lock contention
+    # instead of raising OperationalError immediately.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     try:
         yield conn
     finally:

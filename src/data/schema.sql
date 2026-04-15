@@ -11,7 +11,9 @@ CREATE TABLE IF NOT EXISTS games (
     status TEXT DEFAULT 'SCHEDULED',
     home_score INTEGER,
     away_score INTEGER,
-    historical INTEGER DEFAULT 0
+    historical INTEGER DEFAULT 0,
+    lineups_confirmed_at TEXT,
+    last_scanned_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS teams (
@@ -191,3 +193,30 @@ CREATE TABLE IF NOT EXISTS umpire_game_assignments (
 CREATE INDEX IF NOT EXISTS idx_uga_game_id ON umpire_game_assignments(game_id)
     WHERE game_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_uga_date   ON umpire_game_assignments(date);
+
+CREATE TABLE IF NOT EXISTS sgp_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_id TEXT,
+    legs_json TEXT,
+    joint_prob REAL,
+    naive_parlay_odds REAL,
+    fair_odds REAL,
+    edge_vs_naive REAL,
+    bookmakers TEXT,
+    timestamp TEXT,
+    UNIQUE(game_id, legs_json)
+);
+CREATE INDEX IF NOT EXISTS idx_sgp_candidates_timestamp ON sgp_candidates(timestamp);
+
+-- Fired weather / umpire edge triggers. Used for dedup so we don't re-pull
+-- the same game every cron tick once a threshold is crossed.
+CREATE TABLE IF NOT EXISTS trigger_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_id TEXT NOT NULL,
+    trigger_type TEXT NOT NULL,
+    detail TEXT,
+    triggered_at TEXT NOT NULL,
+    UNIQUE(game_id, trigger_type, triggered_at)
+);
+CREATE INDEX IF NOT EXISTS idx_trigger_events_game
+    ON trigger_events(game_id, trigger_type, triggered_at);

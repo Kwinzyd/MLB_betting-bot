@@ -1,3 +1,4 @@
+from src.config import SHARP_BOOKMAKERS
 from src.data.db import get_db_connection
 from src.models.devig import devig_multiplicative
 from src.utils.logging_utils import get_logger
@@ -163,16 +164,40 @@ def _get_actual_stat(player_name: str, market: str, game_id: str) -> float:
 def _calculate_clv(game_id: str, player_name: str, market: str,
                    line: float, side: str, opening_odds: float) -> float:
     """
-    Calculate Closing Line Value.
-    CLV = closing_implied - opening_implied (positive = we got a better line)
+    Calculate Closing Line Value against a sharp book's devigged closing line.
+
+    Source of truth preference: the most recent snapshot whose bookmaker matches
+    SHARP_BOOKMAKERS (walked in priority order). Soft books (DK/FD/etc.) carry
+    liability-adjusted closes and are only used when no sharp snapshot exists.
+
+    CLV = devigged_closing_implied(sharp) - opening_implied
+    Positive = we beat the sharp close.
     """
     with get_db_connection() as conn:
-        # Get the most recent snapshot as the "closing" line
-        closing = conn.execute('''
-            SELECT over_odds, under_odds FROM prop_snapshots
-            WHERE game_id = ? AND player_name = ? AND market = ? AND line = ?
-            ORDER BY timestamp DESC LIMIT 1
-        ''', (game_id, player_name, market, line)).fetchone()
+        closing = None
+        for sharp_book in SHARP_BOOKMAKERS:
+            row = conn.execute('''
+                SELECT over_odds, under_odds FROM prop_snapshots
+                WHERE game_id = ? AND player_name = ? AND market = ?
+                  AND line = ? AND bookmaker = ?
+                ORDER BY timestamp DESC LIMIT 1
+            ''', (game_id, player_name, market, line, sharp_book)).fetchone()
+            if row and row['over_odds'] and row['under_odds']:
+                closing = row
+                break
+
+        if closing is None:
+            # Fallback: latest snapshot regardless of book. Noisier — soft closes
+            # include liability adjustments — but better than returning 0.
+            logger.debug(
+                f"No sharp-book snapshot for {player_name} {market} {line}; "
+                f"falling back to latest any-book close."
+            )
+            closing = conn.execute('''
+                SELECT over_odds, under_odds FROM prop_snapshots
+                WHERE game_id = ? AND player_name = ? AND market = ? AND line = ?
+                ORDER BY timestamp DESC LIMIT 1
+            ''', (game_id, player_name, market, line)).fetchone()
 
         if not closing or not closing['over_odds'] or not closing['under_odds']:
             return 0.0
@@ -181,13 +206,7 @@ def _calculate_clv(game_id: str, player_name: str, market: str,
             closing['over_odds'], closing['under_odds']
         )
         opening_implied = 1.0 / opening_odds
-
-        if side == 'over':
-            closing_implied = closing_over
-        else:
-            closing_implied = closing_under
-
-        # CLV: if closing implied > opening implied, we captured value
+        closing_implied = closing_over if side == 'over' else closing_under
         return round(closing_implied - opening_implied, 4)
 
 

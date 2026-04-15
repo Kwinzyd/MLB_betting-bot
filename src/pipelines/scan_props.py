@@ -1,7 +1,11 @@
 import uuid
 import json
-from datetime import datetime
-from src.config import MARKETS_MAPPING, UMP_MIN_GAMES, UMP_K_WEIGHT
+import os
+from datetime import datetime, timezone, timedelta
+from src.config import (
+    MARKETS_MAPPING, UMP_MIN_GAMES, UMP_K_WEIGHT, PREGAME_WINDOW_MINUTES,
+    SHARP_BOOKMAKERS,
+)
 from src.clients.odds_api import OddsAPIClient
 from src.clients.weather import WeatherClient
 from src.data.db import get_db_connection
@@ -14,19 +18,42 @@ from src.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
-def scan_props():
+def scan_props(force: bool = False, game_ids: list = None):
     """
     Core pipeline: fetch live odds, run projections, identify edges.
     Batches all 5 markets in a single API call per game to conserve quota.
+
+    Quota gate: a game is polled only when either
+      (a) its lineups were confirmed since its last scan, or
+      (b) first pitch is within PREGAME_WINDOW_MINUTES.
+    Pass force=True (or set ODDS_SCAN_FORCE=1) to bypass the gate for testing.
+
+    game_ids: optional list restricting the scan to specific games. Implies
+    force=True (targeted pulls always bypass the gate) and busts the odds
+    cache for those events so the trigger path beats the 5-min TTL.
     """
     logger.info("Executing pipeline: scan_props")
     odds_client = OddsAPIClient()
     weather_client = WeatherClient()
     proj_model = ProjectionModel()
 
+    force = force or os.getenv("ODDS_SCAN_FORCE", "").lower() in ("1", "true", "yes")
+    targeted = bool(game_ids)
+    if targeted:
+        force = True
+    now_utc = datetime.now(timezone.utc)
+
     # 1. Get active games from DB
     with get_db_connection() as conn:
-        games = conn.execute("SELECT * FROM games WHERE status != 'COMPLETED'").fetchall()
+        if targeted:
+            placeholders = ",".join("?" for _ in game_ids)
+            games = conn.execute(
+                f"SELECT * FROM games WHERE status != 'COMPLETED' "
+                f"AND game_id IN ({placeholders})",
+                tuple(game_ids),
+            ).fetchall()
+        else:
+            games = conn.execute("SELECT * FROM games WHERE status != 'COMPLETED'").fetchall()
 
     if not games:
         logger.info("No active games found for odds scanning.")
@@ -35,12 +62,18 @@ def scan_props():
     # All markets in one call
     markets = list(MARKETS_MAPPING.keys())
     total_edges = 0
+    skipped_quota = 0
 
     for game in games:
         game_id = game['game_id']
         home_team = game['home_team']
         away_team = game['away_team']
         venue = game['venue']
+
+        if not force and not _should_scan_game(game, now_utc):
+            skipped_quota += 1
+            continue
+
         logger.info(f"Scanning: {away_team} @ {home_team}")
 
         # Fetch live weather for this stadium
@@ -53,7 +86,7 @@ def scan_props():
         ump_k_factor = _get_ump_k_factor(game_id)
 
         try:
-            event_odds = odds_client.get_event_odds(game_id, markets)
+            event_odds = odds_client.get_event_odds(game_id, markets, bust_cache=targeted)
         except Exception as e:
             logger.error(f"Failed to fetch odds for {game_id}: {e}")
             continue
@@ -64,21 +97,30 @@ def scan_props():
         # 2. Parse odds and group by player+market+line for devigging
         player_lines = _parse_odds_by_player(event_odds)
 
-        # 3. For each player+market+line, pick best line across books, devig, project, rank
+        # 3. For each player+market+line:
+        #    (a) Devig the sharp book → TRUE probability (source of truth).
+        #    (b) Hunt soft books for the best offer deviating from sharp consensus.
+        #    (c) rank_edge compares sharp_prob vs the soft-book's implied price.
+        #    Props with no sharp quote are skipped — we don't bet without truth.
         for key, line_data in player_lines.items():
             player_name, market_key, line = key
 
-            best = _pick_best_line(line_data)
-            over_odds, over_book = best['over']
-            under_odds, under_book = best['under']
+            sharp_pair = _pick_sharp_pair(line_data, SHARP_BOOKMAKERS)
+            if sharp_pair is None:
+                continue
 
+            sharp_over_odds, sharp_under_odds, sharp_book = sharp_pair
+            sharp_prob_over, sharp_prob_under = devig_multiplicative(
+                sharp_over_odds, sharp_under_odds
+            )
+
+            soft_best = _pick_best_soft_line(line_data, SHARP_BOOKMAKERS)
+            over_odds, over_book = soft_best['over']
+            under_odds, under_book = soft_best['under']
             if not over_odds or not under_odds:
                 continue
             if over_odds <= 1.0 or under_odds <= 1.0:
                 continue
-
-            # Devig using best-of-books pair
-            devigged_over, devigged_under = devig_multiplicative(over_odds, under_odds)
 
             projection = _build_projection(
                 proj_model, player_name, market_key, line,
@@ -91,13 +133,15 @@ def scan_props():
 
             projection['player_name'] = player_name
 
-            # Composite book label when over and under come from different books
+            # Composite book label when over and under come from different soft books
             book_label = over_book if over_book == under_book else f"{over_book}/{under_book}"
 
             snapshot_id = str(uuid.uuid4())
             timestamp = datetime.utcnow().isoformat()
 
             with get_db_connection() as conn:
+                # Primary snapshot: best soft-book offer (what we'd actually bet),
+                # tagged with sharp-devigged truth in devigged_over/under.
                 conn.execute('''
                     INSERT INTO prop_snapshots
                     (snapshot_id, game_id, player_name, market, line,
@@ -107,22 +151,44 @@ def scan_props():
                 ''', (
                     snapshot_id, game_id, player_name, market_key,
                     line, over_odds, under_odds, book_label, timestamp,
-                    devigged_over, devigged_under,
+                    sharp_prob_over, sharp_prob_under,
                 ))
 
+                # Separate snapshot per sharp book (source of truth for CLV).
+                for sb in SHARP_BOOKMAKERS:
+                    sp = line_data.get(sb)
+                    if not sp:
+                        continue
+                    s_over = sp.get('over')
+                    s_under = sp.get('under')
+                    if not s_over or not s_under or s_over <= 1.0 or s_under <= 1.0:
+                        continue
+                    s_dev_over, s_dev_under = devig_multiplicative(s_over, s_under)
+                    conn.execute('''
+                        INSERT INTO prop_snapshots
+                        (snapshot_id, game_id, player_name, market, line,
+                         over_odds, under_odds, bookmaker, timestamp,
+                         devigged_over, devigged_under)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        str(uuid.uuid4()), game_id, player_name, market_key,
+                        line, s_over, s_under, sb, timestamp,
+                        s_dev_over, s_dev_under,
+                    ))
+
                 playable_any = False
-                for side, odds_val, dev_prob, side_book in [
-                    ('over', over_odds, devigged_over, over_book),
-                    ('under', under_odds, devigged_under, under_book),
+                for side, odds_val, sharp_prob, side_book in [
+                    ('over', over_odds, sharp_prob_over, over_book),
+                    ('under', under_odds, sharp_prob_under, under_book),
                 ]:
-                    edge_result = rank_edge(projection, odds_val, side, dev_prob)
+                    edge_result = rank_edge(projection, odds_val, side, sharp_prob)
 
                     if edge_result['is_playable']:
                         total_edges += 1
                         playable_any = True
                         logger.info(
                             f"EDGE FOUND: {player_name} {market_key} {side.upper()} {line} "
-                            f"@ {side_book} | Edge: {edge_result['edge_pct']:.1f}% | "
+                            f"@ {side_book} (vs {sharp_book}) | Edge: {edge_result['edge_pct']:.1f}% | "
                             f"EV: {edge_result['ev']:.3f} | "
                             f"Kelly: ${edge_result['kelly']['recommended_stake']}"
                         )
@@ -147,20 +213,110 @@ def scan_props():
                         context_json, timestamp,
                     ))
 
+                # Stamp last_scanned_at so subsequent scans respect the gate
+                conn.execute(
+                    "UPDATE games SET last_scanned_at = ? WHERE game_id = ?",
+                    (now_utc.isoformat(), game_id),
+                )
                 conn.commit()
 
-    logger.info(f"Scan complete. Found {total_edges} playable edges.")
+    logger.info(
+        f"Scan complete. Found {total_edges} playable edges; "
+        f"skipped {skipped_quota} games by quota gate."
+    )
+
+
+def _parse_iso(ts: str):
+    """Parse an ISO timestamp to UTC-aware datetime. Returns None on bad input."""
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+    except (ValueError, AttributeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _should_scan_game(game, now_utc: datetime) -> bool:
+    """
+    Quota gate. Scan a game only if either:
+      (a) lineups were confirmed after the last scan (new info → re-price), or
+      (b) first pitch is within PREGAME_WINDOW_MINUTES (high-volatility window).
+    """
+    confirmed_at = _parse_iso(game['lineups_confirmed_at'])
+    last_scanned = _parse_iso(game['last_scanned_at'])
+    game_time = _parse_iso(game['game_time'])
+
+    # (a) Lineup drop triggers one re-scan.
+    if confirmed_at is not None:
+        if last_scanned is None or last_scanned < confirmed_at:
+            return True
+
+    # (b) Pregame window: first pitch within PREGAME_WINDOW_MINUTES from now.
+    if game_time is not None:
+        minutes_until = (game_time - now_utc).total_seconds() / 60.0
+        if 0 <= minutes_until <= PREGAME_WINDOW_MINUTES:
+            return True
+
+    return False
 
 
 def _pick_best_line(line_data: dict) -> dict:
     """
-    Given {book: {'over': odds, 'under': odds}}, pick the max odds per side.
-    Returns {'over': (odds|None, book|None), 'under': (odds|None, book|None)}.
-    Over and under may come from different books — that's the point of shopping.
+    Given {book: {'over': odds, 'under': odds}}, pick the max odds per side
+    across all books. Returns {'over': (odds|None, book|None),
+    'under': (odds|None, book|None)}. Over and under may come from different
+    books — that's the point of shopping.
+
+    Kept for back-compat / tests; scan_props now uses _pick_best_soft_line
+    to exclude sharp books from the hunt.
     """
     best_over = (None, None)
     best_under = (None, None)
     for book, pair in line_data.items():
+        over = pair.get('over')
+        under = pair.get('under')
+        if over is not None and (best_over[0] is None or over > best_over[0]):
+            best_over = (over, book)
+        if under is not None and (best_under[0] is None or under > best_under[0]):
+            best_under = (under, book)
+    return {'over': best_over, 'under': best_under}
+
+
+def _pick_sharp_pair(line_data: dict, sharp_books: list):
+    """
+    Walk sharp_books in priority order; return the first (over_odds, under_odds,
+    book) triple where that sharp book quotes both sides with valid prices.
+    Returns None if no sharp book has a full two-sided quote.
+    """
+    for book in sharp_books:
+        pair = line_data.get(book)
+        if not pair:
+            continue
+        over = pair.get('over')
+        under = pair.get('under')
+        if not over or not under:
+            continue
+        if over <= 1.0 or under <= 1.0:
+            continue
+        return (over, under, book)
+    return None
+
+
+def _pick_best_soft_line(line_data: dict, sharp_books: list) -> dict:
+    """
+    Same as _pick_best_line but restricted to non-sharp books. This is the
+    "rogue line hunt": we compare soft-book offers against sharp consensus,
+    so the sharp book's own price should never be the target we're betting.
+    """
+    sharp_set = set(sharp_books)
+    best_over = (None, None)
+    best_under = (None, None)
+    for book, pair in line_data.items():
+        if book in sharp_set:
+            continue
         over = pair.get('over')
         under = pair.get('under')
         if over is not None and (best_over[0] is None or over > best_over[0]):

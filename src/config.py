@@ -16,9 +16,35 @@ MIN_MODEL_PROB = float(os.getenv("MIN_MODEL_PROB", "0.55"))
 MIN_SAMPLE_SIZE = int(os.getenv("MIN_SAMPLE_SIZE", "10"))
 MAX_BETS_PER_GAME = int(os.getenv("MAX_BETS_PER_GAME", "3"))
 MAX_BETS_PER_PLAYER = int(os.getenv("MAX_BETS_PER_PLAYER", "1"))
+PREGAME_WINDOW_MINUTES = int(os.getenv("PREGAME_WINDOW_MINUTES", "45"))
 MLB_SEASON = int(os.getenv("MLB_SEASON", "2026"))
 ODDS_REGION = os.getenv("ODDS_REGION", "us")
 BOOKMAKERS = os.getenv("BOOKMAKERS", "draftkings,fanduel,betmgm,caesars,pointsbetus,betrivers").split(",")
+# Sharp books used as the source of truth for CLV. Priority order: first available wins.
+# Pinnacle lives in the `eu` region feed but is reachable by listing it in the `bookmakers`
+# param of a `us`-region call (Odds API accepts cross-region books via that filter).
+SHARP_BOOKMAKERS = [b.strip() for b in os.getenv("SHARP_BOOKMAKERS", "pinnacle,circasports").split(",") if b.strip()]
+# Max allowed gap between model_prob and sharp-devigged prob for a bet to be
+# playable. Sharp market is near-efficient; a wide gap means the model is
+# wrong. 0.05 = 5 percentage points.
+SHARP_MODEL_AGREEMENT_TOL = float(os.getenv("SHARP_MODEL_AGREEMENT_TOL", "0.05"))
+
+# Same-game-parlay tunables. edge_vs_naive compares our correlation-adjusted
+# joint probability to the independent-multiply parlay price a book would
+# charge if it didn't penalize correlation. Higher than single-bet bar
+# because parlays compound variance.
+SGP_MIN_EDGE = float(os.getenv("SGP_MIN_EDGE", "0.10"))
+SGP_MAX_PER_GAME = int(os.getenv("SGP_MAX_PER_GAME", "1"))
+SGP_MAX_PER_DAY = int(os.getenv("SGP_MAX_PER_DAY", "3"))
+
+# Weather / umpire edge-trigger thresholds. Fire a targeted odds pull when an
+# environmental input shifts enough that our projections meaningfully move
+# before the books have re-priced.
+TRIGGER_UMP_THRESHOLD = float(os.getenv("TRIGGER_UMP_THRESHOLD", "0.10"))
+TRIGGER_WEATHER_HR_THRESHOLD = float(os.getenv("TRIGGER_WEATHER_HR_THRESHOLD", "0.05"))
+TRIGGER_WEATHER_SO_THRESHOLD = float(os.getenv("TRIGGER_WEATHER_SO_THRESHOLD", "0.03"))
+TRIGGER_DEDUP_HOURS = int(os.getenv("TRIGGER_DEDUP_HOURS", "6"))
+
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 DB_PATH = os.getenv("DB_PATH", "data.db")
 

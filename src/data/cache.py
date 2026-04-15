@@ -20,6 +20,9 @@ class SimpleCache:
             'expires_at': time.time() + ttl_seconds
         }
 
+    def delete(self, key):
+        self._cache.pop(key, None)
+
     def clear(self):
         self._cache = {}
 

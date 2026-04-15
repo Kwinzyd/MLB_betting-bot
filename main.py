@@ -5,6 +5,8 @@ from src.pipelines.sync_injuries import sync_injuries
 from src.pipelines.sync_stats import sync_stats
 from src.pipelines.scan_props import scan_props
 from src.pipelines.send_alerts import send_alerts
+from src.pipelines.find_sgp import find_and_alert_sgps
+from src.pipelines.trigger_watch import run_trigger_watch
 from src.pipelines.sync_lineups import sync_lineups
 from src.pipelines.sync_umpires import sync_umpires
 from src.pipelines.settle_results import settle_results
@@ -17,7 +19,8 @@ logger = get_logger(__name__)
 def main():
     parser = argparse.ArgumentParser(description="MLB Player Prop Betting Bot")
     parser.add_argument('command', choices=['sync', 'scan', 'run', 'settle', 'prune',
-                                             'backtest', 'backfill', 'train'],
+                                             'backtest', 'backfill', 'train', 'sgp',
+                                             'trigger', 'walkforward'],
                         help="Command to execute")
 
     # backtest-specific flags (ignored for other commands)
@@ -37,6 +40,18 @@ def main():
     parser.add_argument('--compare', choices=['sklearn'], default=None,
                         help="train: also fit sklearn RF/GB for comparison")
 
+    # walkforward flags
+    parser.add_argument('--train-window', type=int, default=45, metavar='DAYS',
+                        help="walkforward: training window length in days (default 45)")
+    parser.add_argument('--step', type=int, default=7, metavar='DAYS',
+                        help="walkforward: step size between folds in days (default 7)")
+    parser.add_argument('--mode', choices=['sliding', 'expanding'], default='sliding',
+                        help="walkforward: sliding (fixed window) or expanding training set")
+
+    # scan flags
+    parser.add_argument('--force', action='store_true',
+                        help="scan: bypass the quota gate and scan every active game")
+
     args = parser.parse_args()
 
     # Always ensure DB is initialized
@@ -53,7 +68,7 @@ def main():
 
         elif args.command == 'scan':
             logger.info("Running SCAN mode...")
-            scan_props()
+            scan_props(force=args.force)
 
         elif args.command == 'run':
             logger.info("Running FULL pipeline (sync -> scan -> alerts)...")
@@ -62,8 +77,31 @@ def main():
             sync_lineups()
             sync_umpires()
             # sync_stats() omitted by default (slow, run separately)
-            scan_props()
+            scan_props(force=args.force)
             send_alerts()
+            find_and_alert_sgps()
+
+        elif args.command == 'sgp':
+            logger.info("Running SGP mode...")
+            find_and_alert_sgps()
+
+        elif args.command == 'trigger':
+            logger.info("Running TRIGGER WATCH mode...")
+            run_trigger_watch()
+
+        elif args.command == 'walkforward':
+            from src.pipelines.walk_forward import walk_forward_all, print_walk_forward_report
+            logger.info(
+                f"Running WALK-FORWARD backtest "
+                f"(window={args.train_window}d, step={args.step}d, mode={args.mode})..."
+            )
+            results = walk_forward_all(
+                markets=args.markets,
+                train_window_days=args.train_window,
+                step_days=args.step,
+                mode=args.mode,
+            )
+            print_walk_forward_report(results)
 
         elif args.command == 'settle':
             logger.info("Running SETTLE mode...")
