@@ -155,30 +155,21 @@ def scan_props(force: bool = False, game_ids: list = None):
                     LIMIT 1
                 ''', (game_id, player_name, market_key, line)).fetchone()
 
-                # Primary snapshot: best soft-book offer (what we'd actually bet),
-                # tagged with sharp-devigged truth in devigged_over/under.
-                conn.execute('''
-                    INSERT INTO prop_snapshots
-                    (snapshot_id, game_id, player_name, market, line,
-                     over_odds, under_odds, bookmaker, timestamp,
-                     devigged_over, devigged_under)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    snapshot_id, game_id, player_name, market_key,
-                    line, over_odds, under_odds, book_label, timestamp,
-                    sharp_prob_over, sharp_prob_under,
-                ))
+                # Pre-calculate steam detection before overwriting latest snaps
+                steam_over = _detect_steam_in_soft_books(conn, game_id, player_name, market_key, line, 'over', line_data, SHARP_BOOKMAKERS)
+                steam_under = _detect_steam_in_soft_books(conn, game_id, player_name, market_key, line, 'under', line_data, SHARP_BOOKMAKERS)
 
-                # Separate snapshot per sharp book (source of truth for CLV).
-                for sb in SHARP_BOOKMAKERS:
-                    sp = line_data.get(sb)
-                    if not sp:
+                # Store snapshots for all books to track convergence and market sweeps
+                for book, pair in line_data.items():
+                    o_odds = pair.get('over')
+                    u_odds = pair.get('under')
+                    if not o_odds or not u_odds or o_odds <= 1.0 or u_odds <= 1.0:
                         continue
-                    s_over = sp.get('over')
-                    s_under = sp.get('under')
-                    if not s_over or not s_under or s_over <= 1.0 or s_under <= 1.0:
-                        continue
-                    s_dev_over, s_dev_under = devig_multiplicative(s_over, s_under)
+                        
+                    dev_o, dev_u = None, None
+                    if book in SHARP_BOOKMAKERS:
+                        dev_o, dev_u = devig_multiplicative(o_odds, u_odds)
+                        
                     conn.execute('''
                         INSERT INTO prop_snapshots
                         (snapshot_id, game_id, player_name, market, line,
@@ -187,8 +178,8 @@ def scan_props(force: bool = False, game_ids: list = None):
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
                         str(uuid.uuid4()), game_id, player_name, market_key,
-                        line, s_over, s_under, sb, timestamp,
-                        s_dev_over, s_dev_under,
+                        line, o_odds, u_odds, book, timestamp,
+                        dev_o, dev_u,
                     ))
 
                 playable_any = False
@@ -197,7 +188,11 @@ def scan_props(force: bool = False, game_ids: list = None):
                     ('under', under_odds, sharp_prob_under, under_book),
                 ]:
                     opening_prob = opening_row[f'devigged_{side}'] if opening_row else None
-                    edge_result = rank_edge(projection, odds_val, side, sharp_prob, opening_prob=opening_prob)
+                    is_steam = steam_over if side == 'over' else steam_under
+                    edge_result = rank_edge(
+                        projection, odds_val, side, sharp_prob, 
+                        opening_prob=opening_prob, steam_detected=is_steam
+                    )
 
                     if edge_result['is_playable']:
                         total_edges += 1
@@ -253,6 +248,36 @@ def _parse_iso(ts: str):
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def _detect_steam_in_soft_books(conn, game_id, player_name, market_key, line, side, current_line_data, sharp_books):
+    """
+    Check if at least 3 soft books have shortened their odds on 'side' 
+    compared to their most recent recorded snapshot.
+    """
+    steam_count = 0
+    sharp_set = set(sharp_books)
+    for book, pair in current_line_data.items():
+        if book in sharp_set:
+            continue
+        curr_odds = pair.get(side)
+        if not curr_odds:
+            continue
+            
+        last_snap = conn.execute('''
+            SELECT over_odds, under_odds
+            FROM prop_snapshots
+            WHERE game_id = ? AND player_name = ? AND market = ? AND line = ? AND bookmaker = ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+        ''', (game_id, player_name, market_key, line, book)).fetchone()
+        
+        if last_snap:
+            last_odds = last_snap[f'{side}_odds']
+            if last_odds and curr_odds < last_odds:  # Odds shrank -> Implied prob increased
+                steam_count += 1
+                
+    return steam_count >= 3
 
 
 def _should_scan_game(game, now_utc: datetime) -> bool:
@@ -446,12 +471,14 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
         if injury_status in ('IL', 'Out'):
             return None
             
-        # Precompute bullpen factors
         pitcher_bullpen_era = compute_bullpen_factor(team_id, today, db=conn)
         opp_bullpen_era = compute_bullpen_factor(opp_team_id, today, db=conn)
         extra_features = {
             'pitcher_bullpen_era': pitcher_bullpen_era,
-            'opp_bullpen_era': opp_bullpen_era
+            'opp_bullpen_era': opp_bullpen_era,
+            'opp_team_id': opp_team_id,
+            'pitcher_id': player_id,
+            'db': conn
         }
 
         # Build projection based on market type

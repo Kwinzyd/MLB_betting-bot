@@ -307,9 +307,15 @@ class BacktestEngine:
             )
             lineup_pos = self._lookup_lineup_position(conn, player['name'], game_id)
 
+            # Approximate historical game total based on both teams' recent run rates
+            home_runs_pg = self._historical_opp_runs_pg(conn, home_team, game_date)
+            away_runs_pg = self._historical_opp_runs_pg(conn, away_team, game_date)
+            game_total = home_runs_pg + away_runs_pg
+
             return self._proj.project_batter_stat(
                 logs, stat_type, pitcher_hand, player['bats'] or '',
                 venue, line, lineup_position=lineup_pos,
+                game_total=game_total,
             )
 
         return None

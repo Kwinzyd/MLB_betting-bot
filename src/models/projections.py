@@ -266,7 +266,7 @@ class ProjectionModel:
         
         # Bullpen effect: a bad bullpen allows more of the starter's inherited runners to score
         pitcher_bullpen_era = extra_features.get('pitcher_bullpen_era', LEAGUE_AVG_RUNS_PER_GAME) if extra_features else LEAGUE_AVG_RUNS_PER_GAME
-        bp_adj = 1.0 + ((pitcher_bullpen_era / LEAGUE_AVG_RUNS_PER_GAME) - 1.0) * 0.15 if LEAGUE_AVG_RUNS_PER_GAME > 0 else 1.0
+        bp_adj = 1.0 + ((pitcher_bullpen_era / LEAGUE_AVG_RUNS_PER_GAME) - 1.0) * bp_weight if LEAGUE_AVG_RUNS_PER_GAME > 0 else 1.0
         
         projected_er = (blended_era / 9.0) * proj_ip * opp_adj * park_adj * ump_er_factor * bp_adj
 
@@ -307,7 +307,8 @@ class ProjectionModel:
                             weather: dict = None,
                             extra_features: dict = None,
                             player_id: int = None,
-                            game_total: float = None) -> Optional[Dict]:
+                            game_total: float = None,
+                            bp_weight: float = 0.10) -> Optional[Dict]:
         """
         Project a batter stat (hits, total_bases, home_runs).
 
@@ -379,7 +380,7 @@ class ProjectionModel:
 
         # Bullpen effect: bad opposing bullpen gives batters more late-inning opportunities
         opp_bullpen_era = extra_features.get('opp_bullpen_era', LEAGUE_AVG_RUNS_PER_GAME) if extra_features else LEAGUE_AVG_RUNS_PER_GAME
-        bp_adj = 1.0 + ((opp_bullpen_era / LEAGUE_AVG_RUNS_PER_GAME) - 1.0) * 0.10 if LEAGUE_AVG_RUNS_PER_GAME > 0 else 1.0
+        bp_adj = 1.0 + ((opp_bullpen_era / LEAGUE_AVG_RUNS_PER_GAME) - 1.0) * bp_weight if LEAGUE_AVG_RUNS_PER_GAME > 0 else 1.0
 
         # Final projection: rate * opportunities * adjustments
         projected = blended_per_pa * projected_pa * platoon_adj * park_adj * bp_adj

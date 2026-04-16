@@ -55,6 +55,7 @@ PITCHER_FEATURE_NAMES: List[str] = [
     "hr_per_9_l10",
     "k_volatility_l10",
     "ip_volatility_l10",
+    "h2h_k_per_9_delta",
 ]
 
 BATTER_FEATURE_NAMES: List[str] = [
@@ -246,6 +247,54 @@ def compute_bullpen_factor(opp_team_id: int, game_date: str, db=None) -> float:
     return LEAGUE_AVG_RUNS_PER_GAME
 
 
+def compute_pitcher_h2h_vs_team(pitcher_id: int, opp_team_id: int, game_date: str, db=None) -> float:
+    """
+    Returns the difference in K/9 between a pitcher's historical performance vs 
+    a specific opposing team and their overall season average prior to the game.
+    """
+    if db is None or not opp_team_id or not pitcher_id:
+        return 0.0
+
+    try:
+        rows = db.execute(
+            """
+            SELECT SUM(pgl.strikeouts) AS k, SUM(pgl.innings_pitched) AS ip
+            FROM pitcher_game_logs pgl
+            JOIN games g ON pgl.game_id = g.bdl_game_id
+            WHERE pgl.player_id = ?
+              AND pgl.date < ?
+              AND (g.home_team_id = ? OR g.away_team_id = ?)
+            """,
+            (pitcher_id, game_date, opp_team_id, opp_team_id),
+        ).fetchone()
+
+        # Minimum 5 IP vs this team to avoid extreme variance
+        if not rows or not rows['ip'] or rows['ip'] < 5.0:
+            return 0.0
+
+        h2h_k_per_9 = _safe_div((rows['k'] or 0) * 9.0, rows['ip'])
+
+        season_rows = db.execute(
+            """
+            SELECT SUM(strikeouts) AS k, SUM(innings_pitched) AS ip
+            FROM pitcher_game_logs
+            WHERE player_id = ? AND date < ?
+            """,
+            (pitcher_id, game_date)
+        ).fetchone()
+        
+        if not season_rows or not season_rows['ip']:
+            return 0.0
+            
+        season_k_per_9 = _safe_div((season_rows['k'] or 0) * 9.0, season_rows['ip'])
+        
+        return h2h_k_per_9 - season_k_per_9
+    except Exception:
+        pass
+        
+    return 0.0
+
+
 def _extract_weather(weather: Optional[Dict]) -> Tuple[float, float]:
     if not weather:
         return 72.0, 5.0
@@ -323,6 +372,12 @@ def build_pitcher_features(pitcher_logs: List[Dict],
     k_vol_l10 = _rolling_pitcher_start_stdev(logs, "strikeouts", 10)
     ip_vol_l10 = _rolling_pitcher_start_stdev(logs, "innings_pitched", 10)
 
+    h2h_k_delta = 0.0
+    if extra.get("db") and extra.get("pitcher_id") and extra.get("opp_team_id"):
+        h2h_k_delta = compute_pitcher_h2h_vs_team(
+            extra["pitcher_id"], extra["opp_team_id"], game_date, extra["db"]
+        )
+
     values = [
         l5["k_per_9"],
         l10["k_per_9"],
@@ -348,6 +403,7 @@ def build_pitcher_features(pitcher_logs: List[Dict],
         float(hr_per_9_l10),
         float(k_vol_l10),
         float(ip_vol_l10),
+        float(h2h_k_delta),
     ]
     return np.array(values, dtype=np.float64)
 

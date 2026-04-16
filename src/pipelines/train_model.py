@@ -105,6 +105,9 @@ def _build_pitcher_dataset(market: str) -> Tuple[np.ndarray, np.ndarray, np.ndar
                     "month_of_season": None,
                     "rest_days": compute_rest_days(prior, row.get("date")),
                     "opp_bullpen_era": compute_bullpen_factor(opp_team_id, row.get("date"), conn),
+                    "db": conn,
+                    "pitcher_id": player_id,
+                    "opp_team_id": opp_team_id,
                 }
 
                 X = build_pitcher_features(

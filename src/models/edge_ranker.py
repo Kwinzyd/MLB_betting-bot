@@ -35,7 +35,8 @@ def line_movement_signal(current_prob: float, opening_prob: float) -> Dict[str, 
 
 
 def rank_edge(projection: Dict[str, Any], odds: float, side: str,
-              sharp_prob: float, opening_prob: float = None) -> Dict[str, Any]:
+              sharp_prob: float, opening_prob: float = None,
+              steam_detected: bool = False) -> Dict[str, Any]:
     """
     Rank a soft-book offer against the sharp-devigged "true" probability.
 
@@ -57,6 +58,8 @@ def rank_edge(projection: Dict[str, Any], odds: float, side: str,
     ev = (sharp_prob * odds) - 1.0
     lm_signal = line_movement_signal(sharp_prob, opening_prob)
     adjusted_fraction = KELLY_FRACTION * lm_signal["multiplier"]
+    if steam_detected:
+        adjusted_fraction *= 1.5
     kelly = fractional_kelly(sharp_prob, odds, fraction=adjusted_fraction)
 
     is_playable = True
@@ -110,4 +113,5 @@ def rank_edge(projection: Dict[str, Any], odds: float, side: str,
         "reasons": reasons,
         "kelly": kelly,
         "line_movement": lm_signal,
+        "steam_detected": steam_detected,
     }
