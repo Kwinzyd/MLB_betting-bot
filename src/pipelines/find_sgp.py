@@ -64,16 +64,16 @@ def _build_candidates():
         away_team = game['away_team']
 
         for anchor, opposing_team in _find_pitcher_anchors(
-            game_id, home_team, away_team
+            conn, game_id, home_team, away_team
         ):
-            opp_legs = _find_opposing_under_legs(game_id, opposing_team)
+            opp_legs = _find_opposing_under_legs(conn, game_id, opposing_team)
             if len(opp_legs) < 2:
                 continue
             for a, b in itertools.combinations(opp_legs, 2):
                 if a['player_name'] == b['player_name']:
                     continue
                 legs = [anchor, a, b]
-                p = joint_probability(legs)
+                p = joint_probability(legs, db_conn=conn)
                 if p <= 0:
                     continue
                 parlay_odds = parlay_decimal_odds(legs)
@@ -93,74 +93,74 @@ def _build_candidates():
     return out
 
 
-def _find_pitcher_anchors(game_id, home_team, away_team):
+def _find_pitcher_anchors(conn, game_id, home_team, away_team):
     """Yield (anchor_leg, opposing_team_name) for each playable pitcher K-over
     candidate on this game."""
     sharp_set = set(SHARP_BOOKMAKERS)
-    with get_db_connection() as conn:
-        placeholders = ','.join('?' for _ in sharp_set) or "''"
-        rows = conn.execute(f'''
-            SELECT p.player_name,
-                   ps.line, ps.over_odds, ps.bookmaker, ps.devigged_over
-            FROM projections p
-            JOIN prop_snapshots ps
-              ON p.game_id = ps.game_id
-             AND p.player_name = ps.player_name
-             AND p.market = ps.market
-            WHERE p.game_id = ?
-              AND p.market = 'pitcher_strikeouts'
-              AND ps.bookmaker NOT IN ({placeholders})
-              AND ps.over_odds > 1.0
-              AND ps.devigged_over IS NOT NULL
-        ''', (game_id, *sharp_set)).fetchall()
+    placeholders = ','.join('?' for _ in sharp_set) or "''"
+    rows = conn.execute(f'''
+        SELECT p.player_name, pl.player_id,
+               ps.line, ps.over_odds, ps.bookmaker, ps.devigged_over
+        FROM projections p
+        JOIN players pl ON p.player_name = pl.name COLLATE NOCASE
+        JOIN prop_snapshots ps
+          ON p.game_id = ps.game_id
+         AND p.player_name = ps.player_name
+         AND p.market = ps.market
+        WHERE p.game_id = ?
+          AND p.market = 'pitcher_strikeouts'
+          AND ps.bookmaker NOT IN ({placeholders})
+          AND ps.over_odds > 1.0
+          AND ps.devigged_over IS NOT NULL
+    ''', (game_id, *sharp_set)).fetchall()
 
-        for row in rows:
-            pp = conn.execute(
-                "SELECT team FROM probable_pitchers "
-                "WHERE game_id = ? AND player_name = ? COLLATE NOCASE",
-                (game_id, row['player_name'])
-            ).fetchone()
-            if not pp:
-                continue
-            pitcher_team = pp['team']
-            opposing = (
-                away_team if _team_matches(pitcher_team, home_team)
-                else home_team
-            )
-            yield ({
-                'player_name': row['player_name'],
-                'market': 'pitcher_strikeouts',
-                'side': 'over',
-                'line': row['line'],
-                'odds': row['over_odds'],
-                'prob': row['devigged_over'],
-                'bookmaker': row['bookmaker'],
-            }, opposing)
+    for row in rows:
+        pp = conn.execute(
+            "SELECT team FROM probable_pitchers "
+            "WHERE game_id = ? AND player_name = ? COLLATE NOCASE",
+            (game_id, row['player_name'])
+        ).fetchone()
+        if not pp:
+            continue
+        pitcher_team = pp['team']
+        opposing = (
+            away_team if _team_matches(pitcher_team, home_team)
+            else home_team
+        )
+        yield ({
+            'player_name': row['player_name'],
+            'player_id': row['player_id'],
+            'market': 'pitcher_strikeouts',
+            'side': 'over',
+            'line': row['line'],
+            'odds': row['over_odds'],
+            'prob': row['devigged_over'],
+            'bookmaker': row['bookmaker'],
+        }, opposing)
 
 
-def _find_opposing_under_legs(game_id, opposing_team):
+def _find_opposing_under_legs(conn, game_id, opposing_team):
     """Playable hits-under / total_bases-under legs for batters on opposing_team."""
     sharp_set = set(SHARP_BOOKMAKERS)
-    with get_db_connection() as conn:
-        placeholders = ','.join('?' for _ in sharp_set) or "''"
-        rows = conn.execute(f'''
-            SELECT p.player_name, p.market,
-                   ps.line, ps.under_odds, ps.bookmaker, ps.devigged_under
-            FROM projections p
-            JOIN prop_snapshots ps
-              ON p.game_id = ps.game_id
-             AND p.player_name = ps.player_name
-             AND p.market = ps.market
-            JOIN daily_lineups dl
-              ON dl.game_id = p.game_id
-             AND dl.player_name = p.player_name COLLATE NOCASE
-            WHERE p.game_id = ?
-              AND dl.team LIKE ? COLLATE NOCASE
-              AND p.market IN ('batter_hits', 'batter_total_bases')
-              AND ps.bookmaker NOT IN ({placeholders})
-              AND ps.under_odds > 1.0
-              AND ps.devigged_under IS NOT NULL
-        ''', (game_id, f"%{opposing_team}%", *sharp_set)).fetchall()
+    placeholders = ','.join('?' for _ in sharp_set) or "''"
+    rows = conn.execute(f'''
+        SELECT p.player_name, p.market,
+               ps.line, ps.under_odds, ps.bookmaker, ps.devigged_under
+        FROM projections p
+        JOIN prop_snapshots ps
+          ON p.game_id = ps.game_id
+         AND p.player_name = ps.player_name
+         AND p.market = ps.market
+        JOIN daily_lineups dl
+          ON dl.game_id = p.game_id
+         AND dl.player_name = p.player_name COLLATE NOCASE
+        WHERE p.game_id = ?
+          AND dl.team LIKE ? COLLATE NOCASE
+          AND p.market IN ('batter_hits', 'batter_total_bases')
+          AND ps.bookmaker NOT IN ({placeholders})
+          AND ps.under_odds > 1.0
+          AND ps.devigged_under IS NOT NULL
+    ''', (game_id, f"%{opposing_team}%", *sharp_set)).fetchall()
 
     return [{
         'player_name': r['player_name'],

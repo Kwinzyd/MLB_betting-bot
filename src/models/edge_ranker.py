@@ -1,7 +1,7 @@
 from typing import Dict, Any
 from src.config import (
     EDGE_MIN, MIN_ODDS, MIN_MODEL_PROB, MIN_SAMPLE_SIZE,
-    SHARP_MODEL_AGREEMENT_TOL,
+    SHARP_MODEL_AGREEMENT_TOL, KELLY_FRACTION
 )
 from src.models.kelly import fractional_kelly
 from src.utils.logging_utils import get_logger
@@ -9,8 +9,33 @@ from src.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
+def line_movement_signal(current_prob: float, opening_prob: float) -> Dict[str, Any]:
+    """
+    Compare current sharp probability to opening sharp probability.
+    Returns tracking info and Kelly multiplier.
+    If sharp money moves against us, kill the bet or reduce Kelly.
+    """
+    if opening_prob is None:
+        return {"is_killed": False, "multiplier": 1.0, "diff": 0.0}
+
+    diff = current_prob - opening_prob
+    kill = False
+
+    if diff <= -0.015:
+        kill = True # Sharp moved against us by 1.5%+
+        multiplier = 0.0
+    elif diff < 0.0:
+        multiplier = 0.5 # Slight fade, reduce size
+    elif diff >= 0.015:
+        multiplier = 1.5 # Caught steam, bump size
+    else:
+        multiplier = 1.0 # Negligible
+
+    return {"is_killed": kill, "multiplier": multiplier, "diff": round(diff, 4)}
+
+
 def rank_edge(projection: Dict[str, Any], odds: float, side: str,
-              sharp_prob: float) -> Dict[str, Any]:
+              sharp_prob: float, opening_prob: float = None) -> Dict[str, Any]:
     """
     Rank a soft-book offer against the sharp-devigged "true" probability.
 
@@ -30,10 +55,16 @@ def rank_edge(projection: Dict[str, Any], odds: float, side: str,
     book_implied = 1.0 / odds
     edge_pct = (sharp_prob - book_implied) * 100
     ev = (sharp_prob * odds) - 1.0
-    kelly = fractional_kelly(sharp_prob, odds)
+    lm_signal = line_movement_signal(sharp_prob, opening_prob)
+    adjusted_fraction = KELLY_FRACTION * lm_signal["multiplier"]
+    kelly = fractional_kelly(sharp_prob, odds, fraction=adjusted_fraction)
 
     is_playable = True
     reasons = []
+
+    if lm_signal["is_killed"]:
+        is_playable = False
+        reasons.append(f"Line moved against us (steam diff: {lm_signal['diff']})")
 
     if edge_pct < EDGE_MIN:
         is_playable = False
@@ -78,4 +109,5 @@ def rank_edge(projection: Dict[str, Any], odds: float, side: str,
         "is_playable": is_playable,
         "reasons": reasons,
         "kelly": kelly,
+        "line_movement": lm_signal,
     }

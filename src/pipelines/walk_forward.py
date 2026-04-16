@@ -28,6 +28,7 @@ from src.pipelines.train_model import (
     _ALL_MARKETS,
     _BATTER_MARKETS,
     _PITCHER_MARKETS,
+    _batch_predict,
     _build_batter_dataset,
     _build_pitcher_dataset,
     _evaluate,
@@ -127,11 +128,17 @@ def walk_forward_market(
             continue
 
         metrics = _evaluate(glm, X[test_mask], y[test_mask], exp_[test_mask])
+        y_test = y[test_mask].astype(float)
+        mu_test = _batch_predict(glm, X[test_mask], exp_[test_mask])
+        mean_mu = float(np.mean(mu_test)) if len(mu_test) > 0 else 1.0
+        var_resid = float(np.var(y_test - mu_test, ddof=1)) if len(mu_test) > 1 else 0.0
+        var_ratio = round(var_resid / max(mean_mu, 1e-6), 4)
         metrics.update({
             "test_start": test_start,
             "test_end": test_end,
             "n_train": n_train,
             "converged": glm.converged_,
+            "var_ratio": var_ratio,
         })
         folds.append(metrics)
 
@@ -142,13 +149,15 @@ def walk_forward_market(
     total_n = sum(f["n"] for f in folds)
     weighted_mae = sum(f["mae"] * f["n"] for f in folds) / max(1, total_n)
     weighted_dev = sum(f["poisson_deviance"] * f["n"] for f in folds) / max(1, total_n)
+    weighted_var_ratio = sum(f["var_ratio"] * f["n"] for f in folds) / max(1, total_n)
 
-    by_month = defaultdict(lambda: {"n": 0, "mae_num": 0.0, "dev_num": 0.0})
+    by_month = defaultdict(lambda: {"n": 0, "mae_num": 0.0, "dev_num": 0.0, "vr_num": 0.0})
     for f in folds:
         ym = f["test_start"][:7]  # YYYY-MM
         by_month[ym]["n"] += f["n"]
         by_month[ym]["mae_num"] += f["mae"] * f["n"]
         by_month[ym]["dev_num"] += f["poisson_deviance"] * f["n"]
+        by_month[ym]["vr_num"] += f["var_ratio"] * f["n"]
     monthly = []
     for ym in sorted(by_month):
         agg = by_month[ym]
@@ -157,6 +166,7 @@ def walk_forward_market(
             "n": agg["n"],
             "mae": round(agg["mae_num"] / max(1, agg["n"]), 4),
             "poisson_deviance": round(agg["dev_num"] / max(1, agg["n"]), 4),
+            "var_ratio": round(agg["vr_num"] / max(1, agg["n"]), 4),
         })
 
     return {
@@ -168,6 +178,7 @@ def walk_forward_market(
         "n_folds": len(folds),
         "weighted_mae": round(weighted_mae, 4),
         "weighted_poisson_deviance": round(weighted_dev, 4),
+        "weighted_var_ratio": round(weighted_var_ratio, 4),
         "monthly": monthly,
         "folds": folds,
     }
@@ -208,11 +219,12 @@ def print_walk_forward_report(results: List[Dict]) -> None:
         )
         print(f"  weighted MAE      : {r['weighted_mae']}")
         print(f"  weighted deviance : {r['weighted_poisson_deviance']}")
+        print(f"  weighted var_ratio: {r.get('weighted_var_ratio', 'N/A')}")
         if r.get("monthly"):
             print(f"  monthly drift:")
-            print(f"    {'month':<9} {'n':>6} {'mae':>8} {'deviance':>10}")
+            print(f"    {'month':<9} {'n':>6} {'mae':>8} {'deviance':>10} {'var_ratio':>10}")
             for m in r["monthly"]:
                 print(
                     f"    {m['month']:<9} {m['n']:>6} {m['mae']:>8.4f} "
-                    f"{m['poisson_deviance']:>10.4f}"
+                    f"{m['poisson_deviance']:>10.4f} {m.get('var_ratio', 0):>10.4f}"
                 )

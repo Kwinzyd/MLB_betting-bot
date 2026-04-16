@@ -14,6 +14,8 @@ from src.models.devig import devig_multiplicative
 from src.models.projections import ProjectionModel
 from src.models.edge_ranker import rank_edge
 from src.utils.logging_utils import get_logger
+from src.data.feature_builder import compute_bullpen_factor
+from src.utils.time_utils import get_eastern_local_date
 
 logger = get_logger(__name__)
 
@@ -59,8 +61,9 @@ def scan_props(force: bool = False, game_ids: list = None):
         logger.info("No active games found for odds scanning.")
         return
 
-    # All markets in one call
+    # All markets in one call; include game totals for PA scaling (zero extra quota)
     markets = list(MARKETS_MAPPING.keys())
+    api_markets = markets + ["totals"]
     total_edges = 0
     skipped_quota = 0
 
@@ -86,7 +89,7 @@ def scan_props(force: bool = False, game_ids: list = None):
         ump_k_factor = _get_ump_k_factor(game_id)
 
         try:
-            event_odds = odds_client.get_event_odds(game_id, markets, bust_cache=targeted)
+            event_odds = odds_client.get_event_odds(game_id, api_markets, bust_cache=targeted)
         except Exception as e:
             logger.error(f"Failed to fetch odds for {game_id}: {e}")
             continue
@@ -96,6 +99,7 @@ def scan_props(force: bool = False, game_ids: list = None):
 
         # 2. Parse odds and group by player+market+line for devigging
         player_lines = _parse_odds_by_player(event_odds)
+        game_total = _parse_game_total(event_odds)
 
         # 3. For each player+market+line:
         #    (a) Devig the sharp book → TRUE probability (source of truth).
@@ -126,6 +130,7 @@ def scan_props(force: bool = False, game_ids: list = None):
                 proj_model, player_name, market_key, line,
                 game_id, home_team, away_team, venue,
                 weather=weather, ump_k_factor=ump_k_factor,
+                game_total=game_total,
             )
 
             if not projection:
@@ -140,6 +145,16 @@ def scan_props(force: bool = False, game_ids: list = None):
             timestamp = datetime.utcnow().isoformat()
 
             with get_db_connection() as conn:
+                # Fetch opening prob before inserting new snapshot
+                opening_row = conn.execute('''
+                    SELECT devigged_over, devigged_under 
+                    FROM prop_snapshots 
+                    WHERE game_id = ? AND player_name = ? AND market = ? AND line = ?
+                      AND devigged_over IS NOT NULL
+                    ORDER BY timestamp ASC 
+                    LIMIT 1
+                ''', (game_id, player_name, market_key, line)).fetchone()
+
                 # Primary snapshot: best soft-book offer (what we'd actually bet),
                 # tagged with sharp-devigged truth in devigged_over/under.
                 conn.execute('''
@@ -181,7 +196,8 @@ def scan_props(force: bool = False, game_ids: list = None):
                     ('over', over_odds, sharp_prob_over, over_book),
                     ('under', under_odds, sharp_prob_under, under_book),
                 ]:
-                    edge_result = rank_edge(projection, odds_val, side, sharp_prob)
+                    opening_prob = opening_row[f'devigged_{side}'] if opening_row else None
+                    edge_result = rank_edge(projection, odds_val, side, sharp_prob, opening_prob=opening_prob)
 
                     if edge_result['is_playable']:
                         total_edges += 1
@@ -360,11 +376,34 @@ def _parse_odds_by_player(event_odds: dict) -> dict:
     return result
 
 
+def _parse_game_total(event_odds: dict) -> float | None:
+    """Extract the consensus game total (over/under) line from the API response.
+
+    Returns the median line across bookmakers, or None if unavailable.
+    The totals market has outcomes with name="Over"/"Under" and point=<line>,
+    with no 'description' field (game-level market, not player-level).
+    """
+    lines = []
+    for bookmaker in event_odds.get('bookmakers', []):
+        for market_data in bookmaker.get('markets', []):
+            if market_data['key'] != 'totals':
+                continue
+            for outcome in market_data.get('outcomes', []):
+                if 'point' in outcome:
+                    lines.append(float(outcome['point']))
+                    break  # one line per bookmaker is enough
+    if not lines:
+        return None
+    lines.sort()
+    return lines[len(lines) // 2]
+
+
 def _build_projection(proj_model: ProjectionModel, player_name: str,
                       market_key: str, line: float,
                       game_id: str, home_team: str, away_team: str,
                       venue: str, weather: dict = None,
-                      ump_k_factor: float = 1.0) -> dict:
+                      ump_k_factor: float = 1.0,
+                      game_total: float = None) -> dict:
     """Build a projection for a player+market by looking up their stats in the DB."""
     with get_db_connection() as conn:
         # Find the player
@@ -383,12 +422,20 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
             return None
 
         player_id = player['player_id']
+        team_id = player['team_id']
         position = player['position'] or ''
         bats = player['bats'] or ''
         throws = player['throws'] or ''
+        
+        # Determine opposing team ID
+        home = conn.execute("SELECT team_id FROM teams WHERE name LIKE ? COLLATE NOCASE", (f"%{home_team}%",)).fetchone()
+        away = conn.execute("SELECT team_id FROM teams WHERE name LIKE ? COLLATE NOCASE", (f"%{away_team}%",)).fetchone()
+        
+        home_id = home['team_id'] if home else None
+        away_id = away['team_id'] if away else None
+        opp_team_id = away_id if team_id == home_id else home_id
 
         # Check injury status
-        from src.utils.time_utils import get_eastern_local_date
         today = str(get_eastern_local_date())
         injury = conn.execute(
             "SELECT status FROM injury_reports WHERE player_name = ? AND date = ?",
@@ -398,6 +445,14 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
 
         if injury_status in ('IL', 'Out'):
             return None
+            
+        # Precompute bullpen factors
+        pitcher_bullpen_era = compute_bullpen_factor(team_id, today, db=conn)
+        opp_bullpen_era = compute_bullpen_factor(opp_team_id, today, db=conn)
+        extra_features = {
+            'pitcher_bullpen_era': pitcher_bullpen_era,
+            'opp_bullpen_era': opp_bullpen_era
+        }
 
         # Build projection based on market type
         if market_key == 'pitcher_strikeouts':
@@ -417,6 +472,7 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
 
             proj = proj_model.project_pitcher_strikeouts(
                 logs, opp_k_rate, venue, line, weather=weather, ump_k_factor=ump_k_factor,
+                extra_features=extra_features, player_id=player_id,
             )
             if proj:
                 proj['injury_status'] = injury_status
@@ -435,6 +491,7 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
 
             proj = proj_model.project_pitcher_earned_runs(
                 logs, opp_runs_pg, venue, line, weather=weather, ump_k_factor=ump_k_factor,
+                extra_features=extra_features, player_id=player_id,
             )
             if proj:
                 proj['injury_status'] = injury_status
@@ -463,6 +520,9 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
                 logs, stat_type, pitcher_hand, bats, venue, line,
                 lineup_position=lineup_position,
                 weather=weather,
+                extra_features=extra_features,
+                player_id=player_id,
+                game_total=game_total,
             )
             if proj:
                 proj['injury_status'] = injury_status

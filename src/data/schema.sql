@@ -220,3 +220,19 @@ CREATE TABLE IF NOT EXISTS trigger_events (
 );
 CREATE INDEX IF NOT EXISTS idx_trigger_events_game
     ON trigger_events(game_id, trigger_type, triggered_at);
+
+-- Per-entity overdispersion parameters (NB alpha for counts, residual sigma
+-- for total_bases). Fitted post-hoc after the mean model trains.
+CREATE TABLE IF NOT EXISTS dispersion_params (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_id TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    market TEXT NOT NULL,
+    alpha REAL,
+    sigma REAL,
+    n_obs INTEGER NOT NULL,
+    fitted_at TEXT NOT NULL,
+    UNIQUE(entity_id, market)
+);
+CREATE INDEX IF NOT EXISTS idx_dispersion_lookup
+    ON dispersion_params(entity_id, market);

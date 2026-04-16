@@ -15,19 +15,16 @@ _POISSON_MARKETS = frozenset({
     "batter_home_runs",
 })
 
-# Empirical residual std for total bases; replaced by fitted value if the
-# model training pipeline writes one to models/tb_residual_std.txt.
 _DEFAULT_TB_STD_VARIANCE_FACTOR = 1.2
 
 
 def mc_prob_over(mean: float, line: float, market: str, n_sims: int = 1000,
-                 tb_std: float = None) -> tuple[float, float]:
+                 tb_std: float = None, nb_alpha: float = None) -> tuple[float, float]:
     """
     Returns (prob_over, prob_under) via Monte Carlo simulation.
 
-    - Count markets (K, H, HR, ER) → Poisson sampling.
-    - batter_total_bases → Normal sampling with std from tb_std (or a sqrt(mean * 1.2) default).
-    Over is strict: P(X > line). With .5 lines this coincides with P(X >= ceil(line)).
+    - Count markets: NB sampling when nb_alpha > 0, else Poisson.
+    - batter_total_bases: Normal sampling with tb_std (fitted) or sqrt(mean*1.2) default.
     """
     if mean is None or mean <= 0 or math.isnan(mean):
         return 0.0, 1.0
@@ -35,12 +32,16 @@ def mc_prob_over(mean: float, line: float, market: str, n_sims: int = 1000,
     rng = np.random.default_rng()
 
     if market in _POISSON_MARKETS:
-        samples = rng.poisson(lam=mean, size=n_sims)
+        if nb_alpha is not None and nb_alpha > 0 and math.isfinite(nb_alpha):
+            n = 1.0 / nb_alpha
+            p = 1.0 / (1.0 + nb_alpha * mean)
+            samples = rng.negative_binomial(n, p, size=n_sims)
+        else:
+            samples = rng.poisson(lam=mean, size=n_sims)
     elif market == "batter_total_bases":
         std = tb_std if tb_std is not None else max(0.5, math.sqrt(mean * _DEFAULT_TB_STD_VARIANCE_FACTOR))
         samples = rng.normal(loc=mean, scale=std, size=n_sims)
     else:
-        # Unknown market: fall back to Poisson as the safest count-like default
         samples = rng.poisson(lam=mean, size=n_sims)
 
     prob_over = float(np.mean(samples > line))

@@ -45,6 +45,16 @@ PITCHER_FEATURE_NAMES: List[str] = [
     "is_home",
     "is_day_game",
     "month_of_season",
+    # Pitch-mix + volatility proxies derived from existing game logs.
+    # command: K/BB is the cheapest stand-in for stuff+command when we don't
+    # have pitch-by-pitch data. flyball: HR/9 allowed correlates with FB%,
+    # which interacts with wind/park. volatility: start-to-start stdev in
+    # K and IP — two pitchers with identical means can have very different
+    # over/under distributions. Books price the distribution, not the mean.
+    "k_bb_ratio_l10",
+    "hr_per_9_l10",
+    "k_volatility_l10",
+    "ip_volatility_l10",
 ]
 
 BATTER_FEATURE_NAMES: List[str] = [
@@ -64,6 +74,10 @@ BATTER_FEATURE_NAMES: List[str] = [
     "month_of_season",
     "opp_starter_k_per_9",
     "opp_bullpen_era",
+    # Batter volatility + strikeout-proneness. High-K batters have thinner
+    # hits/TB distributions (more 0s) which matters at the under line.
+    "stat_volatility_l15",
+    "k_rate_l15",
 ]
 
 
@@ -100,6 +114,45 @@ def _rolling_batter_rate(logs: List[Dict], stat_key: str, window: int) -> float:
     stat = sum(l.get(stat_key) or 0 for l in recent)
     pa = sum((l.get('plate_appearances') or 0) or (l.get('at_bats') or 0) for l in recent)
     return _safe_div(stat, pa)
+
+
+def _stdev(values: List[float]) -> float:
+    """Population stdev with safe defaults (0.0 for <2 samples)."""
+    if not values or len(values) < 2:
+        return 0.0
+    arr = np.asarray(values, dtype=np.float64)
+    return float(arr.std(ddof=0))
+
+
+def _rolling_pitcher_hr_per_9(logs: List[Dict], window: int) -> float:
+    """HR allowed per 9 IP over the window. Proxy for flyball tendency."""
+    recent = logs[:window] if logs else []
+    ip = sum(l.get('innings_pitched') or 0 for l in recent)
+    hr = sum(l.get('home_runs_allowed') or 0 for l in recent)
+    return _safe_div(hr * 9.0, ip)
+
+
+def _rolling_pitcher_k_bb_ratio(logs: List[Dict], window: int) -> float:
+    """K/BB ratio — command proxy. BB floored at 1 to avoid div-by-zero inflation."""
+    recent = logs[:window] if logs else []
+    k = sum(l.get('strikeouts') or 0 for l in recent)
+    bb = sum(l.get('walks') or 0 for l in recent)
+    return _safe_div(k, max(bb, 1.0))
+
+
+def _rolling_pitcher_start_stdev(logs: List[Dict], stat_key: str, window: int) -> float:
+    """Start-to-start stdev of a pitcher stat (raw per-start count, not a rate).
+    Captures volatility the mean hides."""
+    recent = logs[:window] if logs else []
+    vals = [float(l.get(stat_key) or 0) for l in recent]
+    return _stdev(vals)
+
+
+def _rolling_batter_game_stdev(logs: List[Dict], stat_key: str, window: int) -> float:
+    """Game-to-game stdev of a batter stat (raw count per game)."""
+    recent = logs[:window] if logs else []
+    vals = [float(l.get(stat_key) or 0) for l in recent]
+    return _stdev(vals)
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +318,11 @@ def build_pitcher_features(pitcher_logs: List[Dict],
     if est_pitch_limit is None:
         est_pitch_limit = int(min(110, max(100, l5["avg_pitches"] + 10))) if l5["avg_pitches"] else 100
 
+    k_bb_ratio_l10 = _rolling_pitcher_k_bb_ratio(logs, 10)
+    hr_per_9_l10 = _rolling_pitcher_hr_per_9(logs, 10)
+    k_vol_l10 = _rolling_pitcher_start_stdev(logs, "strikeouts", 10)
+    ip_vol_l10 = _rolling_pitcher_start_stdev(logs, "innings_pitched", 10)
+
     values = [
         l5["k_per_9"],
         l10["k_per_9"],
@@ -286,6 +344,10 @@ def build_pitcher_features(pitcher_logs: List[Dict],
         float(extra.get("is_day_game") if extra.get("is_day_game") is not None
               else _is_day_game(extra.get("game_time"))),
         float(extra.get("month_of_season") or _month_from_date(game_date)),
+        float(k_bb_ratio_l10),
+        float(hr_per_9_l10),
+        float(k_vol_l10),
+        float(ip_vol_l10),
     ]
     return np.array(values, dtype=np.float64)
 
@@ -346,6 +408,9 @@ def build_batter_features(batter_logs: List[Dict],
     opp_starter_k = extra.get("opp_starter_k_per_9", 8.5)
     opp_bullpen_era = extra.get("opp_bullpen_era", LEAGUE_AVG_RUNS_PER_GAME)
 
+    stat_vol_l15 = _rolling_batter_game_stdev(logs, stat_key, 15)
+    k_rate_l15 = _rolling_batter_rate(logs, "strikeouts", 15)
+
     values = [
         rate_l15,
         rate_season,
@@ -364,5 +429,7 @@ def build_batter_features(batter_logs: List[Dict],
         float(extra.get("month_of_season") or _month_from_date(game_date)),
         float(opp_starter_k),
         float(opp_bullpen_era),
+        float(stat_vol_l15),
+        float(k_rate_l15),
     ]
     return np.array(values, dtype=np.float64)

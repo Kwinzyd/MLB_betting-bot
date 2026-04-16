@@ -20,7 +20,7 @@ def main():
     parser = argparse.ArgumentParser(description="MLB Player Prop Betting Bot")
     parser.add_argument('command', choices=['sync', 'scan', 'run', 'settle', 'prune',
                                              'backtest', 'backfill', 'train', 'sgp',
-                                             'trigger', 'walkforward'],
+                                             'trigger', 'walkforward', 'fit-dispersion'],
                         help="Command to execute")
 
     # backtest-specific flags (ignored for other commands)
@@ -119,6 +119,11 @@ def main():
             seasons = [int(s.strip()) for s in args.seasons.split(',') if s.strip()]
             logger.info(f"Running BACKFILL for seasons={seasons} ...")
             sync_historical(seasons)
+
+        elif args.command == 'fit-dispersion':
+            from src.pipelines.fit_dispersion import fit_all_dispersion
+            logger.info("Running FIT-DISPERSION mode...")
+            fit_all_dispersion()
 
         elif args.command == 'train':
             from src.pipelines.train_model import train_all

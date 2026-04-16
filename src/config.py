@@ -45,6 +45,11 @@ TRIGGER_WEATHER_HR_THRESHOLD = float(os.getenv("TRIGGER_WEATHER_HR_THRESHOLD", "
 TRIGGER_WEATHER_SO_THRESHOLD = float(os.getenv("TRIGGER_WEATHER_SO_THRESHOLD", "0.03"))
 TRIGGER_DEDUP_HOURS = int(os.getenv("TRIGGER_DEDUP_HOURS", "6"))
 
+# Dispersion fitting: per-entity NB alpha / Normal sigma with EB shrinkage.
+DISPERSION_MIN_OBS = int(os.getenv("DISPERSION_MIN_OBS", "10"))
+DISPERSION_PRIOR_K = int(os.getenv("DISPERSION_PRIOR_K", "30"))
+DISPERSION_ALPHA_CAP = float(os.getenv("DISPERSION_ALPHA_CAP", "2.0"))
+
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 DB_PATH = os.getenv("DB_PATH", "data.db")
 
@@ -145,3 +150,5 @@ LINEUP_PA_MAP = {
     9: 3.70,  # 9-hole (pitcher spot in NL / weakest hitter)
 }
 DEFAULT_PROJECTED_PA = 4.0  # Fallback when lineup position is unknown
+LEAGUE_AVG_GAME_TOTAL = LEAGUE_AVG_RUNS_PER_GAME * 2  # both teams combined
+PA_ELASTICITY_TO_TOTAL = 0.35  # 10% more expected runs -> ~3.5% more PAs

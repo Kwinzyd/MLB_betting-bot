@@ -283,4 +283,11 @@ def train_all(compare_sklearn: bool = False) -> List[Dict]:
         except Exception as e:
             logger.error(f"Training failed for {market}: {e}", exc_info=True)
             results.append({"market": market, "trained": False, "error": str(e)})
+
+    try:
+        from src.pipelines.fit_dispersion import fit_all_dispersion
+        fit_all_dispersion()
+    except Exception as e:
+        logger.error(f"Dispersion fitting failed: {e}", exc_info=True)
+
     return results

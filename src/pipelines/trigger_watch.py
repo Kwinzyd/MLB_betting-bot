@@ -64,6 +64,10 @@ def run_trigger_watch():
         if weather_hit and not _already_fired(game_id, 'weather', dedup_cutoff):
             fired.append((game_id, matchup, 'weather', weather_hit))
 
+        platoon_hit = _check_matchup_volatility(game_id, game['home_team'], game['away_team'])
+        if platoon_hit and not _already_fired(game_id, 'platoon', dedup_cutoff):
+            fired.append((game_id, matchup, 'platoon', platoon_hit))
+
     if not fired:
         logger.info("Trigger watch: no extreme conditions detected.")
         return
@@ -138,6 +142,65 @@ def _check_weather(venue, weather_client):
     }
 
 
+def _check_matchup_volatility(game_id, home_team, away_team):
+    """
+    Return detail dict if a probable pitcher averages < 3.5 IP recently (bullpen game)
+    AND the opposing lineup features switch-hitters (who are highly volatile vs relievers).
+    """
+    with get_db_connection() as conn:
+        pitchers = conn.execute(
+            "SELECT player_name, team FROM probable_pitchers WHERE game_id = ?",
+            (game_id,)
+        ).fetchall()
+        
+        for pp in pitchers:
+            pitcher_name = pp['player_name']
+            pitcher_team = pp['team'] or ''
+            
+            # Identify opposing team for the lineup check
+            if pitcher_team.lower() in home_team.lower() or home_team.lower() in pitcher_team.lower():
+                opp_team = away_team
+            else:
+                opp_team = home_team
+                
+            logs = conn.execute(
+                """
+                SELECT pgl.innings_pitched 
+                FROM pitcher_game_logs pgl
+                JOIN players p ON p.player_id = pgl.player_id
+                WHERE p.name = ? COLLATE NOCASE
+                ORDER BY pgl.date DESC LIMIT 5
+                """, (pitcher_name,)
+            ).fetchall()
+            
+            if not logs:
+                continue
+                
+            avg_ip = sum(l['innings_pitched'] or 0 for l in logs) / len(logs)
+            if avg_ip < 3.5:
+                # Potential bullpen game. Check opponent daily lineup for switch hitters
+                hitters = conn.execute(
+                    """
+                    SELECT dl.player_name
+                    FROM daily_lineups dl
+                    JOIN players p ON dl.player_name = p.name COLLATE NOCASE
+                    WHERE dl.game_id = ? AND dl.team LIKE ? COLLATE NOCASE
+                      AND p.bats = 'S'
+                    """, (game_id, f"%{opp_team}%")
+                ).fetchall()
+                
+                if hitters:
+                    switch_names = [h['player_name'] for h in hitters]
+                    return {
+                        'opener': pitcher_name,
+                        'avg_ip': float(avg_ip),
+                        'opp_team': opp_team,
+                        'switch_hitters': switch_names
+                    }
+                    
+    return None
+
+
 def _already_fired(game_id, trigger_type, dedup_cutoff_iso):
     """True if a trigger of this type fired for this game within the dedup window."""
     with get_db_connection() as conn:
@@ -194,5 +257,11 @@ def _format_detail(trigger_type, detail):
             f"{detail['venue']}: {detail['temp_f']:.0f}°F, "
             f"wind {detail['wind_mph']:.0f}mph @ {detail['wind_deg']}° — "
             f"hr×{detail['hr_adjust']:.3f}, so×{detail['so_adjust']:.3f}"
+        )
+    if trigger_type == 'platoon':
+        hitters = ", ".join(detail['switch_hitters'])
+        return (
+            f"Bullpen Game (Opener: {detail['opener']}, avg {detail['avg_ip']:.1f} IP)\n"
+            f"    └ Volatile Switch-Hitters: {hitters}"
         )
     return str(detail)

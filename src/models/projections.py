@@ -10,10 +10,63 @@ from src.config import (
     PITCHER_RECENT_WEIGHT, PITCHER_SEASON_WEIGHT,
     BATTER_RECENT_WEIGHT, BATTER_SEASON_WEIGHT,
     LINEUP_PA_MAP, DEFAULT_PROJECTED_PA,
+    LEAGUE_AVG_GAME_TOTAL, PA_ELASTICITY_TO_TOTAL,
     UMP_ER_K_DAMPENING,
 )
 
 logger = get_logger(__name__)
+
+
+def _scale_pa_for_game_total(base_pa: float, game_total: float | None) -> float:
+    """Scale projected plate appearances based on the game's over/under total.
+
+    Higher game totals imply more baserunners, longer innings, more PAs.
+    The elasticity is ~0.35: a 10% increase in expected runs yields ~3.5% more PAs.
+
+    Returns base_pa unchanged when game_total is None.
+    """
+    if game_total is None:
+        return base_pa
+    pct_deviation = (game_total - LEAGUE_AVG_GAME_TOTAL) / LEAGUE_AVG_GAME_TOTAL
+    scale_factor = 1.0 + PA_ELASTICITY_TO_TOTAL * pct_deviation
+    scale_factor = max(0.90, min(1.15, scale_factor))
+    return round(base_pa * scale_factor, 2)
+
+_dispersion_cache: Dict[tuple, Dict] | None = None
+
+
+def _load_dispersion() -> Dict[tuple, Dict]:
+    """Load dispersion_params table into an in-memory dict, cached across calls."""
+    global _dispersion_cache
+    if _dispersion_cache is not None:
+        return _dispersion_cache
+    _dispersion_cache = {}
+    try:
+        from src.data.db import get_db_connection
+        with get_db_connection() as conn:
+            try:
+                rows = conn.execute(
+                    "SELECT entity_id, market, alpha, sigma FROM dispersion_params"
+                ).fetchall()
+            except Exception:
+                return _dispersion_cache
+            for r in rows:
+                _dispersion_cache[(r["entity_id"], r["market"])] = {
+                    "alpha": r["alpha"],
+                    "sigma": r["sigma"],
+                }
+    except Exception:
+        pass
+    return _dispersion_cache
+
+
+def get_dispersion(entity_id: str, market: str) -> Dict:
+    """Get (alpha, sigma) for an entity+market, falling back to pool."""
+    cache = _load_dispersion()
+    hit = cache.get((str(entity_id), market))
+    if hit:
+        return hit
+    return cache.get(("__pool__", market), {})
 
 _GLM_MARKETS = (
     "pitcher_strikeouts",
@@ -53,7 +106,8 @@ class ProjectionModel:
                                    venue: str, line: float,
                                    weather: dict = None,
                                    ump_k_factor: float = 1.0,
-                                   extra_features: dict = None) -> Optional[Dict]:
+                                   extra_features: dict = None,
+                                   player_id: int = None) -> Optional[Dict]:
         """
         Project pitcher strikeouts for a game.
 
@@ -67,6 +121,8 @@ class ProjectionModel:
         if not pitcher_logs or len(pitcher_logs) < 3:
             return None
 
+        disp = get_dispersion(str(player_id), "pitcher_strikeouts") if player_id else {}
+
         glm_result = self._try_glm_pitcher(
             market="pitcher_strikeouts",
             pitcher_logs=pitcher_logs,
@@ -76,6 +132,7 @@ class ProjectionModel:
             weather=weather,
             ump_k_factor=ump_k_factor,
             extra_features=extra_features,
+            dispersion=disp,
         )
         if glm_result is not None:
             return glm_result
@@ -117,7 +174,9 @@ class ProjectionModel:
         # A large-zone umpire (factor > 1) boosts Ks; a tight zone (factor < 1) suppresses.
         projected_k = (blended_k_per_9 / 9.0) * proj_ip * opp_adj * park_adj * ump_k_factor
 
-        prob_over, prob_under = get_probabilities(projected_k, line, "pitcher_strikeouts")
+        prob_over, prob_under = get_probabilities(
+            projected_k, line, "pitcher_strikeouts", alpha=disp.get("alpha"),
+        )
 
         return {
             "player_name": None,  # set by caller
@@ -147,10 +206,13 @@ class ProjectionModel:
                                     venue: str, line: float,
                                     weather: dict = None,
                                     ump_k_factor: float = 1.0,
-                                    extra_features: dict = None) -> Optional[Dict]:
+                                    extra_features: dict = None,
+                                    player_id: int = None) -> Optional[Dict]:
         """Project pitcher earned runs for a game."""
         if not pitcher_logs or len(pitcher_logs) < 3:
             return None
+
+        disp = get_dispersion(str(player_id), "pitcher_earned_runs") if player_id else {}
 
         glm_result = self._try_glm_pitcher(
             market="pitcher_earned_runs",
@@ -161,6 +223,7 @@ class ProjectionModel:
             weather=weather,
             ump_k_factor=ump_k_factor,
             extra_features=extra_features,
+            dispersion=disp,
         )
         if glm_result is not None:
             return glm_result
@@ -200,9 +263,16 @@ class ProjectionModel:
         # baserunners → slightly fewer ER. The relationship is dampened relative to the
         # direct K adjustment (UMP_ER_K_DAMPENING = 0.3 by default).
         ump_er_factor = 1.0 - (ump_k_factor - 1.0) * UMP_ER_K_DAMPENING
-        projected_er = (blended_era / 9.0) * proj_ip * opp_adj * park_adj * ump_er_factor
+        
+        # Bullpen effect: a bad bullpen allows more of the starter's inherited runners to score
+        pitcher_bullpen_era = extra_features.get('pitcher_bullpen_era', LEAGUE_AVG_RUNS_PER_GAME) if extra_features else LEAGUE_AVG_RUNS_PER_GAME
+        bp_adj = 1.0 + ((pitcher_bullpen_era / LEAGUE_AVG_RUNS_PER_GAME) - 1.0) * 0.15 if LEAGUE_AVG_RUNS_PER_GAME > 0 else 1.0
+        
+        projected_er = (blended_era / 9.0) * proj_ip * opp_adj * park_adj * ump_er_factor * bp_adj
 
-        prob_over, prob_under = get_probabilities(projected_er, line, "pitcher_earned_runs")
+        prob_over, prob_under = get_probabilities(
+            projected_er, line, "pitcher_earned_runs", alpha=disp.get("alpha"),
+        )
 
         return {
             "player_name": None,
@@ -221,6 +291,7 @@ class ProjectionModel:
                 "park_adj": round(park_adj, 3),
                 "ump_k_factor": round(ump_k_factor, 3),
                 "ump_er_factor": round(ump_er_factor, 3),
+                "bp_adj": round(bp_adj, 3),
                 "proj_ip": round(proj_ip, 2),
                 "pitches_per_ip": ip_result['pitches_per_ip'],
                 "est_pitch_limit": ip_result['est_pitch_limit'],
@@ -234,7 +305,9 @@ class ProjectionModel:
                             venue: str, line: float,
                             lineup_position: int = None,
                             weather: dict = None,
-                            extra_features: dict = None) -> Optional[Dict]:
+                            extra_features: dict = None,
+                            player_id: int = None,
+                            game_total: float = None) -> Optional[Dict]:
         """
         Project a batter stat (hits, total_bases, home_runs).
 
@@ -254,6 +327,8 @@ class ProjectionModel:
             return None
 
         market_key = self._stat_type_to_market(stat_type)
+        disp = get_dispersion(str(player_id), market_key) if player_id else {}
+
         glm_result = self._try_glm_batter(
             market=market_key,
             batter_logs=logs,
@@ -264,6 +339,8 @@ class ProjectionModel:
             lineup_position=lineup_position,
             weather=weather,
             extra_features=extra_features,
+            dispersion=disp,
+            game_total=game_total,
         )
         if glm_result is not None:
             return glm_result
@@ -288,8 +365,9 @@ class ProjectionModel:
         blended_per_pa = (BATTER_RECENT_WEIGHT * recent_rate_per_pa +
                           BATTER_SEASON_WEIGHT * season_rate_per_pa)
 
-        # --- Projected plate appearances from lineup position ---
-        projected_pa = LINEUP_PA_MAP.get(lineup_position, DEFAULT_PROJECTED_PA)
+        # --- Projected plate appearances from lineup position, scaled by game total ---
+        base_pa = LINEUP_PA_MAP.get(lineup_position, DEFAULT_PROJECTED_PA)
+        projected_pa = _scale_pa_for_game_total(base_pa, game_total)
 
         # Platoon adjustment
         platoon_adj = self._get_platoon_adjustment(batter_hand, pitcher_hand, stat_type)
@@ -299,11 +377,18 @@ class ProjectionModel:
         park_key = self._stat_to_park_key(stat_type)
         park_adj = park.get(park_key, 1.0)
 
+        # Bullpen effect: bad opposing bullpen gives batters more late-inning opportunities
+        opp_bullpen_era = extra_features.get('opp_bullpen_era', LEAGUE_AVG_RUNS_PER_GAME) if extra_features else LEAGUE_AVG_RUNS_PER_GAME
+        bp_adj = 1.0 + ((opp_bullpen_era / LEAGUE_AVG_RUNS_PER_GAME) - 1.0) * 0.10 if LEAGUE_AVG_RUNS_PER_GAME > 0 else 1.0
+
         # Final projection: rate * opportunities * adjustments
-        projected = blended_per_pa * projected_pa * platoon_adj * park_adj
+        projected = blended_per_pa * projected_pa * platoon_adj * park_adj * bp_adj
 
         market_key = self._stat_type_to_market(stat_type)
-        prob_over, prob_under = get_probabilities(projected, line, market_key)
+        prob_over, prob_under = get_probabilities(
+            projected, line, market_key,
+            alpha=disp.get("alpha"), sigma=disp.get("sigma"),
+        )
 
         return {
             "player_name": None,
@@ -319,10 +404,13 @@ class ProjectionModel:
                 "rate_per_pa": round(blended_per_pa, 4),
                 "recent_rate_per_pa": round(recent_rate_per_pa, 4),
                 "season_rate_per_pa": round(season_rate_per_pa, 4),
+                "base_pa": base_pa,
                 "projected_pa": projected_pa,
+                "game_total": game_total,
                 "lineup_position": lineup_position,
                 "platoon_adj": round(platoon_adj, 3),
                 "park_adj": round(park_adj, 3),
+                "bp_adj": round(bp_adj, 3),
                 "batter_hand": batter_hand,
                 "pitcher_hand": pitcher_hand,
                 "venue": venue,
@@ -335,13 +423,14 @@ class ProjectionModel:
     # ------------------------------------------------------------------
 
     def _try_glm_pitcher(self, market, pitcher_logs, opponent_rate, venue, line,
-                         weather, ump_k_factor, extra_features):
+                         weather, ump_k_factor, extra_features, dispersion=None):
         """Run the Poisson GLM path for a pitcher market. Returns None if unavailable."""
         glm = self._glm.get(market)
         if glm is None:
             return None
         from src.data.feature_builder import build_pitcher_features
         from src.models.monte_carlo import mc_prob_over
+        disp = dispersion or {}
 
         ip_result = self._project_innings(
             sorted(pitcher_logs, key=lambda x: x['date'], reverse=True)
@@ -367,7 +456,10 @@ class ProjectionModel:
             logger.warning(f"GLM predict failed for {market}: {e}; falling back.")
             return None
 
-        prob_over, prob_under = mc_prob_over(projected_mean, line, market)
+        prob_over, prob_under = mc_prob_over(
+            projected_mean, line, market,
+            nb_alpha=disp.get("alpha"),
+        )
 
         return {
             "player_name": None,
@@ -390,15 +482,18 @@ class ProjectionModel:
         }
 
     def _try_glm_batter(self, market, batter_logs, pitcher_hand, batter_hand,
-                        venue, line, lineup_position, weather, extra_features):
+                        venue, line, lineup_position, weather, extra_features,
+                        dispersion=None, game_total=None):
         """Run the Poisson GLM path for a batter market. Returns None if unavailable."""
         glm = self._glm.get(market)
         if glm is None:
             return None
         from src.data.feature_builder import build_batter_features
         from src.models.monte_carlo import mc_prob_over
+        disp = dispersion or {}
 
-        projected_pa = LINEUP_PA_MAP.get(lineup_position, DEFAULT_PROJECTED_PA)
+        base_pa = LINEUP_PA_MAP.get(lineup_position, DEFAULT_PROJECTED_PA)
+        projected_pa = _scale_pa_for_game_total(base_pa, game_total)
 
         try:
             features = build_batter_features(
@@ -422,7 +517,11 @@ class ProjectionModel:
             logger.warning(f"GLM predict failed for {market}: {e}; falling back.")
             return None
 
-        prob_over, prob_under = mc_prob_over(projected_mean, line, market)
+        prob_over, prob_under = mc_prob_over(
+            projected_mean, line, market,
+            nb_alpha=disp.get("alpha"),
+            tb_std=disp.get("sigma"),
+        )
 
         return {
             "player_name": None,
@@ -435,7 +534,9 @@ class ProjectionModel:
             "sample_size": len(batter_logs),
             "context": {
                 "model": "glm",
+                "base_pa": base_pa,
                 "projected_pa": projected_pa,
+                "game_total": game_total,
                 "lineup_position": lineup_position,
                 "batter_hand": batter_hand,
                 "pitcher_hand": pitcher_hand,
