@@ -127,7 +127,7 @@ def _insert_batter_log(conn, gid, player_id, game_date, player_stat, player_name
 # Pipeline entry point
 # ---------------------------------------------------------------------------
 
-def sync_stats():
+async def sync_stats():
     """Fetch pitcher and batter game logs from BallDontLie for teams in upcoming games."""
     logger.info("Executing pipeline: sync_stats")
     bdl_client = MLBStatsClient()
@@ -150,7 +150,7 @@ def sync_stats():
     }
 
     # 2. Sync the BDL teams table (cached 24 hr; rarely changes mid-season).
-    all_teams = bdl_client.get_teams()
+    all_teams = await bdl_client.get_teams()
     with get_db_connection() as conn:
         _upsert_teams(conn, all_teams)
         conn.commit()
@@ -160,7 +160,7 @@ def sync_stats():
     #    instead of one per-team call for the full season.
     today = date.today()
     date_window = [(today - timedelta(days=d)).isoformat() for d in range(_LOOKBACK_DAYS)]
-    all_recent_games = bdl_client.get_games(dates=date_window)
+    all_recent_games = await bdl_client.get_games(dates=date_window)
 
     recent_game_ids = {
         g['id']
@@ -181,7 +181,7 @@ def sync_stats():
         return
 
     # 4. Fetch all player stats in one batched call (≤50 game IDs per HTTP request).
-    all_stats = bdl_client.get_stats_batch(recent_game_ids)
+    all_stats = await bdl_client.get_stats_batch(recent_game_ids)
     logger.info(f"Processing {len(all_stats)} player-game stat records.")
 
     # 5. Write everything in a single transaction.

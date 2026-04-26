@@ -27,7 +27,7 @@ from src.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
-def find_and_alert_sgps():
+async def find_and_alert_sgps():
     """Entry point. Discovers, persists, and alerts top SGP candidates."""
     logger.info("Executing pipeline: find_sgp")
     candidates = _build_candidates()
@@ -46,7 +46,7 @@ def find_and_alert_sgps():
         if len(kept) >= SGP_MAX_PER_DAY:
             break
 
-    _persist_and_alert(kept)
+    await _persist_and_alert(kept)
     logger.info(f"SGP pipeline complete. Alerted {len(kept)} candidates.")
 
 
@@ -181,7 +181,7 @@ def _team_matches(a, b):
     return a in b or b in a
 
 
-def _persist_and_alert(candidates):
+async def _persist_and_alert(candidates):
     if not candidates:
         return
     bot = TelegramClient()
@@ -201,7 +201,7 @@ def _persist_and_alert(candidates):
                 books, datetime.utcnow().isoformat(),
             ))
             try:
-                bot.send_message(_format_sgp_message(c))
+                await bot.send_message(_format_sgp_message(c))
                 logger.info(
                     f"SGP alerted: {c['matchup']} | "
                     f"joint {c['joint_prob']:.3f} | "

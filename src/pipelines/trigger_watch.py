@@ -31,7 +31,7 @@ from src.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
-def run_trigger_watch():
+async def run_trigger_watch():
     """Entry point: scan active games for ump/weather triggers, fire if extreme."""
     logger.info("Executing pipeline: trigger_watch")
 
@@ -79,10 +79,10 @@ def run_trigger_watch():
     )
 
     _persist_triggers(fired, now_utc)
-    _alert_triggers(fired)
+    await _alert_triggers(fired)
 
-    scan_props(force=True, game_ids=triggered_game_ids)
-    send_alerts()
+    await scan_props(force=True, game_ids=triggered_game_ids)
+    await send_alerts()
 
 
 def _check_umpire(game_id):
@@ -232,7 +232,7 @@ def _persist_triggers(fired, now_utc):
         conn.commit()
 
 
-def _alert_triggers(fired):
+async def _alert_triggers(fired):
     try:
         client = TelegramClient()
         lines = ["<b>Edge trigger fired</b>"]
@@ -240,7 +240,7 @@ def _alert_triggers(fired):
             lines.append(f"\n<b>{matchup}</b> — {trigger_type}")
             lines.append(_format_detail(trigger_type, detail))
         lines.append("\nForcing targeted odds pull...")
-        client.send_message("\n".join(lines))
+        await client.send_message("\n".join(lines))
     except Exception as e:
         logger.warning(f"Trigger Telegram alert failed: {e}")
 

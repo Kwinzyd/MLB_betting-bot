@@ -1,6 +1,6 @@
 import sqlite3
 from datetime import datetime, timezone, timedelta
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 import pytest
 
 
@@ -35,6 +35,12 @@ def _seed_schema(conn):
             detail TEXT,
             triggered_at TEXT NOT NULL,
             UNIQUE(game_id, trigger_type, triggered_at)
+        );
+        CREATE TABLE probable_pitchers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            game_id TEXT, team TEXT, player_name TEXT,
+            player_id INTEGER, throws TEXT, date TEXT,
+            UNIQUE(game_id, team)
         );
     ''')
 
@@ -89,17 +95,22 @@ def _patch_common(memory_db, weather_return=None):
     db_ctx = _DBCtx(memory_db)
     weather_client = MagicMock()
     weather_client.get_game_weather.return_value = weather_return
+    telegram_instance = MagicMock()
+    telegram_instance.send_message = AsyncMock()
     return {
         'db': patch('src.pipelines.trigger_watch.get_db_connection', db_ctx),
         'weather_cls': patch('src.pipelines.trigger_watch.WeatherClient',
                              return_value=weather_client),
-        'telegram_cls': patch('src.pipelines.trigger_watch.TelegramClient'),
-        'scan_props': patch('src.pipelines.trigger_watch.scan_props'),
-        'send_alerts': patch('src.pipelines.trigger_watch.send_alerts'),
+        'telegram_cls': patch('src.pipelines.trigger_watch.TelegramClient',
+                              return_value=telegram_instance),
+        'scan_props': patch('src.pipelines.trigger_watch.scan_props',
+                            new_callable=AsyncMock),
+        'send_alerts': patch('src.pipelines.trigger_watch.send_alerts',
+                             new_callable=AsyncMock),
     }
 
 
-def test_umpire_extreme_fires_when_k_factor_above_threshold(memory_db):
+async def test_umpire_extreme_fires_when_k_factor_above_threshold(memory_db):
     _add_game(memory_db, venue='Tropicana Field')  # dome — no weather trigger
     _add_umpire(memory_db, 'g1', k_factor=1.15, games_called=50)
     memory_db.commit()
@@ -108,7 +119,7 @@ def test_umpire_extreme_fires_when_k_factor_above_threshold(memory_db):
     with patches['db'], patches['weather_cls'], patches['telegram_cls'], \
          patches['scan_props'] as mock_scan, patches['send_alerts'] as mock_alerts:
         from src.pipelines.trigger_watch import run_trigger_watch
-        run_trigger_watch()
+        await run_trigger_watch()
 
     rows = memory_db.execute(
         "SELECT game_id, trigger_type FROM trigger_events"
@@ -120,7 +131,7 @@ def test_umpire_extreme_fires_when_k_factor_above_threshold(memory_db):
     mock_alerts.assert_called_once()
 
 
-def test_umpire_no_fire_when_games_called_below_min(memory_db):
+async def test_umpire_no_fire_when_games_called_below_min(memory_db):
     _add_game(memory_db, venue='Tropicana Field')
     _add_umpire(memory_db, 'g1', k_factor=1.50, games_called=2)  # sample too small
     memory_db.commit()
@@ -129,13 +140,13 @@ def test_umpire_no_fire_when_games_called_below_min(memory_db):
     with patches['db'], patches['weather_cls'], patches['telegram_cls'], \
          patches['scan_props'] as mock_scan, patches['send_alerts']:
         from src.pipelines.trigger_watch import run_trigger_watch
-        run_trigger_watch()
+        await run_trigger_watch()
 
     assert memory_db.execute("SELECT COUNT(*) FROM trigger_events").fetchone()[0] == 0
     mock_scan.assert_not_called()
 
 
-def test_umpire_no_fire_when_deviation_below_threshold(memory_db):
+async def test_umpire_no_fire_when_deviation_below_threshold(memory_db):
     _add_game(memory_db, venue='Tropicana Field')
     _add_umpire(memory_db, 'g1', k_factor=1.05, games_called=50)  # within band
     memory_db.commit()
@@ -144,13 +155,13 @@ def test_umpire_no_fire_when_deviation_below_threshold(memory_db):
     with patches['db'], patches['weather_cls'], patches['telegram_cls'], \
          patches['scan_props'] as mock_scan, patches['send_alerts']:
         from src.pipelines.trigger_watch import run_trigger_watch
-        run_trigger_watch()
+        await run_trigger_watch()
 
     assert memory_db.execute("SELECT COUNT(*) FROM trigger_events").fetchone()[0] == 0
     mock_scan.assert_not_called()
 
 
-def test_weather_extreme_fires_on_hr_adjust(memory_db):
+async def test_weather_extreme_fires_on_hr_adjust(memory_db):
     _add_game(memory_db, venue='Wrigley Field')
     memory_db.commit()
 
@@ -163,7 +174,7 @@ def test_weather_extreme_fires_on_hr_adjust(memory_db):
     with patches['db'], patches['weather_cls'], patches['telegram_cls'], \
          patches['scan_props'] as mock_scan, patches['send_alerts']:
         from src.pipelines.trigger_watch import run_trigger_watch
-        run_trigger_watch()
+        await run_trigger_watch()
 
     rows = memory_db.execute(
         "SELECT trigger_type FROM trigger_events"
@@ -173,7 +184,7 @@ def test_weather_extreme_fires_on_hr_adjust(memory_db):
     mock_scan.assert_called_once_with(force=True, game_ids=['g1'])
 
 
-def test_weather_no_fire_when_dome(memory_db):
+async def test_weather_no_fire_when_dome(memory_db):
     _add_game(memory_db, venue='Tropicana Field')
     memory_db.commit()
 
@@ -186,13 +197,13 @@ def test_weather_no_fire_when_dome(memory_db):
     with patches['db'], patches['weather_cls'], patches['telegram_cls'], \
          patches['scan_props'] as mock_scan, patches['send_alerts']:
         from src.pipelines.trigger_watch import run_trigger_watch
-        run_trigger_watch()
+        await run_trigger_watch()
 
     assert memory_db.execute("SELECT COUNT(*) FROM trigger_events").fetchone()[0] == 0
     mock_scan.assert_not_called()
 
 
-def test_dedup_prevents_second_fire_within_window(memory_db):
+async def test_dedup_prevents_second_fire_within_window(memory_db):
     _add_game(memory_db, venue='Tropicana Field')
     _add_umpire(memory_db, 'g1', k_factor=1.15, games_called=50)
     # Seed a prior trigger 1h ago — inside default 6h dedup window.
@@ -208,14 +219,14 @@ def test_dedup_prevents_second_fire_within_window(memory_db):
     with patches['db'], patches['weather_cls'], patches['telegram_cls'], \
          patches['scan_props'] as mock_scan, patches['send_alerts']:
         from src.pipelines.trigger_watch import run_trigger_watch
-        run_trigger_watch()
+        await run_trigger_watch()
 
     # Still just the one seed row; no new fire.
     assert memory_db.execute("SELECT COUNT(*) FROM trigger_events").fetchone()[0] == 1
     mock_scan.assert_not_called()
 
 
-def test_dedup_allows_second_fire_after_window(memory_db):
+async def test_dedup_allows_second_fire_after_window(memory_db):
     _add_game(memory_db, venue='Tropicana Field')
     _add_umpire(memory_db, 'g1', k_factor=1.15, games_called=50)
     # Seed a prior trigger 12h ago — outside default 6h dedup window.
@@ -231,20 +242,20 @@ def test_dedup_allows_second_fire_after_window(memory_db):
     with patches['db'], patches['weather_cls'], patches['telegram_cls'], \
          patches['scan_props'] as mock_scan, patches['send_alerts']:
         from src.pipelines.trigger_watch import run_trigger_watch
-        run_trigger_watch()
+        await run_trigger_watch()
 
     # Both the seed row and a new fire.
     assert memory_db.execute("SELECT COUNT(*) FROM trigger_events").fetchone()[0] == 2
     mock_scan.assert_called_once_with(force=True, game_ids=['g1'])
 
 
-def test_no_active_games_exits_cleanly(memory_db):
+async def test_no_active_games_exits_cleanly(memory_db):
     memory_db.commit()
 
     patches = _patch_common(memory_db, weather_return=None)
     with patches['db'], patches['weather_cls'], patches['telegram_cls'], \
          patches['scan_props'] as mock_scan, patches['send_alerts']:
         from src.pipelines.trigger_watch import run_trigger_watch
-        run_trigger_watch()
+        await run_trigger_watch()
 
     mock_scan.assert_not_called()

@@ -1,6 +1,6 @@
 import pytest
 import sqlite3
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, AsyncMock
 
 
 @pytest.fixture
@@ -29,7 +29,9 @@ def memory_db():
             alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
             player_name TEXT, market TEXT, line REAL, side TEXT,
             edge REAL, ev REAL, kelly_stake REAL, bookmaker TEXT,
-            odds REAL, opening_odds REAL, game_id TEXT, timestamp TEXT,
+            odds REAL, opening_odds REAL,
+            model_prob_over REAL, model_prob_under REAL,
+            game_id TEXT, timestamp TEXT,
             UNIQUE(player_name, market, line, bookmaker)
         );
     ''')
@@ -37,31 +39,37 @@ def memory_db():
         INSERT INTO games VALUES
         ('g1', 'Yankees', 'Red Sox', 'Yankee Stadium', 'SCHEDULED', '2024-05-15')
     ''')
-    # prob_over=0.65, devigged_over=0.50 → edge=15% (playable, above 5% threshold)
+    # Playable edge setup:
+    #   odds=2.0 -> book_implied=0.50
+    #   devigged_over=0.60 -> edge = 10% (above EDGE_MIN=5%)
+    #   model prob_over=0.62 -> |model - sharp| = 0.02 (within SHARP_MODEL_AGREEMENT_TOL=0.05)
+    #   sharp_prob=0.60 > MIN_MODEL_PROB=0.55, odds=2.0 > MIN_ODDS=1.70
     conn.execute('''
         INSERT INTO projections
         (game_id, player_name, market, projected_mean, prob_over, prob_under, context_json, timestamp)
-        VALUES ('g1', 'Gerrit Cole', 'pitcher_strikeouts', 7.5, 0.65, 0.35, '{}', '2024-05-15T12:00:00')
+        VALUES ('g1', 'Gerrit Cole', 'pitcher_strikeouts', 7.5, 0.62, 0.38, '{}', '2024-05-15T12:00:00')
     ''')
     conn.execute('''
         INSERT INTO prop_snapshots VALUES
         ('snap1', 'g1', 'Gerrit Cole', 'pitcher_strikeouts', 6.5, 2.0, 1.8,
-         'draftkings', '2024-05-15T12:00:00', 0.50, 0.50)
+         'draftkings', '2024-05-15T12:00:00', 0.60, 0.40)
     ''')
     conn.commit()
     return conn
 
 
+@patch('src.pipelines.send_alerts.BETTING_ENABLED', True)
 @patch('src.pipelines.send_alerts.get_db_connection')
 @patch('src.pipelines.send_alerts.TelegramClient')
-def test_send_alerts_new_alert_inserted(mock_telegram_cls, mock_get_db, memory_db):
+async def test_send_alerts_new_alert_inserted(mock_telegram_cls, mock_get_db, memory_db):
     """A playable edge triggers a Telegram message and is recorded in alerts_sent."""
     mock_bot = mock_telegram_cls.return_value
+    mock_bot.send_message = AsyncMock()
     mock_get_db.return_value.__enter__.return_value = memory_db
     mock_get_db.return_value.__exit__.return_value = None
 
     from src.pipelines.send_alerts import send_alerts
-    send_alerts()
+    await send_alerts()
 
     mock_bot.send_message.assert_called_once()
 
@@ -75,7 +83,7 @@ def test_send_alerts_new_alert_inserted(mock_telegram_cls, mock_get_db, memory_d
 
 @patch('src.pipelines.send_alerts.get_db_connection')
 @patch('src.pipelines.send_alerts.TelegramClient')
-def test_send_alerts_deduplication(mock_telegram_cls, mock_get_db, memory_db):
+async def test_send_alerts_deduplication(mock_telegram_cls, mock_get_db, memory_db):
     """An already-alerted prop is not sent again."""
     memory_db.execute('''
         INSERT INTO alerts_sent
@@ -87,11 +95,12 @@ def test_send_alerts_deduplication(mock_telegram_cls, mock_get_db, memory_db):
     memory_db.commit()
 
     mock_bot = mock_telegram_cls.return_value
+    mock_bot.send_message = AsyncMock()
     mock_get_db.return_value.__enter__.return_value = memory_db
     mock_get_db.return_value.__exit__.return_value = None
 
     from src.pipelines.send_alerts import send_alerts
-    send_alerts()
+    await send_alerts()
 
     mock_bot.send_message.assert_not_called()
     rows = memory_db.execute("SELECT * FROM alerts_sent").fetchall()
@@ -100,7 +109,7 @@ def test_send_alerts_deduplication(mock_telegram_cls, mock_get_db, memory_db):
 
 @patch('src.pipelines.send_alerts.get_db_connection')
 @patch('src.pipelines.send_alerts.TelegramClient')
-def test_send_alerts_no_edge_no_alert(mock_telegram_cls, mock_get_db, memory_db):
+async def test_send_alerts_no_edge_no_alert(mock_telegram_cls, mock_get_db, memory_db):
     """A projection below the edge threshold produces no alert."""
     # Overwrite projection with sub-threshold edge: prob_over=0.51, devigged=0.50 → 1% edge
     memory_db.execute(
@@ -109,11 +118,12 @@ def test_send_alerts_no_edge_no_alert(mock_telegram_cls, mock_get_db, memory_db)
     memory_db.commit()
 
     mock_bot = mock_telegram_cls.return_value
+    mock_bot.send_message = AsyncMock()
     mock_get_db.return_value.__enter__.return_value = memory_db
     mock_get_db.return_value.__exit__.return_value = None
 
     from src.pipelines.send_alerts import send_alerts
-    send_alerts()
+    await send_alerts()
 
     mock_bot.send_message.assert_not_called()
     alert = memory_db.execute("SELECT * FROM alerts_sent").fetchone()

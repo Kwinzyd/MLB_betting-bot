@@ -1,6 +1,6 @@
 import datetime
 import sqlite3
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 
 
 @patch('src.pipelines.sync_lineups.get_eastern_local_date',
@@ -21,7 +21,8 @@ def memory_db():
     conn.executescript('''
         CREATE TABLE games (
             game_id TEXT PRIMARY KEY, bdl_game_id INTEGER,
-            home_team TEXT, away_team TEXT, status TEXT, date TEXT
+            home_team TEXT, away_team TEXT, status TEXT, date TEXT,
+            lineups_confirmed_at TEXT
         );
         CREATE TABLE daily_lineups (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,7 +39,7 @@ def memory_db():
     ''')
     conn.execute('''
         INSERT INTO games VALUES
-        ('g1', 999, 'Yankees', 'Red Sox', 'SCHEDULED', '2024-05-15T18:10:00Z')
+        ('g1', 999, 'Yankees', 'Red Sox', 'SCHEDULED', '2024-05-15T18:10:00Z', NULL)
     ''')
     conn.commit()
     return conn
@@ -64,14 +65,14 @@ LINEUP_ENTRIES = [
        return_value=datetime.date(2024, 5, 15))
 @patch('src.pipelines.sync_lineups.get_db_connection')
 @patch('src.pipelines.sync_lineups.MLBStatsClient')
-def test_sync_lineups_probable_pitcher(mock_client_cls, mock_get_db, _mock_date, memory_db):
+async def test_sync_lineups_probable_pitcher(mock_client_cls, mock_get_db, _mock_date, memory_db):
     """A probable pitcher entry is written to the probable_pitchers table."""
-    mock_client_cls.return_value.get_lineups.return_value = LINEUP_ENTRIES
+    mock_client_cls.return_value.get_lineups = AsyncMock(return_value=LINEUP_ENTRIES)
     mock_get_db.return_value.__enter__.return_value = memory_db
     mock_get_db.return_value.__exit__.return_value = None
 
     from src.pipelines.sync_lineups import sync_lineups
-    sync_lineups()
+    await sync_lineups()
 
     pitcher = memory_db.execute(
         "SELECT * FROM probable_pitchers WHERE game_id = 'g1'"
@@ -86,14 +87,14 @@ def test_sync_lineups_probable_pitcher(mock_client_cls, mock_get_db, _mock_date,
        return_value=datetime.date(2024, 5, 15))
 @patch('src.pipelines.sync_lineups.get_db_connection')
 @patch('src.pipelines.sync_lineups.MLBStatsClient')
-def test_sync_lineups_batting_order(mock_client_cls, mock_get_db, _mock_date, memory_db):
+async def test_sync_lineups_batting_order(mock_client_cls, mock_get_db, _mock_date, memory_db):
     """A batter with a batting_order is written to daily_lineups with the correct position."""
-    mock_client_cls.return_value.get_lineups.return_value = LINEUP_ENTRIES
+    mock_client_cls.return_value.get_lineups = AsyncMock(return_value=LINEUP_ENTRIES)
     mock_get_db.return_value.__enter__.return_value = memory_db
     mock_get_db.return_value.__exit__.return_value = None
 
     from src.pipelines.sync_lineups import sync_lineups
-    sync_lineups()
+    await sync_lineups()
 
     batter = memory_db.execute(
         "SELECT * FROM daily_lineups WHERE player_name = 'Aaron Judge'"
@@ -107,14 +108,14 @@ def test_sync_lineups_batting_order(mock_client_cls, mock_get_db, _mock_date, me
        return_value=datetime.date(2024, 5, 15))
 @patch('src.pipelines.sync_lineups.get_db_connection')
 @patch('src.pipelines.sync_lineups.MLBStatsClient')
-def test_sync_lineups_pitcher_upsert(mock_client_cls, mock_get_db, _mock_date, memory_db):
+async def test_sync_lineups_pitcher_upsert(mock_client_cls, mock_get_db, _mock_date, memory_db):
     """Running sync_lineups twice with a changed pitcher name updates the existing row."""
-    mock_client_cls.return_value.get_lineups.return_value = LINEUP_ENTRIES
+    mock_client_cls.return_value.get_lineups = AsyncMock(return_value=LINEUP_ENTRIES)
     mock_get_db.return_value.__enter__.return_value = memory_db
     mock_get_db.return_value.__exit__.return_value = None
 
     from src.pipelines.sync_lineups import sync_lineups
-    sync_lineups()
+    await sync_lineups()
 
     # Second run — different pitcher announced
     updated_entries = [
@@ -125,8 +126,8 @@ def test_sync_lineups_pitcher_upsert(mock_client_cls, mock_get_db, _mock_date, m
             'batting_order': None,
         }
     ]
-    mock_client_cls.return_value.get_lineups.return_value = updated_entries
-    sync_lineups()
+    mock_client_cls.return_value.get_lineups = AsyncMock(return_value=updated_entries)
+    await sync_lineups()
 
     pitchers = memory_db.execute("SELECT * FROM probable_pitchers WHERE game_id = 'g1'").fetchall()
     assert len(pitchers) == 1

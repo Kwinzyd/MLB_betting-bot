@@ -61,6 +61,7 @@ def _update_umpire_stats(client: MLBOfficialStatsClient) -> None:
 
     # {umpire_id: {name, new_k, new_bb, new_games}}
     delta: dict[int, dict] = {}
+    historical_assignments_to_add: list[tuple] = []
 
     for days_back in range(1, UMP_STATS_LOOKBACK_DAYS + 1):
         target = (today - timedelta(days=days_back)).isoformat()
@@ -90,7 +91,10 @@ def _update_umpire_stats(client: MLBOfficialStatsClient) -> None:
 
             # Record this gamePk so we never fetch its box score again.
             # game_id is NULL — this is a historical-only row used as a processing log.
-            _record_historical_assignment(game_pk, hp, target)
+            historical_assignments_to_add.append((game_pk, hp["id"], hp["name"], target))
+
+    if historical_assignments_to_add:
+        _record_historical_assignments(historical_assignments_to_add)
 
     if not delta:
         logger.info("No new completed games to update umpire stats from.")
@@ -103,16 +107,16 @@ def _update_umpire_stats(client: MLBOfficialStatsClient) -> None:
     )
 
 
-def _record_historical_assignment(game_pk: int, hp: dict, date_str: str) -> None:
-    """Store a historical game assignment so it is never re-fetched."""
+def _record_historical_assignments(assignments: list[tuple]) -> None:
+    """Store historical game assignments so they are never re-fetched."""
     with get_db_connection() as conn:
-        conn.execute(
+        conn.executemany(
             """
             INSERT OR IGNORE INTO umpire_game_assignments
                 (mlb_game_pk, game_id, umpire_id, umpire_name, date)
             VALUES (?, NULL, ?, ?, ?)
             """,
-            (game_pk, hp["id"], hp["name"], date_str),
+            assignments,
         )
         conn.commit()
 

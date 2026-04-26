@@ -1,8 +1,11 @@
+import time
+import random
 import requests
 from src.config import WEATHER_API_KEY
 from src.utils.logging_utils import get_logger
 from src.utils.retry import retry_api
 from src.data.cache import cache
+from src.clients.telegram_bot import TelegramClient
 
 logger = get_logger(__name__)
 
@@ -40,9 +43,16 @@ class WeatherClient:
         }
 
         try:
+            delay = random.uniform(0.1, 0.3)
+            logger.debug(f"Applying jitter delay of {delay:.3f}s before Weather API request")
+            time.sleep(delay)
             response = requests.get(
                 f"{self.base_url}/weather", params=params, timeout=8
             )
+            if response.status_code == 429:
+                msg = "🚨 <b>Rate Limit Hit</b>\nWeather API rate limit (HTTP 429) reached. Request blocked."
+                logger.warning(msg)
+                TelegramClient().send_message_sync(msg)
             response.raise_for_status()
             data = response.json()
 

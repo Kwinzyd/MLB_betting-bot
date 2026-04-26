@@ -140,6 +140,11 @@ CREATE TABLE IF NOT EXISTS alerts_sent (
     bookmaker TEXT,
     odds REAL,
     opening_odds REAL,
+    -- Model's P(over) / P(under) at placement time. Stored so calibration
+    -- metrics use the prob we actually bet on, not whatever later re-scans
+    -- overwrite in the projections table.
+    model_prob_over REAL,
+    model_prob_under REAL,
     game_id TEXT,
     timestamp TEXT,
     UNIQUE(player_name, market, line, bookmaker)

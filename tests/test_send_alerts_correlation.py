@@ -1,5 +1,5 @@
 import sqlite3
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 import pytest
 
 
@@ -25,7 +25,9 @@ def _seed_schema(conn):
             alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
             player_name TEXT, market TEXT, line REAL, side TEXT,
             edge REAL, ev REAL, kelly_stake REAL, bookmaker TEXT,
-            odds REAL, opening_odds REAL, game_id TEXT, timestamp TEXT,
+            odds REAL, opening_odds REAL,
+            model_prob_over REAL, model_prob_under REAL,
+            game_id TEXT, timestamp TEXT,
             UNIQUE(player_name, market, line, bookmaker)
         );
     ''')
@@ -62,7 +64,7 @@ def memory_db():
 
 @patch('src.pipelines.send_alerts.get_db_connection')
 @patch('src.pipelines.send_alerts.TelegramClient')
-def test_one_bet_per_player(mock_tg_cls, mock_get_db, memory_db):
+async def test_one_bet_per_player(mock_tg_cls, mock_get_db, memory_db):
     """Same player with two playable markets → only the higher-edge one fires."""
     # Strikeouts: edge ~15% (prob_over=0.65)
     _add_candidate(memory_db, 'g1', 'Gerrit Cole', 'pitcher_strikeouts', 7.5, 0.65, 's1')
@@ -70,11 +72,12 @@ def test_one_bet_per_player(mock_tg_cls, mock_get_db, memory_db):
     _add_candidate(memory_db, 'g1', 'Gerrit Cole', 'pitcher_earned_runs', 2.5, 0.70, 's2')
     memory_db.commit()
 
+    mock_tg_cls.return_value.send_message = AsyncMock()
     mock_get_db.return_value.__enter__.return_value = memory_db
     mock_get_db.return_value.__exit__.return_value = None
 
     from src.pipelines.send_alerts import send_alerts
-    send_alerts()
+    await send_alerts()
 
     rows = memory_db.execute(
         "SELECT market FROM alerts_sent WHERE player_name = 'Gerrit Cole'"
@@ -85,7 +88,7 @@ def test_one_bet_per_player(mock_tg_cls, mock_get_db, memory_db):
 
 @patch('src.pipelines.send_alerts.get_db_connection')
 @patch('src.pipelines.send_alerts.TelegramClient')
-def test_max_three_per_game(mock_tg_cls, mock_get_db, memory_db):
+async def test_max_three_per_game(mock_tg_cls, mock_get_db, memory_db):
     """Five playable candidates on one game → only the top 3 by edge fire."""
     # Edges: 20%, 18%, 15%, 12%, 10% — top 3 keep
     for i, (player, prob) in enumerate([
@@ -98,11 +101,12 @@ def test_max_three_per_game(mock_tg_cls, mock_get_db, memory_db):
         _add_candidate(memory_db, 'g1', player, 'batter_hits', 1.5, prob, f's{i}')
     memory_db.commit()
 
+    mock_tg_cls.return_value.send_message = AsyncMock()
     mock_get_db.return_value.__enter__.return_value = memory_db
     mock_get_db.return_value.__exit__.return_value = None
 
     from src.pipelines.send_alerts import send_alerts
-    send_alerts()
+    await send_alerts()
 
     rows = memory_db.execute(
         "SELECT player_name FROM alerts_sent WHERE game_id = 'g1' ORDER BY edge DESC"

@@ -1,6 +1,7 @@
-from src.config import SHARP_BOOKMAKERS
+from src.config import BANKROLL, SHARP_BOOKMAKERS
 from src.data.db import get_db_connection
 from src.models.devig import devig_multiplicative
+from src.models.kelly import get_current_bankroll
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -205,6 +206,9 @@ def _calculate_clv(game_id: str, player_name: str, market: str,
         closing_over, closing_under = devig_multiplicative(
             closing['over_odds'], closing['under_odds']
         )
+        if closing_over is None:
+            # Closing line failed sanity checks; CLV is undefined.
+            return 0.0
         opening_implied = 1.0 / opening_odds
         closing_implied = closing_over if side == 'over' else closing_under
         return round(closing_implied - opening_implied, 4)
@@ -226,6 +230,8 @@ def _log_pnl_summary():
 
         if summary and summary['total_bets'] > 0:
             win_rate = (summary['wins'] / summary['total_bets']) * 100
+            current_bankroll = get_current_bankroll()
+            roi_pct = (summary['total_profit'] / BANKROLL) * 100 if BANKROLL else 0.0
             logger.info(
                 f"\n{'=' * 40}\n"
                 f"CUMULATIVE P&L SUMMARY\n"
@@ -234,5 +240,7 @@ def _log_pnl_summary():
                 f"({win_rate:.1f}%)\n"
                 f"Total Profit: ${summary['total_profit']:+.2f}\n"
                 f"Avg CLV: {summary['avg_clv']:+.4f}\n"
+                f"Starting Bankroll: ${BANKROLL:.2f}\n"
+                f"Current Bankroll:  ${current_bankroll:.2f} ({roi_pct:+.1f}% ROI)\n"
                 f"{'=' * 40}"
             )

@@ -20,7 +20,7 @@ from src.utils.time_utils import get_eastern_local_date
 logger = get_logger(__name__)
 
 
-def scan_props(force: bool = False, game_ids: list = None):
+async def scan_props(force: bool = False, game_ids: list = None):
     """
     Core pipeline: fetch live odds, run projections, identify edges.
     Batches all 5 markets in a single API call per game to conserve quota.
@@ -89,7 +89,7 @@ def scan_props(force: bool = False, game_ids: list = None):
         ump_k_factor = _get_ump_k_factor(game_id)
 
         try:
-            event_odds = odds_client.get_event_odds(game_id, api_markets, bust_cache=targeted)
+            event_odds = await odds_client.get_event_odds(game_id, api_markets, bust_cache=targeted)
         except Exception as e:
             logger.error(f"Failed to fetch odds for {game_id}: {e}")
             continue
@@ -117,6 +117,9 @@ def scan_props(force: bool = False, game_ids: list = None):
             sharp_prob_over, sharp_prob_under = devig_multiplicative(
                 sharp_over_odds, sharp_under_odds
             )
+            if sharp_prob_over is None:
+                # Devig sanity check rejected the sharp pair — treat as no truth.
+                continue
 
             soft_best = _pick_best_soft_line(line_data, SHARP_BOOKMAKERS)
             over_odds, over_book = soft_best['over']

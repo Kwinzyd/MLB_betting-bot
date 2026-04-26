@@ -2,14 +2,14 @@ import json
 from datetime import datetime
 from src.clients.telegram_bot import TelegramClient
 from src.data.db import get_db_connection
-from src.config import MAX_BETS_PER_GAME, MAX_BETS_PER_PLAYER
+from src.config import MAX_BETS_PER_GAME, MAX_BETS_PER_PLAYER, BETTING_ENABLED
 from src.models.edge_ranker import rank_edge
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
 
-def send_alerts():
+async def send_alerts():
     """Find high-edge projections and send Telegram alerts for unsent ones."""
     logger.info("Executing pipeline: send_alerts")
     bot = TelegramClient()
@@ -131,25 +131,34 @@ def send_alerts():
                 venue=row['venue'],
             )
 
-            try:
-                bot.send_message(message)
-                logger.info(f"Alert sent: {player_name} {market} {cand['side'].upper()} {line}")
-            except Exception as e:
-                logger.error(f"Failed to send Telegram alert: {e}")
-                continue
+            if BETTING_ENABLED:
+                try:
+                    await bot.send_message(message)
+                    logger.info(f"Alert sent: {player_name} {market} {cand['side'].upper()} {line}")
+                except Exception as e:
+                    logger.error(f"Failed to send Telegram alert: {e}")
+                    continue
+            else:
+                logger.info(
+                    f"[SHADOW] Would-alert: {player_name} {market} {cand['side'].upper()} {line} "
+                    f"@ {bookmaker} (edge {cand['edge']['edge_pct']:.1f}%). "
+                    f"Set BETTING_ENABLED=true to deliver."
+                )
 
             timestamp = datetime.utcnow().isoformat()
             conn.execute('''
                 INSERT INTO alerts_sent
                 (player_name, market, line, side, edge, ev, kelly_stake,
-                 bookmaker, odds, opening_odds, game_id, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 bookmaker, odds, opening_odds, model_prob_over, model_prob_under,
+                 game_id, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(player_name, market, line, bookmaker) DO NOTHING
             ''', (
                 player_name, market, line, cand['side'],
                 cand['edge']['edge_pct'], cand['edge']['ev'],
                 cand['edge']['kelly']['recommended_stake'],
                 bookmaker, cand['odds'], cand['odds'],
+                row['prob_over'], row['prob_under'],
                 game_id, timestamp,
             ))
             conn.commit()

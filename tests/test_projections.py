@@ -12,8 +12,8 @@ def proj_model():
 def test_project_pitcher_strikeouts_handles_empty_logs(proj_model):
     """Test that the model gracefully handles a player with no historical logs."""
     result = proj_model.project_pitcher_strikeouts(
-        logs=[],
-        opp_k_rate=0.225,
+        pitcher_logs=[],
+        opponent_k_rate=0.225,
         venue="Wrigley Field",
         line=5.5
     )
@@ -23,13 +23,13 @@ def test_project_pitcher_strikeouts_handles_empty_logs(proj_model):
 def test_project_pitcher_strikeouts_valid_data(proj_model):
     """Test strikeout projections with standard historical data."""
     logs = [
-        {"strikeouts": 6, "innings_pitched": 5.0, "pitches_thrown": 90},
-        {"strikeouts": 4, "innings_pitched": 6.0, "pitches_thrown": 95},
-        {"strikeouts": 8, "innings_pitched": 5.2, "pitches_thrown": 100},
+        {"date": "2026-04-15", "strikeouts": 6, "innings_pitched": 5.0, "pitches_thrown": 90},
+        {"date": "2026-04-08", "strikeouts": 4, "innings_pitched": 6.0, "pitches_thrown": 95},
+        {"date": "2026-04-01", "strikeouts": 8, "innings_pitched": 5.2, "pitches_thrown": 100},
     ]
     result = proj_model.project_pitcher_strikeouts(
-        logs=logs,
-        opp_k_rate=0.25,
+        pitcher_logs=logs,
+        opponent_k_rate=0.25,
         venue="Wrigley Field",
         line=5.5
     )
@@ -47,12 +47,12 @@ def test_project_pitcher_strikeouts_valid_data(proj_model):
 def test_project_pitcher_earned_runs_valid_data(proj_model):
     """Test earned run projections return valid math outputs."""
     logs = [
-        {"earned_runs": 2, "innings_pitched": 6.0},
-        {"earned_runs": 4, "innings_pitched": 5.0},
+        {"date": "2026-04-15", "earned_runs": 2, "innings_pitched": 6.0},
+        {"date": "2026-04-08", "earned_runs": 4, "innings_pitched": 5.0},
     ]
     result = proj_model.project_pitcher_earned_runs(
-        logs=logs,
-        opp_runs_pg=4.5,
+        pitcher_logs=logs,
+        opponent_runs_per_game=4.5,
         venue="Coors Field",
         line=2.5
     )
@@ -65,12 +65,15 @@ def test_project_pitcher_earned_runs_valid_data(proj_model):
 def test_project_batter_stat_has_correct_keys(proj_model):
     """Test that batter projections output the correct data structure."""
     logs = [
-        {"hits": 1, "at_bats": 4, "plate_appearances": 4},
-        {"hits": 2, "at_bats": 4, "plate_appearances": 4},
+        {"date": "2026-04-15", "hits": 1, "at_bats": 4, "plate_appearances": 4},
+        {"date": "2026-04-14", "hits": 2, "at_bats": 4, "plate_appearances": 4},
+        {"date": "2026-04-13", "hits": 1, "at_bats": 3, "plate_appearances": 4},
+        {"date": "2026-04-12", "hits": 0, "at_bats": 4, "plate_appearances": 4},
+        {"date": "2026-04-11", "hits": 2, "at_bats": 4, "plate_appearances": 4},
     ]
 
     result = proj_model.project_batter_stat(
-        logs=logs, stat_type="hits", pitcher_hand="R", bats="L",
+        batter_logs=logs, stat_type="hits", pitcher_hand="R", batter_hand="L",
         venue="Coors Field", line=1.5, lineup_position=1
     )
 

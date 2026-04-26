@@ -1,7 +1,8 @@
-import requests
+import asyncio
+import httpx
 from src.config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 from src.utils.logging_utils import get_logger
-from src.utils.retry import retry_api
+from src.utils.retry import async_retry_api
 
 logger = get_logger(__name__)
 
@@ -10,8 +11,8 @@ class TelegramClient:
     def __init__(self):
         self.base_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-    @retry_api(max_retries=3, delay=2.0)
-    def send_message(self, text: str, parse_mode='HTML'):
+    @async_retry_api(max_retries=3, delay=2.0)
+    async def send_message(self, text: str, parse_mode='HTML'):
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
             logger.warning("Telegram credentials missing. Not sending message.")
             return False
@@ -23,7 +24,16 @@ class TelegramClient:
             "parse_mode": parse_mode,
         }
 
-        response = requests.post(url, json=payload, timeout=10)
-        response.raise_for_status()
-        logger.debug("Successfully sent Telegram message.")
-        return True
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, json=payload, timeout=10.0)
+            response.raise_for_status()
+            logger.debug("Successfully sent Telegram message.")
+            return True
+
+    def send_message_sync(self, text: str, parse_mode='HTML'):
+        """Safely dispatch an async Telegram message from synchronous code."""
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.send_message(text, parse_mode))
+        except RuntimeError:
+            asyncio.run(self.send_message(text, parse_mode))

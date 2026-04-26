@@ -7,7 +7,7 @@ from src.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
-def sync_events():
+async def sync_events():
     """
     Fetch upcoming MLB games from Odds API and cross-reference with BDL for game IDs.
     Uses ODDS_API_TEAM_ABBREV mapping for deterministic team matching (no fuzzy strings).
@@ -17,7 +17,7 @@ def sync_events():
     bdl_client = MLBStatsClient()
 
     # 1. Fetch events from Odds API
-    events = odds_client.get_mlb_events()
+    events = await odds_client.get_mlb_events()
     if not events:
         logger.warning("No MLB events returned from Odds API.")
         return
@@ -36,7 +36,7 @@ def sync_events():
     # If teams table is empty, sync teams first
     if not abbrev_to_team_id:
         logger.info("Teams table empty, fetching from BDL...")
-        all_teams = bdl_client.get_teams()
+        all_teams = await bdl_client.get_teams()
         with get_db_connection() as conn:
             for team in all_teams:
                 conn.execute('''
@@ -65,7 +65,7 @@ def sync_events():
     # 3. Fetch today's games from BDL for cross-referencing by team_id
     from src.utils.time_utils import get_eastern_local_date
     today = str(get_eastern_local_date())
-    bdl_games = bdl_client.get_games(dates=today)
+    bdl_games = await bdl_client.get_games(dates=today)
 
     # Build BDL game lookup keyed by (home_team_id, away_team_id) for exact matching
     bdl_by_teams = {}

@@ -92,8 +92,11 @@ class PoissonGLM:
     # ------------------------------------------------------------------
     # Inference
     # ------------------------------------------------------------------
-    def predict_mean(self, X, exposure: float = 1.0) -> float:
-        """Predict expected count for a single row (1D array) or a batch (2D)."""
+    def predict_mean(self, X, exposure: float | np.ndarray = 1.0) -> float | np.ndarray:
+        """
+        Predict expected count for a single row (1D array) or a batch (2D).
+        Exposure can be a scalar or an array matching the number of samples in X.
+        """
         if self.coef_ is None:
             raise RuntimeError("PoissonGLM is not fitted")
         X = np.asarray(X, dtype=np.float64)
@@ -103,8 +106,8 @@ class PoissonGLM:
 
         Xs = (X - self.feature_mean_) / self.feature_std_
         Xd = np.hstack([np.ones((Xs.shape[0], 1)), Xs])
-        exposure_arr = np.full(Xs.shape[0], float(exposure))
-        eta = Xd @ self.coef_ + np.log(np.clip(exposure_arr, 1e-3, None))
+        log_exposure = np.log(np.clip(np.asarray(exposure), 1e-3, None))
+        eta = Xd @ self.coef_ + log_exposure
         mu = np.exp(np.clip(eta, -50.0, 50.0))
         return float(mu[0]) if single else mu
 

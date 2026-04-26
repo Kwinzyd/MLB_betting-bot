@@ -14,15 +14,25 @@ Two endpoints used:
 
 from __future__ import annotations
 
+import time
+import random
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from src.utils.logging_utils import get_logger
+from src.utils.circuit_breaker import CircuitBreaker
+from src.clients.telegram_bot import TelegramClient
 
 logger = get_logger(__name__)
 
 _BASE = "https://statsapi.mlb.com/api/v1"
+
+mlb_api_circuit_breaker = CircuitBreaker(
+    failure_threshold=3, 
+    recovery_timeout=60.0,
+    exceptions=(requests.RequestException,)
+)
 
 
 def _make_session() -> requests.Session:
@@ -44,6 +54,7 @@ class MLBOfficialStatsClient:
     def __init__(self):
         self.session = _make_session()
 
+    @mlb_api_circuit_breaker
     def get_games_with_officials(self, date_str: str) -> list[dict]:
         """
         Return all games scheduled on date_str with their official assignments.
@@ -59,16 +70,23 @@ class MLBOfficialStatsClient:
         Returns [] on any network or parse error.
         """
         try:
+            delay = random.uniform(0.1, 0.3)
+            logger.debug(f"Applying jitter delay of {delay:.3f}s before MLB Stats API schedule request")
+            time.sleep(delay)
             resp = self.session.get(
                 f"{_BASE}/schedule",
                 params={"sportId": 1, "date": date_str, "hydrate": "officials"},
-                timeout=15,
+                timeout=(3.0, 15.0),
             )
+            if resp.status_code == 429:
+                msg = f"🚨 <b>Rate Limit Hit</b>\nMLB Stats API rate limit (HTTP 429) blocked schedule request for {date_str}."
+                logger.warning(msg)
+                TelegramClient().send_message_sync(msg)
             resp.raise_for_status()
             body = resp.json()
         except requests.RequestException as e:
             logger.error(f"MLB Stats API schedule error ({date_str}): {e}")
-            return []
+            raise
 
         games = []
         for date_block in body.get("dates", []):
@@ -84,6 +102,7 @@ class MLBOfficialStatsClient:
                 })
         return games
 
+    @mlb_api_circuit_breaker
     def get_game_ks_and_bbs(self, game_pk: int) -> dict[str, int]:
         """
         Return combined pitching strikeouts and walks for a completed game.
@@ -93,15 +112,22 @@ class MLBOfficialStatsClient:
         Returns {} on error or if the game is not yet final.
         """
         try:
+            delay = random.uniform(0.1, 0.3)
+            logger.debug(f"Applying jitter delay of {delay:.3f}s before MLB Stats API boxscore request")
+            time.sleep(delay)
             resp = self.session.get(
                 f"{_BASE}/game/{game_pk}/boxscore",
-                timeout=15,
+                timeout=(3.0, 15.0),
             )
+            if resp.status_code == 429:
+                msg = f"🚨 <b>Rate Limit Hit</b>\nMLB Stats API rate limit (HTTP 429) blocked boxscore request for gamePk={game_pk}."
+                logger.warning(msg)
+                TelegramClient().send_message_sync(msg)
             resp.raise_for_status()
             box = resp.json()
         except requests.RequestException as e:
             logger.error(f"MLB Stats API boxscore error (gamePk={game_pk}): {e}")
-            return {}
+            raise
 
         try:
             teams = box.get("teams", {})

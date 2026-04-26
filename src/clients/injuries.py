@@ -1,9 +1,12 @@
+import asyncio
+import random
 import requests
 from bs4 import BeautifulSoup
 from typing import List, Dict
 from src.clients.mlb_stats import MLBStatsClient
 from src.utils.logging_utils import get_logger
 from src.data.cache import cache
+from src.clients.telegram_bot import TelegramClient
 
 logger = get_logger(__name__)
 
@@ -19,19 +22,19 @@ class InjuryClient:
     def __init__(self):
         self.cbs_url = "https://www.cbssports.com/mlb/injuries/"
 
-    def get_injuries(self) -> List[Dict]:
+    async def get_injuries(self) -> List[Dict]:
         cache_key = "mlb_injuries_current"
         cached = cache.get(cache_key)
         if cached is not None:
             return cached
 
         # Primary: BallDontLie API
-        injuries = self._fetch_from_bdl()
+        injuries = await self._fetch_from_bdl()
 
         # Fallback: CBS Sports scraper if BDL returns nothing
         if not injuries:
             logger.info("BDL injuries empty, falling back to CBS Sports scraper.")
-            injuries = self._fetch_from_cbs()
+            injuries = await self._fetch_from_cbs()
 
         if injuries:
             cache.set(cache_key, injuries, ttl_seconds=3600)
@@ -39,11 +42,11 @@ class InjuryClient:
         logger.info(f"Fetched {len(injuries)} MLB injury entries.")
         return injuries
 
-    def _fetch_from_bdl(self) -> List[Dict]:
+    async def _fetch_from_bdl(self) -> List[Dict]:
         """Fetch injuries from BallDontLie API (stable, structured)."""
         try:
             bdl_client = MLBStatsClient()
-            raw = bdl_client.get_player_injuries()
+            raw = await bdl_client.get_player_injuries()
             if not raw:
                 return []
 
@@ -76,7 +79,7 @@ class InjuryClient:
             logger.warning(f"BDL injuries fetch failed: {e}")
             return []
 
-    def _fetch_from_cbs(self) -> List[Dict]:
+    async def _fetch_from_cbs(self) -> List[Dict]:
         """
         Fallback: scrape CBS Sports injuries page.
         Wrapped in broad try/except so HTML structure changes don't crash the pipeline.
@@ -86,7 +89,14 @@ class InjuryClient:
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
             }
-            res = requests.get(self.cbs_url, headers=headers, timeout=10)
+            delay = random.uniform(0.5, 1.5)
+            logger.debug(f"Applying jitter delay of {delay:.3f}s before CBS Sports scraper request")
+            await asyncio.sleep(delay)
+            res = await asyncio.to_thread(requests.get, self.cbs_url, headers=headers, timeout=10)
+            if res.status_code == 429:
+                msg = "🚨 <b>Rate Limit Hit</b>\nCBS Sports scraper rate limit (HTTP 429) reached. Request blocked."
+                logger.warning(msg)
+                asyncio.create_task(TelegramClient().send_message(msg))
             res.raise_for_status()
 
             soup = BeautifulSoup(res.text, 'html.parser')

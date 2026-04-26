@@ -16,7 +16,8 @@ def memory_db():
     conn.row_factory = sqlite3.Row
     conn.executescript('''
         CREATE TABLE games (
-            game_id TEXT PRIMARY KEY, date TEXT, status TEXT
+            game_id TEXT PRIMARY KEY, date TEXT, status TEXT,
+            bdl_game_id INTEGER, historical INTEGER DEFAULT 0
         );
         CREATE TABLE pitcher_game_logs (
             game_id INTEGER, player_id INTEGER, date TEXT,
@@ -85,9 +86,9 @@ def test_prune_deletes_old_game_logs(mock_get_db, memory_db):
 @patch('src.pipelines.prune_old_data.get_db_connection')
 def test_prune_only_removes_completed_games(mock_get_db, memory_db):
     """Only COMPLETED games past the cutoff are deleted; SCHEDULED games are untouched."""
-    memory_db.execute("INSERT INTO games VALUES ('old_completed', ?, 'COMPLETED')", (iso(100),))
-    memory_db.execute("INSERT INTO games VALUES ('old_scheduled', ?, 'SCHEDULED')", (iso(100),))
-    memory_db.execute("INSERT INTO games VALUES ('new_completed', ?, 'COMPLETED')", (iso(10),))
+    memory_db.execute("INSERT INTO games (game_id, date, status) VALUES ('old_completed', ?, 'COMPLETED')", (iso(100),))
+    memory_db.execute("INSERT INTO games (game_id, date, status) VALUES ('old_scheduled', ?, 'SCHEDULED')", (iso(100),))
+    memory_db.execute("INSERT INTO games (game_id, date, status) VALUES ('new_completed', ?, 'COMPLETED')", (iso(10),))
     memory_db.commit()
 
     mock_get_db.return_value.__enter__.return_value = memory_db

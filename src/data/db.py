@@ -19,6 +19,7 @@ def init_db():
     with get_db_connection() as conn:
         conn.executescript(schema_sql)
         _migrate_games_columns(conn)
+        _migrate_alerts_columns(conn)
         conn.commit()
     logger.info("Database initialized successfully.")
 
@@ -34,6 +35,15 @@ def _migrate_games_columns(conn):
         conn.execute("ALTER TABLE games ADD COLUMN lineups_confirmed_at TEXT")
     if 'last_scanned_at' not in existing:
         conn.execute("ALTER TABLE games ADD COLUMN last_scanned_at TEXT")
+
+
+def _migrate_alerts_columns(conn):
+    """Backfill placement-time probability columns on existing alerts_sent rows."""
+    existing = {row['name'] for row in conn.execute("PRAGMA table_info(alerts_sent)").fetchall()}
+    if 'model_prob_over' not in existing:
+        conn.execute("ALTER TABLE alerts_sent ADD COLUMN model_prob_over REAL")
+    if 'model_prob_under' not in existing:
+        conn.execute("ALTER TABLE alerts_sent ADD COLUMN model_prob_under REAL")
 
 @contextmanager
 def get_db_connection():

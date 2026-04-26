@@ -6,7 +6,7 @@ from src.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
-def sync_injuries():
+async def sync_injuries():
     """
     Fetch current MLB injuries and upsert into database.
     Fully resilient: any failure here logs a warning and returns gracefully
@@ -15,7 +15,7 @@ def sync_injuries():
     logger.info("Executing pipeline: sync_injuries")
     try:
         client = InjuryClient()
-        injuries = client.get_injuries()
+        injuries = await client.get_injuries()
         today = str(get_eastern_local_date())
 
         if not injuries:

@@ -29,7 +29,7 @@ def _stamp_confirmed_if_both_teams(conn, game_id: str, home_team: str, away_team
     )
 
 
-def sync_lineups():
+async def sync_lineups():
     """
     Fetch today's starting lineups and probable pitchers from BDL /lineups endpoint.
 
@@ -62,7 +62,7 @@ def sync_lineups():
         if not bdl_game_id:
             continue
 
-        lineup_data = bdl_client.get_lineups(bdl_game_id)
+        lineup_data = await bdl_client.get_lineups(bdl_game_id)
         if not lineup_data:
             logger.debug(f"No lineup data yet for game {game['game_id']}")
             continue

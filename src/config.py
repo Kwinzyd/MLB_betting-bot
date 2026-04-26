@@ -11,6 +11,10 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 EDGE_MIN = float(os.getenv("EDGE_MIN", "5.0"))
 KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))
 BANKROLL = float(os.getenv("BANKROLL", "1000.0"))
+# Global kill switch. When False, send_alerts still computes edges and logs them
+# but skips Telegram delivery and does not record alerts_sent rows. Flip to True
+# only after a paper-trading validation window.
+BETTING_ENABLED = os.getenv("BETTING_ENABLED", "false").lower() in ("1", "true", "yes")
 MIN_ODDS = float(os.getenv("MIN_ODDS", "1.70"))
 MIN_MODEL_PROB = float(os.getenv("MIN_MODEL_PROB", "0.55"))
 MIN_SAMPLE_SIZE = int(os.getenv("MIN_SAMPLE_SIZE", "10"))
