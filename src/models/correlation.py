@@ -12,6 +12,9 @@ All boosts are env-overridable.
 import os
 import numpy as np
 
+from src.config import JOINT_PA_ENABLED
+from src.models.joint_pa import pa_correlation_boost
+
 
 def _env_float(name, default):
     try:
@@ -68,10 +71,92 @@ def compute_pitcher_correlation(player_id: int, db_conn) -> dict:
     }
 
 
+def _same_team_batter_pair(leg_a, leg_b) -> bool:
+    if not (leg_a.get('market', '').startswith('batter_')
+            and leg_b.get('market', '').startswith('batter_')):
+        return False
+    team_a = (leg_a.get('team') or '').strip().lower()
+    team_b = (leg_b.get('team') or '').strip().lower()
+    if not team_a or not team_b or team_a != team_b:
+        return False
+    return all(leg_a.get(k) is not None and leg_b.get(k) is not None
+               for k in ('lineup_position', 'mean_count',
+                         'line', 'implied_team_total'))
+
+
+def _offensive_stack_boost(leg_a, leg_b) -> float:
+    pos_a = leg_a['lineup_position']
+    pos_b = leg_b['lineup_position']
+    
+    # Lineup is 1-indexed (1 through 9 typically).
+    # Wrap around calculation. Distance from pos_a to pos_b in batting order.
+    dist_a_to_b = (pos_b - pos_a) % 9
+    dist_b_to_a = (pos_a - pos_b) % 9
+
+    if dist_a_to_b <= 3:
+        early_leg, late_leg = leg_a, leg_b
+        dist = dist_a_to_b
+    elif dist_b_to_a <= 3:
+        early_leg, late_leg = leg_b, leg_a
+        dist = dist_b_to_a
+    else:
+        # Distance > 3, too far away for primary offensive transitions
+        return 1.0
+
+    market_early = early_leg['market']
+    market_late = late_leg['market']
+
+    base_boost = 1.0
+    
+    # "Gets on base" -> "Driven in"
+    early_on_base = market_early in (
+        'batter_hits', 'batter_total_bases', 'batter_singles', 
+        'batter_doubles', 'batter_triples'
+    )
+    if early_on_base and market_late == 'batter_runs_batted_in':
+        base_boost = 1.25
+
+    # "Scores" -> "Driven in by Hit/RBI"
+    if market_early == 'batter_runs':
+        if market_late in (
+            'batter_hits', 'batter_total_bases', 'batter_singles', 
+            'batter_doubles', 'batter_triples'
+        ):
+            base_boost = 1.20
+        elif market_late == 'batter_runs_batted_in':
+            base_boost = 1.30
+
+    if base_boost > 1.0:
+        # Exponential exponential decay by distance:
+        decay_factor = [1.0, 0.5, 0.25]
+        return 1.0 + (base_boost - 1.0) * decay_factor[dist - 1]
+
+    return 1.0
+
+
+
 def _lookup_boost(leg_a, leg_b, db_conn=None):
     market_a, side_a = leg_a['market'], leg_a['side']
     market_b, side_b = leg_b['market'], leg_b['side']
-    
+
+    # Same-team batter-under pair with full data: PA-correlation boost.
+    if (JOINT_PA_ENABLED and side_a == 'under' and side_b == 'under'
+            and _same_team_batter_pair(leg_a, leg_b)):
+        # Slot-equality is degenerate (same player); fall through to static.
+        if leg_a['lineup_position'] != leg_b['lineup_position']:
+            return pa_correlation_boost(
+                slot_a=leg_a['lineup_position'],
+                slot_b=leg_b['lineup_position'],
+                implied_team_total=leg_a['implied_team_total'],
+                line_a=leg_a['line'], mean_a=leg_a['mean_count'], market_a=market_a,
+                line_b=leg_b['line'], mean_b=leg_b['mean_count'], market_b=market_b,
+            )
+
+    # Same-team batter-over pair: Offensive stack boost (Transition Matrix)
+    if side_a == 'over' and side_b == 'over' and _same_team_batter_pair(leg_a, leg_b):
+        if leg_a['lineup_position'] != leg_b['lineup_position']:
+            return _offensive_stack_boost(leg_a, leg_b)
+
     # Base batter-batter correlations
     key = (market_a, side_a, market_b, side_b)
     rev = (market_b, side_b, market_a, side_a)

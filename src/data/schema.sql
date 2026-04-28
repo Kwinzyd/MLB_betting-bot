@@ -150,6 +150,29 @@ CREATE TABLE IF NOT EXISTS alerts_sent (
     UNIQUE(player_name, market, line, bookmaker)
 );
 
+CREATE TABLE IF NOT EXISTS orders (
+    order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    venue TEXT NOT NULL,
+    alert_id INTEGER,
+    player_name TEXT NOT NULL,
+    market TEXT NOT NULL,
+    line REAL NOT NULL,
+    side TEXT NOT NULL,
+    game_id TEXT,
+    bookmaker TEXT,
+    offered_odds REAL NOT NULL,
+    fill_odds REAL,
+    stake REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    venue_order_id TEXT,
+    placed_at TEXT NOT NULL,
+    filled_at TEXT,
+    notes TEXT,
+    FOREIGN KEY(alert_id) REFERENCES alerts_sent(alert_id)
+);
+CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+CREATE INDEX IF NOT EXISTS idx_orders_venue ON orders(venue);
+
 CREATE TABLE IF NOT EXISTS bet_results (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     alert_id INTEGER,
@@ -207,11 +230,42 @@ CREATE TABLE IF NOT EXISTS sgp_candidates (
     naive_parlay_odds REAL,
     fair_odds REAL,
     edge_vs_naive REAL,
+    kelly_stake REAL,
     bookmakers TEXT,
     timestamp TEXT,
     UNIQUE(game_id, legs_json)
 );
 CREATE INDEX IF NOT EXISTS idx_sgp_candidates_timestamp ON sgp_candidates(timestamp);
+
+-- Settled SGP tickets. recalc_odds is the payout odds after dropping any
+-- VOID/PUSH legs (their stake is refunded, surviving legs reprice as a smaller
+-- parlay). voided_legs is a JSON list of leg indices that were voided so the
+-- recalculation is auditable.
+CREATE TABLE IF NOT EXISTS sgp_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sgp_candidate_id INTEGER UNIQUE,
+    leg_results_json TEXT,
+    voided_legs_json TEXT,
+    surviving_legs INTEGER,
+    recalc_odds REAL,
+    result TEXT,
+    profit REAL,
+    settled_at TEXT,
+    FOREIGN KEY(sgp_candidate_id) REFERENCES sgp_candidates(id)
+);
+
+-- Per-scan game-total snapshots. Trigger watch reads the latest row as the
+-- baseline against which it compares fresh totals to detect sharp-book moves
+-- between scan cycles.
+CREATE TABLE IF NOT EXISTS game_totals_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_id TEXT NOT NULL,
+    total REAL NOT NULL,
+    source TEXT NOT NULL,
+    timestamp TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_game_totals_history_game_ts
+    ON game_totals_history(game_id, timestamp DESC);
 
 -- Fired weather / umpire edge triggers. Used for dedup so we don't re-pull
 -- the same game every cron tick once a threshold is crossed.

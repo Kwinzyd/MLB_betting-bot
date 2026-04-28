@@ -1,8 +1,14 @@
+import json
+
 from src.config import BANKROLL, SHARP_BOOKMAKERS
 from src.data.db import get_db_connection
 from src.models.devig import devig_multiplicative
 from src.models.kelly import get_current_bankroll
 from src.utils.logging_utils import get_logger
+
+# Markets that resolve from pitcher_game_logs vs. batter_game_logs.
+_PITCHER_MARKETS = {'pitcher_strikeouts', 'pitcher_earned_runs'}
+_BATTER_MARKETS = {'batter_hits', 'batter_total_bases', 'batter_home_runs'}
 
 logger = get_logger(__name__)
 
@@ -26,12 +32,11 @@ def settle_results():
             AND a.alert_id NOT IN (SELECT alert_id FROM bet_results WHERE alert_id IS NOT NULL)
         ''').fetchall()
 
-    if not unsettled:
-        logger.info("No unsettled bets found.")
-        return
-
     settled_count = 0
     total_profit = 0.0
+
+    if not unsettled:
+        logger.info("No unsettled single-bet alerts.")
 
     for alert in unsettled:
         alert_id = alert['alert_id']
@@ -45,7 +50,30 @@ def settle_results():
         # Get actual stat value
         actual = _get_actual_stat(player_name, market, alert['game_id'])
         if actual is None:
-            logger.debug(f"No actual stat found for {player_name} in {market}, skipping.")
+            # Distinguish "BDL hasn't synced this game's box score yet" (skip)
+            # from "the box score is in but this player has no row" (DNP void).
+            if _player_dnp(player_name, market, alert['game_id']):
+                clv = _calculate_clv(
+                    alert['game_id'], player_name, market, line, side,
+                    alert['opening_odds']
+                )
+                with get_db_connection() as conn:
+                    conn.execute('''
+                        INSERT INTO bet_results
+                        (alert_id, actual_value, result, profit, closing_odds, clv)
+                        VALUES (?, NULL, 'VOID', 0.0, ?, ?)
+                    ''', (alert_id, odds, clv))
+                    conn.commit()
+                settled_count += 1
+                logger.info(
+                    f"VOIDED (DNP): {player_name} {market} {side.upper()} {line} - "
+                    f"stake ${stake:.2f} refunded."
+                )
+            else:
+                logger.debug(
+                    f"No actual stat for {player_name} in {market}, "
+                    f"box score not yet synced - skipping."
+                )
             continue
 
         # Determine result
@@ -87,11 +115,185 @@ def settle_results():
             f"Actual: {actual} | {result} | P&L: ${profit:+.2f} | CLV: {clv:+.3f}"
         )
 
+    # Settle SGP tickets (handles void recalculation across legs).
+    sgp_settled, sgp_profit = _settle_sgps()
+    settled_count += sgp_settled
+    total_profit += sgp_profit
+
     # Log summary
     if settled_count > 0:
         _log_pnl_summary()
 
     logger.info(f"Settlement complete. Settled {settled_count} bets. Session P&L: ${total_profit:+.2f}")
+
+
+def _player_dnp(player_name: str, market: str, game_id: str) -> bool:
+    """
+    True iff the box score for this game has been synced but the player has
+    no row in the relevant log table. That's our late-scratch / DNP signal.
+
+    Returning False when the box score isn't in yet keeps the settler from
+    voiding bets just because BDL is slow.
+    """
+    if market in _PITCHER_MARKETS:
+        log_table = 'pitcher_game_logs'
+    elif market in _BATTER_MARKETS:
+        log_table = 'batter_game_logs'
+    else:
+        return False
+
+    with get_db_connection() as conn:
+        game = conn.execute(
+            "SELECT bdl_game_id FROM games WHERE game_id = ?", (game_id,)
+        ).fetchone()
+        if not game or not game['bdl_game_id']:
+            return False
+        bdl_game_id = game['bdl_game_id']
+
+        # Box score must have at least one row for this game; otherwise BDL
+        # likely hasn't synced and we shouldn't void prematurely.
+        any_rows = conn.execute(
+            f"SELECT 1 FROM {log_table} WHERE game_id = ? LIMIT 1",
+            (bdl_game_id,)
+        ).fetchone()
+        if not any_rows:
+            return False
+
+        player = conn.execute(
+            "SELECT player_id FROM players WHERE name = ? COLLATE NOCASE",
+            (player_name,)
+        ).fetchone()
+        if not player:
+            player = conn.execute(
+                "SELECT player_id FROM players WHERE name LIKE ? COLLATE NOCASE",
+                (f"%{player_name}%",)
+            ).fetchone()
+        if not player:
+            # Unknown player — can't confirm DNP, fall through to skip.
+            return False
+
+        player_row = conn.execute(
+            f"SELECT 1 FROM {log_table} WHERE game_id = ? AND player_id = ? LIMIT 1",
+            (bdl_game_id, player['player_id'])
+        ).fetchone()
+        return player_row is None
+
+
+def _settle_sgps():
+    """
+    Grade SGP tickets, recalculating payout when legs void/push.
+
+    Per-leg outcomes: WIN, LOSS, PUSH, VOID, PENDING (box score not in).
+    Ticket logic:
+      - any PENDING leg -> defer (don't write a row)
+      - any LOSS leg    -> ticket loses, profit = -stake
+      - all surviving legs WIN -> profit = stake * (recalc_odds - 1),
+        where recalc_odds = product of surviving legs' decimal odds
+        (PUSH/VOID legs drop out, mirroring how soft books reprice voided SGPs)
+      - all legs VOID/PUSH -> ticket fully refunded, profit = 0
+    """
+    settled = 0
+    total_profit = 0.0
+    with get_db_connection() as conn:
+        rows = conn.execute('''
+            SELECT s.id, s.game_id, s.legs_json, s.kelly_stake,
+                   s.naive_parlay_odds
+            FROM sgp_candidates s
+            JOIN games g ON s.game_id = g.game_id
+            WHERE g.status = 'COMPLETED'
+              AND s.kelly_stake IS NOT NULL
+              AND s.kelly_stake > 0
+              AND s.id NOT IN (
+                  SELECT sgp_candidate_id FROM sgp_results
+                  WHERE sgp_candidate_id IS NOT NULL
+              )
+        ''').fetchall()
+
+    for row in rows:
+        try:
+            legs = json.loads(row['legs_json'])
+        except (TypeError, ValueError):
+            logger.warning(f"SGP {row['id']}: malformed legs_json, skipping.")
+            continue
+
+        leg_results = []
+        defer = False
+        for leg in legs:
+            outcome = _grade_leg(leg, row['game_id'])
+            if outcome == 'PENDING':
+                defer = True
+                break
+            leg_results.append(outcome)
+
+        if defer:
+            logger.debug(f"SGP {row['id']}: legs pending, deferring settlement.")
+            continue
+
+        stake = float(row['kelly_stake'])
+        voided_idx = [i for i, r in enumerate(leg_results) if r in ('VOID', 'PUSH')]
+        survivors = [
+            (legs[i], leg_results[i]) for i in range(len(legs))
+            if i not in voided_idx
+        ]
+
+        if any(r == 'LOSS' for _, r in survivors):
+            ticket_result = 'LOSS'
+            recalc_odds = float(row['naive_parlay_odds'] or 0.0)
+            profit = -stake
+        elif not survivors:
+            # All legs voided/pushed -> full refund.
+            ticket_result = 'VOID'
+            recalc_odds = 1.0
+            profit = 0.0
+        else:
+            recalc_odds = 1.0
+            for leg, _ in survivors:
+                recalc_odds *= float(leg['odds'])
+            ticket_result = 'WIN'
+            profit = stake * (recalc_odds - 1.0)
+
+        with get_db_connection() as conn:
+            conn.execute('''
+                INSERT INTO sgp_results
+                (sgp_candidate_id, leg_results_json, voided_legs_json,
+                 surviving_legs, recalc_odds, result, profit, settled_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ''', (
+                row['id'], json.dumps(leg_results), json.dumps(voided_idx),
+                len(survivors), round(recalc_odds, 4),
+                ticket_result, round(profit, 2),
+            ))
+            conn.commit()
+
+        settled += 1
+        total_profit += profit
+        logger.info(
+            f"SGP SETTLED: id={row['id']} legs={leg_results} "
+            f"voided={voided_idx} -> {ticket_result} @ {recalc_odds:.2f} "
+            f"| P&L: ${profit:+.2f}"
+        )
+
+    return settled, total_profit
+
+
+def _grade_leg(leg: dict, game_id: str) -> str:
+    """Grade a single SGP leg. Returns WIN/LOSS/PUSH/VOID/PENDING."""
+    player = leg.get('player_name')
+    market = leg.get('market')
+    line = float(leg.get('line'))
+    side = leg.get('side')
+
+    actual = _get_actual_stat(player, market, game_id)
+    if actual is None:
+        if _player_dnp(player, market, game_id):
+            return 'VOID'
+        return 'PENDING'
+
+    if actual == line:
+        return 'PUSH'
+    if side == 'over':
+        return 'WIN' if actual > line else 'LOSS'
+    return 'WIN' if actual < line else 'LOSS'
 
 
 def _get_actual_stat(player_name: str, market: str, game_id: str) -> float:

@@ -30,7 +30,33 @@ def _seed_schema(conn):
             game_id TEXT, timestamp TEXT,
             UNIQUE(player_name, market, line, bookmaker)
         );
+        CREATE TABLE orders (
+            order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            venue TEXT NOT NULL,
+            alert_id INTEGER,
+            player_name TEXT NOT NULL,
+            market TEXT NOT NULL,
+            line REAL NOT NULL,
+            side TEXT NOT NULL,
+            game_id TEXT,
+            bookmaker TEXT,
+            offered_odds REAL NOT NULL,
+            fill_odds REAL,
+            stake REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            venue_order_id TEXT,
+            placed_at TEXT NOT NULL,
+            filled_at TEXT,
+            notes TEXT
+        );
     ''')
+
+
+def _build_telegram_registry():
+    from src.clients.execution.telegram_venue import TelegramVenue
+    venue = TelegramVenue()
+    venue._client.send_message = AsyncMock(return_value=True)
+    return [venue], venue
 
 
 def _add_candidate(conn, game_id, player, market, line, prob_over, snap_id, book='dk'):
@@ -62,9 +88,11 @@ def memory_db():
     return conn
 
 
+@patch('src.pipelines.send_alerts.BETTING_ENABLED', True)
+@patch('src.clients.execution.telegram_venue.BETTING_ENABLED', True)
 @patch('src.pipelines.send_alerts.get_db_connection')
-@patch('src.pipelines.send_alerts.TelegramClient')
-async def test_one_bet_per_player(mock_tg_cls, mock_get_db, memory_db):
+@patch('src.pipelines.send_alerts.build_venue_registry')
+async def test_one_bet_per_player(mock_registry, mock_get_db, memory_db):
     """Same player with two playable markets → only the higher-edge one fires."""
     # Strikeouts: edge ~15% (prob_over=0.65)
     _add_candidate(memory_db, 'g1', 'Gerrit Cole', 'pitcher_strikeouts', 7.5, 0.65, 's1')
@@ -72,7 +100,8 @@ async def test_one_bet_per_player(mock_tg_cls, mock_get_db, memory_db):
     _add_candidate(memory_db, 'g1', 'Gerrit Cole', 'pitcher_earned_runs', 2.5, 0.70, 's2')
     memory_db.commit()
 
-    mock_tg_cls.return_value.send_message = AsyncMock()
+    venues, _tg = _build_telegram_registry()
+    mock_registry.return_value = venues
     mock_get_db.return_value.__enter__.return_value = memory_db
     mock_get_db.return_value.__exit__.return_value = None
 
@@ -86,9 +115,11 @@ async def test_one_bet_per_player(mock_tg_cls, mock_get_db, memory_db):
     assert rows[0]['market'] == 'pitcher_earned_runs'
 
 
+@patch('src.pipelines.send_alerts.BETTING_ENABLED', True)
+@patch('src.clients.execution.telegram_venue.BETTING_ENABLED', True)
 @patch('src.pipelines.send_alerts.get_db_connection')
-@patch('src.pipelines.send_alerts.TelegramClient')
-async def test_max_three_per_game(mock_tg_cls, mock_get_db, memory_db):
+@patch('src.pipelines.send_alerts.build_venue_registry')
+async def test_max_three_per_game(mock_registry, mock_get_db, memory_db):
     """Five playable candidates on one game → only the top 3 by edge fire."""
     # Edges: 20%, 18%, 15%, 12%, 10% — top 3 keep
     for i, (player, prob) in enumerate([
@@ -101,7 +132,8 @@ async def test_max_three_per_game(mock_tg_cls, mock_get_db, memory_db):
         _add_candidate(memory_db, 'g1', player, 'batter_hits', 1.5, prob, f's{i}')
     memory_db.commit()
 
-    mock_tg_cls.return_value.send_message = AsyncMock()
+    venues, _tg = _build_telegram_registry()
+    mock_registry.return_value = venues
     mock_get_db.return_value.__enter__.return_value = memory_db
     mock_get_db.return_value.__exit__.return_value = None
 

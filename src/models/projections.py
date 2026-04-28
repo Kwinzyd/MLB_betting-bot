@@ -1,7 +1,12 @@
 import os
 from typing import List, Dict, Any, Optional
 from src.utils.logging_utils import get_logger
-from src.models.distributions import get_probabilities
+from src.models.distributions import (
+    get_probabilities, get_probabilities_mixture, compute_hr_pi0,
+)
+from src.models.pa_estimator import (
+    estimate_pa_distribution, expected_pa, implied_team_total,
+)
 from src.data.park_factors import get_park_factor
 from src.config import (
     LEAGUE_AVG_K_RATE, LEAGUE_AVG_RUNS_PER_GAME,
@@ -11,8 +16,41 @@ from src.config import (
     BATTER_RECENT_WEIGHT, BATTER_SEASON_WEIGHT,
     LINEUP_PA_MAP, DEFAULT_PROJECTED_PA,
     LEAGUE_AVG_GAME_TOTAL, PA_ELASTICITY_TO_TOTAL,
+    PA_ESTIMATOR_ENABLED,
+    HR_ZINB_ENABLED,
     UMP_ER_K_DAMPENING,
 )
+
+
+def _batter_iso_from_logs(logs):
+    """Recent + season blended ISO (slugging - avg) from batter game logs."""
+    if not logs:
+        return None
+    total_2b = sum(l.get('doubles', 0) or 0 for l in logs)
+    total_3b = sum(l.get('triples', 0) or 0 for l in logs)
+    total_hr = sum(l.get('home_runs', 0) or 0 for l in logs)
+    total_h = sum(l.get('hits', 0) or 0 for l in logs)
+    total_ab = sum(l.get('at_bats', 0) or 0 for l in logs)
+    if total_ab <= 0:
+        return None
+    slg = (total_h + total_2b + 2 * total_3b + 3 * total_hr) / total_ab
+    avg = total_h / total_ab
+    return max(0.0, slg - avg)
+
+
+def _compute_hr_pi0(market, batter_logs, park_hr_factor, extra_features, weather):
+    """Compute structural-zero probability for batter_home_runs; None for other markets."""
+    if not HR_ZINB_ENABLED or market != "batter_home_runs":
+        return None
+    pitcher_hr9 = (extra_features or {}).get('opp_pitcher_hr9')
+    wind_in_mph = (weather or {}).get('wind_in_mph')
+    batter_iso = _batter_iso_from_logs(batter_logs)
+    return compute_hr_pi0(
+        pitcher_hr9=pitcher_hr9,
+        batter_iso=batter_iso,
+        park_hr_factor=park_hr_factor,
+        wind_in_mph=wind_in_mph,
+    )
 
 logger = get_logger(__name__)
 
@@ -185,6 +223,8 @@ class ProjectionModel:
             "projected_mean": round(projected_k, 2),
             "prob_over": prob_over,
             "prob_under": prob_under,
+            "alpha": disp.get("alpha"),
+            "sigma": disp.get("sigma"),
             "injury_status": "Healthy",
             "sample_size": len(logs),
             "context": {
@@ -281,6 +321,8 @@ class ProjectionModel:
             "projected_mean": round(projected_er, 2),
             "prob_over": prob_over,
             "prob_under": prob_under,
+            "alpha": disp.get("alpha"),
+            "sigma": disp.get("sigma"),
             "injury_status": "Healthy",
             "sample_size": len(logs),
             "context": {
@@ -368,7 +410,14 @@ class ProjectionModel:
 
         # --- Projected plate appearances from lineup position, scaled by game total ---
         base_pa = LINEUP_PA_MAP.get(lineup_position, DEFAULT_PROJECTED_PA)
-        projected_pa = _scale_pa_for_game_total(base_pa, game_total)
+        if PA_ESTIMATOR_ENABLED:
+            itt = implied_team_total(game_total)
+            pa_dist = estimate_pa_distribution(lineup_position, itt)
+            projected_pa = expected_pa(pa_dist)
+        else:
+            itt = None
+            pa_dist = None
+            projected_pa = _scale_pa_for_game_total(base_pa, game_total)
 
         # Platoon adjustment
         platoon_adj = self._get_platoon_adjustment(batter_hand, pitcher_hand, stat_type)
@@ -386,10 +435,20 @@ class ProjectionModel:
         projected = blended_per_pa * projected_pa * platoon_adj * park_adj * bp_adj
 
         market_key = self._stat_type_to_market(stat_type)
-        prob_over, prob_under = get_probabilities(
-            projected, line, market_key,
-            alpha=disp.get("alpha"), sigma=disp.get("sigma"),
-        )
+        pi0 = _compute_hr_pi0(market_key, logs, park_adj, extra_features, weather)
+        if pa_dist is not None:
+            prob_over, prob_under = get_probabilities_mixture(
+                blended_per_pa, line, market_key, pa_dist,
+                adjustments=platoon_adj * park_adj * bp_adj,
+                alpha=disp.get("alpha"), sigma=disp.get("sigma"),
+                pi0=pi0,
+            )
+        else:
+            prob_over, prob_under = get_probabilities(
+                projected, line, market_key,
+                alpha=disp.get("alpha"), sigma=disp.get("sigma"),
+                pi0=pi0,
+            )
 
         return {
             "player_name": None,
@@ -398,6 +457,8 @@ class ProjectionModel:
             "projected_mean": round(projected, 3),
             "prob_over": prob_over,
             "prob_under": prob_under,
+            "alpha": disp.get("alpha"),
+            "sigma": disp.get("sigma"),
             "injury_status": "Healthy",
             "sample_size": len(logs),
             "context": {
@@ -407,11 +468,14 @@ class ProjectionModel:
                 "season_rate_per_pa": round(season_rate_per_pa, 4),
                 "base_pa": base_pa,
                 "projected_pa": projected_pa,
+                "pa_distribution": pa_dist,
+                "implied_team_total": itt,
                 "game_total": game_total,
                 "lineup_position": lineup_position,
                 "platoon_adj": round(platoon_adj, 3),
                 "park_adj": round(park_adj, 3),
                 "bp_adj": round(bp_adj, 3),
+                "hr_pi0": pi0,
                 "batter_hand": batter_hand,
                 "pitcher_hand": pitcher_hand,
                 "venue": venue,
@@ -469,6 +533,8 @@ class ProjectionModel:
             "projected_mean": round(projected_mean, 3),
             "prob_over": prob_over,
             "prob_under": prob_under,
+            "alpha": disp.get("alpha"),
+            "sigma": disp.get("sigma"),
             "injury_status": "Healthy",
             "sample_size": len(pitcher_logs),
             "context": {
@@ -494,7 +560,14 @@ class ProjectionModel:
         disp = dispersion or {}
 
         base_pa = LINEUP_PA_MAP.get(lineup_position, DEFAULT_PROJECTED_PA)
-        projected_pa = _scale_pa_for_game_total(base_pa, game_total)
+        if PA_ESTIMATOR_ENABLED:
+            itt = implied_team_total(game_total)
+            pa_dist = estimate_pa_distribution(lineup_position, itt)
+            projected_pa = expected_pa(pa_dist)
+        else:
+            itt = None
+            pa_dist = None
+            projected_pa = _scale_pa_for_game_total(base_pa, game_total)
 
         try:
             features = build_batter_features(
@@ -518,11 +591,41 @@ class ProjectionModel:
             logger.warning(f"GLM predict failed for {market}: {e}; falling back.")
             return None
 
-        prob_over, prob_under = mc_prob_over(
-            projected_mean, line, market,
-            nb_alpha=disp.get("alpha"),
-            tb_std=disp.get("sigma"),
-        )
+        park_hr_factor = get_park_factor(venue, weather=weather).get("hr", 1.0)
+        pi0 = _compute_hr_pi0(market, batter_logs, park_hr_factor, extra_features, weather)
+
+        if pa_dist is not None:
+            prob_over = 0.0
+            prob_under = 0.0
+            for k, p_k in pa_dist.items():
+                if p_k <= 0:
+                    continue
+                try:
+                    mean_k = glm.predict_mean(features, exposure=k)
+                except Exception as e:
+                    logger.warning(f"GLM predict failed for {market} at PA={k}: {e}; falling back.")
+                    prob_over, prob_under = mc_prob_over(
+                        projected_mean, line, market,
+                        nb_alpha=disp.get("alpha"),
+                        tb_std=disp.get("sigma"),
+                        zinb_pi0=pi0,
+                    )
+                    break
+                over_k, under_k = mc_prob_over(
+                    mean_k, line, market,
+                    nb_alpha=disp.get("alpha"),
+                    tb_std=disp.get("sigma"),
+                    zinb_pi0=pi0,
+                )
+                prob_over += p_k * over_k
+                prob_under += p_k * under_k
+        else:
+            prob_over, prob_under = mc_prob_over(
+                projected_mean, line, market,
+                nb_alpha=disp.get("alpha"),
+                tb_std=disp.get("sigma"),
+                zinb_pi0=pi0,
+            )
 
         return {
             "player_name": None,
@@ -531,12 +634,17 @@ class ProjectionModel:
             "projected_mean": round(projected_mean, 3),
             "prob_over": prob_over,
             "prob_under": prob_under,
+            "alpha": disp.get("alpha"),
+            "sigma": disp.get("sigma"),
             "injury_status": "Healthy",
             "sample_size": len(batter_logs),
             "context": {
                 "model": "glm",
                 "base_pa": base_pa,
                 "projected_pa": projected_pa,
+                "pa_distribution": pa_dist,
+                "implied_team_total": itt,
+                "hr_pi0": pi0,
                 "game_total": game_total,
                 "lineup_position": lineup_position,
                 "batter_hand": batter_hand,

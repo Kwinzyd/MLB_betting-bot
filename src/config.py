@@ -8,6 +8,13 @@ WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")  # OpenWeatherMap (free tier)
 BDL_API_KEY = os.getenv("BDL_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# Polymarket L2 / CLOB API Auth
+POLYMARKET_HOST = os.getenv("POLYMARKET_HOST", "https://clob.polymarket.com")
+POLYMARKET_API_KEY = os.getenv("POLYMARKET_API_KEY")
+POLYMARKET_SECRET = os.getenv("POLYMARKET_SECRET")
+POLYMARKET_PASSPHRASE = os.getenv("POLYMARKET_PASSPHRASE")
+POLYMARKET_PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY")
 EDGE_MIN = float(os.getenv("EDGE_MIN", "5.0"))
 KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))
 BANKROLL = float(os.getenv("BANKROLL", "1000.0"))
@@ -15,6 +22,9 @@ BANKROLL = float(os.getenv("BANKROLL", "1000.0"))
 # but skips Telegram delivery and does not record alerts_sent rows. Flip to True
 # only after a paper-trading validation window.
 BETTING_ENABLED = os.getenv("BETTING_ENABLED", "false").lower() in ("1", "true", "yes")
+TELEGRAM_VENUE_ENABLED = os.getenv("TELEGRAM_VENUE_ENABLED", "true").lower() in ("1", "true", "yes")
+PAPER_EXCHANGE_ENABLED = os.getenv("PAPER_EXCHANGE_ENABLED", "false").lower() in ("1", "true", "yes")
+POLYMARKET_ENABLED = os.getenv("POLYMARKET_ENABLED", "false").lower() in ("1", "true", "yes")
 MIN_ODDS = float(os.getenv("MIN_ODDS", "1.70"))
 MIN_MODEL_PROB = float(os.getenv("MIN_MODEL_PROB", "0.55"))
 MIN_SAMPLE_SIZE = int(os.getenv("MIN_SAMPLE_SIZE", "10"))
@@ -40,6 +50,10 @@ SHARP_MODEL_AGREEMENT_TOL = float(os.getenv("SHARP_MODEL_AGREEMENT_TOL", "0.05")
 SGP_MIN_EDGE = float(os.getenv("SGP_MIN_EDGE", "0.10"))
 SGP_MAX_PER_GAME = int(os.getenv("SGP_MAX_PER_GAME", "1"))
 SGP_MAX_PER_DAY = int(os.getenv("SGP_MAX_PER_DAY", "3"))
+# Kelly fraction multiplier for SGPs. Effective Kelly = KELLY_FRACTION * this.
+# Tighter than singles because parlay variance compounds even after correlation
+# correction, and the empirical-r estimate from ~50 starts has its own noise.
+SGP_KELLY_FRACTION_MULT = float(os.getenv("SGP_KELLY_FRACTION_MULT", "0.5"))
 
 # Weather / umpire edge-trigger thresholds. Fire a targeted odds pull when an
 # environmental input shifts enough that our projections meaningfully move
@@ -48,6 +62,26 @@ TRIGGER_UMP_THRESHOLD = float(os.getenv("TRIGGER_UMP_THRESHOLD", "0.10"))
 TRIGGER_WEATHER_HR_THRESHOLD = float(os.getenv("TRIGGER_WEATHER_HR_THRESHOLD", "0.05"))
 TRIGGER_WEATHER_SO_THRESHOLD = float(os.getenv("TRIGGER_WEATHER_SO_THRESHOLD", "0.03"))
 TRIGGER_DEDUP_HOURS = int(os.getenv("TRIGGER_DEDUP_HOURS", "6"))
+# Total-shift trigger: fire when sharp-book consensus total moves by >= this
+# (in runs) since the last persisted snapshot. Soft books typically lag the
+# move by minutes, so we force a targeted re-scan to catch them sleeping.
+TRIGGER_TOTAL_SHIFT_THRESHOLD = float(os.getenv("TRIGGER_TOTAL_SHIFT_THRESHOLD", "0.5"))
+# Skip the totals re-poll if the latest history row is younger than this —
+# avoids flapping right after a scan and saves quota.
+TRIGGER_TOTAL_MIN_HISTORY_MINUTES = int(os.getenv("TRIGGER_TOTAL_MIN_HISTORY_MINUTES", "5"))
+
+# Alt-line shopping: max distance (in line units) we'll evaluate alt-lines from
+# the sharp-anchored line. Soft books frequently post off-consensus alts; the
+# model is anchor-validated at the sharp line and re-priced at the alt-line via
+# get_probabilities. The cap keeps us inside the regime where the projection's
+# tails are well-behaved.
+ALT_LINE_MAX_DISTANCE = float(os.getenv("ALT_LINE_MAX_DISTANCE", "1.0"))
+
+# Camouflage stake rounding. Soft books fingerprint accounts that bet exact
+# fractional-Kelly amounts ($18.42, $7.31). Snap persisted/displayed stakes
+# to a round increment so they look like rec-style $15/$20 wagers. Set 0 to
+# disable (e.g. for backtests where exact Kelly figures matter).
+STAKE_ROUNDING_INCREMENT = float(os.getenv("STAKE_ROUNDING_INCREMENT", "5.0"))
 
 # Dispersion fitting: per-entity NB alpha / Normal sigma with EB shrinkage.
 DISPERSION_MIN_OBS = int(os.getenv("DISPERSION_MIN_OBS", "10"))
@@ -105,6 +139,7 @@ MARKETS_MAPPING = {
 LEAGUE_AVG_K_RATE = 0.225       # ~22.5% strikeout rate
 LEAGUE_AVG_RUNS_PER_GAME = 4.5  # ~4.5 runs per team per game
 LEAGUE_AVG_HR_RATE = 0.035      # ~3.5% HR per PA
+LEAGUE_AVG_3B_RATE = 0.005      # ~0.5% triples per PA (too noisy to back out from anchors)
 LEAGUE_AVG_PITCHES_PER_IP = 16.5  # ~16.5 pitches per inning, MLB average
 DEFAULT_PITCH_LIMIT = 100         # Typical pitch count ceiling for starters
 
@@ -156,3 +191,23 @@ LINEUP_PA_MAP = {
 DEFAULT_PROJECTED_PA = 4.0  # Fallback when lineup position is unknown
 LEAGUE_AVG_GAME_TOTAL = LEAGUE_AVG_RUNS_PER_GAME * 2  # both teams combined
 PA_ELASTICITY_TO_TOTAL = 0.35  # 10% more expected runs -> ~3.5% more PAs
+
+PA_ESTIMATOR_ENABLED = True
+PA_DIST_SUPPORT = (3, 4, 5, 6, 7)
+PA_DIST_ANCHOR = 3
+
+HR_ZINB_ENABLED = True
+LEAGUE_AVG_HR9 = 1.30
+LEAGUE_AVG_ISO = 0.165
+HR_PI0_MAX = 0.40
+HR_PI0_BETA_PITCHER = 0.45
+HR_PI0_BETA_BATTER = 4.50
+HR_PI0_BETA_PARK = 1.20
+HR_PI0_BETA_WIND = 0.04
+
+# Same-team batter-batter PA correlation. The TBF latent in joint_pa.py
+# determines every slot's PA deterministically, so two same-team slots co-move
+# strongly. The derived boost replaces the static BATTER_CORR_BOOST entry for
+# same-team batter-under pairs. Cap is a model-error guardrail.
+JOINT_PA_ENABLED = os.getenv("JOINT_PA_ENABLED", "true").lower() in ("1", "true", "yes")
+JOINT_PA_BOOST_CAP = float(os.getenv("JOINT_PA_BOOST_CAP", "1.25"))

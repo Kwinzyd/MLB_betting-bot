@@ -30,12 +30,29 @@ class OddsAPIClient:
     def _log_quota(self, response):
         requests_used = response.headers.get("x-requests-used")
         requests_remaining = response.headers.get("x-requests-remaining")
-        if requests_used is not None:
+        if requests_used is not None and requests_remaining is not None:
             logger.info(f"Odds API Quota - Used: {requests_used}, Remaining: {requests_remaining}")
+            try:
+                used = int(requests_used)
+                rem = int(requests_remaining)
+                total = used + rem
+                if total > 0 and (rem / total) < 0.10:
+                    if not cache.get("odds_api_quota_exhausted"):
+                        # Set lock for 30 days. Must be manually dropped.
+                        cache.set("odds_api_quota_exhausted", True, ttl_seconds=30*86400)
+                        msg = f"🚨 <b>CRITICAL: QUOTA LOW</b>\nOdds API remaining quota dropped below 10% ({rem} / {total}). Halting target scans."
+                        logger.error(msg)
+                        asyncio.create_task(TelegramClient().send_message(msg))
+            except Exception as e:
+                logger.error(f"Failed to parse or log quota metrics: {e}")
 
     @odds_api_circuit_breaker
     @async_retry_api(max_retries=3, exceptions=(httpx.HTTPError,))
-    async def get_mlb_events(self):
+    async def get_mlb_events(self, ignore_quota_lock: bool = False):
+        if not ignore_quota_lock and cache.get("odds_api_quota_exhausted"):
+            logger.warning("Quota lock is active. Skipping OddsAPI request (get_mlb_events).")
+            return []
+
         cache_key = "odds_api_mlb_events"
         cached = cache.get(cache_key)
         if cached:
@@ -60,12 +77,16 @@ class OddsAPIClient:
 
     @odds_api_circuit_breaker
     @async_retry_api(max_retries=3, exceptions=(httpx.HTTPError,))
-    async def get_event_odds(self, event_id: str, markets: list, bust_cache: bool = False):
+    async def get_event_odds(self, event_id: str, markets: list, bust_cache: bool = False, ignore_quota_lock: bool = False):
         """Fetch odds for an event. Pass all markets at once to save quota.
 
         bust_cache=True skips the in-memory cache read (still writes to it),
         used by trigger-driven scans that need fresh data inside the 5-min TTL.
         """
+        if not ignore_quota_lock and cache.get("odds_api_quota_exhausted"):
+            logger.warning(f"Quota lock is active. Skipping OddsAPI request (get_event_odds for {event_id}).")
+            return {}
+
         markets_str = ",".join(markets)
         # Merge BOOKMAKERS + SHARP_BOOKMAKERS (deduped, preserving order) so sharp
         # books come back in the same call. Per Odds API docs, the bookmakers param

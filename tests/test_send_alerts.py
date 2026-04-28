@@ -34,16 +34,30 @@ def memory_db():
             game_id TEXT, timestamp TEXT,
             UNIQUE(player_name, market, line, bookmaker)
         );
+        CREATE TABLE orders (
+            order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            venue TEXT NOT NULL,
+            alert_id INTEGER,
+            player_name TEXT NOT NULL,
+            market TEXT NOT NULL,
+            line REAL NOT NULL,
+            side TEXT NOT NULL,
+            game_id TEXT,
+            bookmaker TEXT,
+            offered_odds REAL NOT NULL,
+            fill_odds REAL,
+            stake REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            venue_order_id TEXT,
+            placed_at TEXT NOT NULL,
+            filled_at TEXT,
+            notes TEXT
+        );
     ''')
     conn.execute('''
         INSERT INTO games VALUES
         ('g1', 'Yankees', 'Red Sox', 'Yankee Stadium', 'SCHEDULED', '2024-05-15')
     ''')
-    # Playable edge setup:
-    #   odds=2.0 -> book_implied=0.50
-    #   devigged_over=0.60 -> edge = 10% (above EDGE_MIN=5%)
-    #   model prob_over=0.62 -> |model - sharp| = 0.02 (within SHARP_MODEL_AGREEMENT_TOL=0.05)
-    #   sharp_prob=0.60 > MIN_MODEL_PROB=0.55, odds=2.0 > MIN_ODDS=1.70
     conn.execute('''
         INSERT INTO projections
         (game_id, player_name, market, projected_mean, prob_over, prob_under, context_json, timestamp)
@@ -58,32 +72,53 @@ def memory_db():
     return conn
 
 
+def _build_telegram_only_registry():
+    from src.clients.execution.telegram_venue import TelegramVenue
+    venue = TelegramVenue()
+    venue._client.send_message = AsyncMock(return_value=True)
+    return [venue], venue
+
+
+def _build_telegram_and_paper_registry():
+    from src.clients.execution.telegram_venue import TelegramVenue
+    from src.clients.execution.paper_exchange import PaperExchange
+    tg = TelegramVenue()
+    tg._client.send_message = AsyncMock(return_value=True)
+    return [tg, PaperExchange()], tg
+
+
 @patch('src.pipelines.send_alerts.BETTING_ENABLED', True)
+@patch('src.clients.execution.telegram_venue.BETTING_ENABLED', True)
 @patch('src.pipelines.send_alerts.get_db_connection')
-@patch('src.pipelines.send_alerts.TelegramClient')
-async def test_send_alerts_new_alert_inserted(mock_telegram_cls, mock_get_db, memory_db):
-    """A playable edge triggers a Telegram message and is recorded in alerts_sent."""
-    mock_bot = mock_telegram_cls.return_value
-    mock_bot.send_message = AsyncMock()
+@patch('src.pipelines.send_alerts.build_venue_registry')
+async def test_send_alerts_new_alert_inserted(mock_registry, mock_get_db, memory_db):
+    """A playable edge dispatches to Telegram and is recorded in alerts_sent + orders."""
+    venues, tg = _build_telegram_only_registry()
+    mock_registry.return_value = venues
     mock_get_db.return_value.__enter__.return_value = memory_db
     mock_get_db.return_value.__exit__.return_value = None
 
     from src.pipelines.send_alerts import send_alerts
     await send_alerts()
 
-    mock_bot.send_message.assert_called_once()
+    tg._client.send_message.assert_called_once()
 
     alert = memory_db.execute("SELECT * FROM alerts_sent").fetchone()
     assert alert is not None
     assert alert['player_name'] == 'Gerrit Cole'
-    assert alert['market'] == 'pitcher_strikeouts'
     assert alert['side'] == 'over'
     assert alert['bookmaker'] == 'draftkings'
 
+    orders = memory_db.execute("SELECT * FROM orders").fetchall()
+    assert len(orders) == 1
+    assert orders[0]['venue'] == 'telegram'
+    assert orders[0]['status'] == 'sent'
+    assert orders[0]['alert_id'] == alert['alert_id']
+
 
 @patch('src.pipelines.send_alerts.get_db_connection')
-@patch('src.pipelines.send_alerts.TelegramClient')
-async def test_send_alerts_deduplication(mock_telegram_cls, mock_get_db, memory_db):
+@patch('src.pipelines.send_alerts.build_venue_registry')
+async def test_send_alerts_deduplication(mock_registry, mock_get_db, memory_db):
     """An already-alerted prop is not sent again."""
     memory_db.execute('''
         INSERT INTO alerts_sent
@@ -94,37 +129,78 @@ async def test_send_alerts_deduplication(mock_telegram_cls, mock_get_db, memory_
     ''')
     memory_db.commit()
 
-    mock_bot = mock_telegram_cls.return_value
-    mock_bot.send_message = AsyncMock()
+    venues, tg = _build_telegram_only_registry()
+    mock_registry.return_value = venues
     mock_get_db.return_value.__enter__.return_value = memory_db
     mock_get_db.return_value.__exit__.return_value = None
 
     from src.pipelines.send_alerts import send_alerts
     await send_alerts()
 
-    mock_bot.send_message.assert_not_called()
+    tg._client.send_message.assert_not_called()
     rows = memory_db.execute("SELECT * FROM alerts_sent").fetchall()
     assert len(rows) == 1
 
 
 @patch('src.pipelines.send_alerts.get_db_connection')
-@patch('src.pipelines.send_alerts.TelegramClient')
-async def test_send_alerts_no_edge_no_alert(mock_telegram_cls, mock_get_db, memory_db):
+@patch('src.pipelines.send_alerts.build_venue_registry')
+async def test_send_alerts_no_edge_no_alert(mock_registry, mock_get_db, memory_db):
     """A projection below the edge threshold produces no alert."""
-    # Overwrite projection with sub-threshold edge: prob_over=0.51, devigged=0.50 → 1% edge
     memory_db.execute(
         "UPDATE projections SET prob_over = 0.51, prob_under = 0.49 WHERE player_name = 'Gerrit Cole'"
     )
     memory_db.commit()
 
-    mock_bot = mock_telegram_cls.return_value
-    mock_bot.send_message = AsyncMock()
+    venues, tg = _build_telegram_only_registry()
+    mock_registry.return_value = venues
     mock_get_db.return_value.__enter__.return_value = memory_db
     mock_get_db.return_value.__exit__.return_value = None
 
     from src.pipelines.send_alerts import send_alerts
     await send_alerts()
 
-    mock_bot.send_message.assert_not_called()
+    tg._client.send_message.assert_not_called()
     alert = memory_db.execute("SELECT * FROM alerts_sent").fetchone()
     assert alert is None
+
+
+@patch('src.pipelines.send_alerts.BETTING_ENABLED', True)
+@patch('src.clients.execution.telegram_venue.BETTING_ENABLED', True)
+@patch('src.pipelines.send_alerts.get_db_connection')
+@patch('src.pipelines.send_alerts.build_venue_registry')
+async def test_send_alerts_paper_exchange_records_filled_order(mock_registry, mock_get_db, memory_db):
+    """When PaperExchange is registered, a filled order is persisted alongside the Telegram alert."""
+    venues, _tg = _build_telegram_and_paper_registry()
+    mock_registry.return_value = venues
+    mock_get_db.return_value.__enter__.return_value = memory_db
+    mock_get_db.return_value.__exit__.return_value = None
+
+    from src.pipelines.send_alerts import send_alerts
+    await send_alerts()
+
+    orders = memory_db.execute("SELECT * FROM orders ORDER BY venue").fetchall()
+    venues_seen = [o['venue'] for o in orders]
+    assert 'telegram' in venues_seen
+    assert 'paper_exchange' in venues_seen
+
+    paper = next(o for o in orders if o['venue'] == 'paper_exchange')
+    assert paper['status'] == 'filled'
+    assert paper['fill_odds'] == 2.0
+    assert paper['offered_odds'] == 2.0
+    assert paper['venue_order_id'] is not None
+    assert paper['venue_order_id'].startswith('paper-')
+
+
+@patch('src.pipelines.send_alerts.get_db_connection')
+@patch('src.pipelines.send_alerts.build_venue_registry')
+async def test_send_alerts_no_venues_is_noop(mock_registry, mock_get_db, memory_db):
+    """An empty venue registry skips work without touching the DB."""
+    mock_registry.return_value = []
+    mock_get_db.return_value.__enter__.return_value = memory_db
+    mock_get_db.return_value.__exit__.return_value = None
+
+    from src.pipelines.send_alerts import send_alerts
+    await send_alerts()
+
+    assert memory_db.execute("SELECT COUNT(*) FROM alerts_sent").fetchone()[0] == 0
+    assert memory_db.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 0

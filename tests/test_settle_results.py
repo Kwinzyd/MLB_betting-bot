@@ -46,6 +46,19 @@ def memory_db():
             market TEXT, line REAL, over_odds REAL, under_odds REAL,
             bookmaker TEXT, timestamp TEXT, devigged_over REAL, devigged_under REAL
         );
+        CREATE TABLE sgp_candidates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            game_id TEXT, legs_json TEXT, joint_prob REAL,
+            naive_parlay_odds REAL, fair_odds REAL, edge_vs_naive REAL,
+            kelly_stake REAL, bookmakers TEXT, timestamp TEXT
+        );
+        CREATE TABLE sgp_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sgp_candidate_id INTEGER UNIQUE,
+            leg_results_json TEXT, voided_legs_json TEXT,
+            surviving_legs INTEGER, recalc_odds REAL,
+            result TEXT, profit REAL, settled_at TEXT
+        );
     ''')
     conn.execute("INSERT INTO games VALUES ('g1', 999, 'COMPLETED')")
     conn.execute("INSERT INTO players VALUES (10, 'Gerrit Cole')")
@@ -154,6 +167,143 @@ def test_settle_results_idempotent(mock_get_db, memory_db):
 
     rows = memory_db.execute("SELECT * FROM bet_results").fetchall()
     assert len(rows) == 1
+
+
+@patch('src.pipelines.settle_results.get_db_connection')
+def test_single_voided_when_player_dnp(mock_get_db, memory_db):
+    """Late scratch: box score is in for the game but the player has no row -> VOID + refund."""
+    memory_db.execute("INSERT INTO players VALUES (30, 'Mookie Betts')")
+    # batter_game_logs has rows for the game (someone played) but not for Mookie.
+    memory_db.execute(
+        "INSERT INTO batter_game_logs (game_id, player_id, date, at_bats, hits, "
+        "doubles, triples, home_runs, runs, rbis, walks, strikeouts, total_bases, plate_appearances) "
+        "VALUES (999, 99, '2024-05-01', 4, 1, 0, 0, 0, 0, 0, 0, 1, 1, 4)"
+    )
+    memory_db.execute('''
+        INSERT INTO alerts_sent
+        (player_name, market, line, side, odds, opening_odds, kelly_stake, game_id, bookmaker)
+        VALUES ('Mookie Betts', 'batter_hits', 0.5, 'over', 1.85, 1.85, 40.0, 'g1', 'fanduel')
+    ''')
+    memory_db.commit()
+    mock_get_db.return_value.__enter__.return_value = memory_db
+    mock_get_db.return_value.__exit__.return_value = None
+
+    from src.pipelines.settle_results import settle_results
+    settle_results()
+
+    row = memory_db.execute(
+        "SELECT * FROM bet_results WHERE alert_id = "
+        "(SELECT alert_id FROM alerts_sent WHERE player_name = 'Mookie Betts')"
+    ).fetchone()
+    assert row is not None
+    assert row['result'] == 'VOID'
+    assert row['profit'] == 0.0
+    assert row['actual_value'] is None
+
+
+@patch('src.pipelines.settle_results.get_db_connection')
+def test_single_pending_when_box_score_not_synced(mock_get_db, memory_db):
+    """If the batter table has zero rows for the game, treat it as not-yet-synced (skip, don't void)."""
+    memory_db.execute("INSERT INTO players VALUES (31, 'Freddie Freeman')")
+    memory_db.execute('''
+        INSERT INTO alerts_sent
+        (player_name, market, line, side, odds, opening_odds, kelly_stake, game_id, bookmaker)
+        VALUES ('Freddie Freeman', 'batter_hits', 0.5, 'over', 1.85, 1.85, 40.0, 'g1', 'fanduel')
+    ''')
+    memory_db.commit()
+    mock_get_db.return_value.__enter__.return_value = memory_db
+    mock_get_db.return_value.__exit__.return_value = None
+
+    from src.pipelines.settle_results import settle_results
+    settle_results()
+
+    row = memory_db.execute(
+        "SELECT * FROM bet_results WHERE alert_id = "
+        "(SELECT alert_id FROM alerts_sent WHERE player_name = 'Freddie Freeman')"
+    ).fetchone()
+    assert row is None  # deferred, not voided
+
+
+@patch('src.pipelines.settle_results.get_db_connection')
+def test_sgp_void_recalculates_payout(mock_get_db, memory_db):
+    """3-leg SGP with one DNP leg pays out as a 2-leg parlay on remaining legs' odds."""
+    import json as _json
+    # Two batters with hits. Third batter has no row but team's box score is in -> DNP.
+    memory_db.execute("INSERT INTO players VALUES (40, 'A B')")
+    memory_db.execute("INSERT INTO players VALUES (41, 'C D')")
+    memory_db.execute("INSERT INTO players VALUES (42, 'E F')")
+    for pid in (40, 41):
+        memory_db.execute(
+            "INSERT INTO batter_game_logs (game_id, player_id, date, at_bats, hits, "
+            "doubles, triples, home_runs, runs, rbis, walks, strikeouts, total_bases, plate_appearances) "
+            f"VALUES (999, {pid}, '2024-05-01', 4, 0, 0, 0, 0, 0, 0, 0, 1, 0, 4)"
+        )
+    legs = [
+        {'player_name': 'Gerrit Cole', 'market': 'pitcher_strikeouts',
+         'line': 6.5, 'side': 'over', 'odds': 1.9, 'bookmaker': 'fanduel'},
+        {'player_name': 'A B', 'market': 'batter_hits',
+         'line': 0.5, 'side': 'under', 'odds': 2.5, 'bookmaker': 'fanduel'},
+        {'player_name': 'E F', 'market': 'batter_hits',  # DNP -> VOID
+         'line': 0.5, 'side': 'under', 'odds': 2.0, 'bookmaker': 'fanduel'},
+    ]
+    memory_db.execute('''
+        INSERT INTO sgp_candidates
+        (game_id, legs_json, joint_prob, naive_parlay_odds, fair_odds,
+         edge_vs_naive, kelly_stake, bookmakers, timestamp)
+        VALUES ('g1', ?, 0.21, 9.5, 7.0, 0.05, 20.0, 'fanduel', '2024-05-01')
+    ''', (_json.dumps(legs),))
+    memory_db.commit()
+    mock_get_db.return_value.__enter__.return_value = memory_db
+    mock_get_db.return_value.__exit__.return_value = None
+
+    from src.pipelines.settle_results import settle_results
+    settle_results()
+
+    row = memory_db.execute("SELECT * FROM sgp_results").fetchone()
+    assert row is not None
+    assert row['result'] == 'WIN'
+    assert row['surviving_legs'] == 2
+    # Recalc odds = 1.9 * 2.5 = 4.75; profit = 20 * (4.75 - 1) = 75.00
+    assert row['recalc_odds'] == pytest.approx(4.75)
+    assert row['profit'] == pytest.approx(75.0)
+
+
+@patch('src.pipelines.settle_results.get_db_connection')
+def test_sgp_full_refund_when_all_legs_void(mock_get_db, memory_db):
+    """If every leg voids, SGP is fully refunded (profit = 0)."""
+    import json as _json
+    # Box score has a row for an unrelated player so DNP detection triggers for our two scratches.
+    memory_db.execute("INSERT INTO players VALUES (50, 'X Y')")
+    memory_db.execute("INSERT INTO players VALUES (51, 'Z W')")
+    memory_db.execute(
+        "INSERT INTO batter_game_logs (game_id, player_id, date, at_bats, hits, "
+        "doubles, triples, home_runs, runs, rbis, walks, strikeouts, total_bases, plate_appearances) "
+        "VALUES (999, 88, '2024-05-01', 4, 1, 0, 0, 0, 0, 0, 0, 1, 1, 4)"
+    )
+    legs = [
+        {'player_name': 'X Y', 'market': 'batter_hits',
+         'line': 0.5, 'side': 'over', 'odds': 1.8, 'bookmaker': 'fanduel'},
+        {'player_name': 'Z W', 'market': 'batter_hits',
+         'line': 0.5, 'side': 'over', 'odds': 1.7, 'bookmaker': 'fanduel'},
+    ]
+    memory_db.execute('''
+        INSERT INTO sgp_candidates
+        (game_id, legs_json, joint_prob, naive_parlay_odds, fair_odds,
+         edge_vs_naive, kelly_stake, bookmakers, timestamp)
+        VALUES ('g1', ?, 0.3, 3.06, 2.8, 0.05, 25.0, 'fanduel', '2024-05-01')
+    ''', (_json.dumps(legs),))
+    memory_db.commit()
+    mock_get_db.return_value.__enter__.return_value = memory_db
+    mock_get_db.return_value.__exit__.return_value = None
+
+    from src.pipelines.settle_results import settle_results
+    settle_results()
+
+    row = memory_db.execute("SELECT * FROM sgp_results").fetchone()
+    assert row is not None
+    assert row['result'] == 'VOID'
+    assert row['profit'] == 0.0
+    assert row['surviving_legs'] == 0
 
 
 @patch('src.pipelines.settle_results.get_db_connection')

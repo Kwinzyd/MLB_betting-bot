@@ -20,8 +20,12 @@ from src.clients.telegram_bot import TelegramClient
 from src.data.db import get_db_connection
 from src.config import (
     SGP_MIN_EDGE, SGP_MAX_PER_GAME, SGP_MAX_PER_DAY, SHARP_BOOKMAKERS,
+    KELLY_FRACTION, SGP_KELLY_FRACTION_MULT, MAX_BETS_PER_GAME,
 )
 from src.models.correlation import joint_probability, parlay_decimal_odds
+from src.models.kelly import fractional_kelly, get_current_bankroll
+from src.models.pa_estimator import implied_team_total as _implied_team_total
+from src.utils.stake_rounding import round_stake
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -46,6 +50,7 @@ async def find_and_alert_sgps():
         if len(kept) >= SGP_MAX_PER_DAY:
             break
 
+    kept = _apply_game_exposure_cap(kept)
     await _persist_and_alert(kept)
     logger.info(f"SGP pipeline complete. Alerted {len(kept)} candidates.")
 
@@ -58,38 +63,47 @@ def _build_candidates():
             "WHERE status != 'COMPLETED'"
         ).fetchall()
 
-    for game in games:
-        game_id = game['game_id']
-        home_team = game['home_team']
-        away_team = game['away_team']
+        for game in games:
+            game_id = game['game_id']
+            home_team = game['home_team']
+            away_team = game['away_team']
 
-        for anchor, opposing_team in _find_pitcher_anchors(
-            conn, game_id, home_team, away_team
-        ):
-            opp_legs = _find_opposing_under_legs(conn, game_id, opposing_team)
-            if len(opp_legs) < 2:
-                continue
-            for a, b in itertools.combinations(opp_legs, 2):
-                if a['player_name'] == b['player_name']:
+            for anchor, opposing_team in _find_pitcher_anchors(
+                conn, game_id, home_team, away_team
+            ):
+                opp_legs = _find_opposing_under_legs(conn, game_id, opposing_team)
+                if len(opp_legs) < 2:
                     continue
-                legs = [anchor, a, b]
-                p = joint_probability(legs, db_conn=conn)
-                if p <= 0:
-                    continue
-                parlay_odds = parlay_decimal_odds(legs)
-                fair_odds = 1.0 / p
-                edge = p * parlay_odds - 1.0
-                if edge < SGP_MIN_EDGE:
-                    continue
-                out.append({
-                    'game_id': game_id,
-                    'matchup': f"{away_team} @ {home_team}",
-                    'legs': legs,
-                    'joint_prob': p,
-                    'naive_parlay_odds': parlay_odds,
-                    'fair_odds': fair_odds,
-                    'edge_vs_naive': edge,
-                })
+                for a, b in itertools.combinations(opp_legs, 2):
+                    if a['player_name'] == b['player_name']:
+                        continue
+                    legs = [anchor, a, b]
+                    p = joint_probability(legs, db_conn=conn)
+                    if p <= 0:
+                        continue
+                    parlay_odds = parlay_decimal_odds(legs)
+                    fair_odds = 1.0 / p
+                    edge = p * parlay_odds - 1.0
+                    if edge < SGP_MIN_EDGE:
+                        continue
+                    stake_info = fractional_kelly(
+                        p, parlay_odds,
+                        fraction=KELLY_FRACTION * SGP_KELLY_FRACTION_MULT,
+                    )
+                    if stake_info['recommended_stake'] <= 0:
+                        continue
+                    out.append({
+                        'game_id': game_id,
+                        'matchup': f"{away_team} @ {home_team}",
+                        'legs': legs,
+                        'joint_prob': p,
+                        'naive_parlay_odds': parlay_odds,
+                        'fair_odds': fair_odds,
+                        'edge_vs_naive': edge,
+                        'kelly_stake': stake_info['recommended_stake'],
+                        'kelly_pct': stake_info['kelly_fraction'],
+                    })
+
     return out
 
 
@@ -144,8 +158,9 @@ def _find_opposing_under_legs(conn, game_id, opposing_team):
     sharp_set = set(SHARP_BOOKMAKERS)
     placeholders = ','.join('?' for _ in sharp_set) or "''"
     rows = conn.execute(f'''
-        SELECT p.player_name, p.market,
-               ps.line, ps.under_odds, ps.bookmaker, ps.devigged_under
+        SELECT p.player_name, p.market, p.projected_mean,
+               ps.line, ps.under_odds, ps.bookmaker, ps.devigged_under,
+               dl.lineup_position
         FROM projections p
         JOIN prop_snapshots ps
           ON p.game_id = ps.game_id
@@ -162,6 +177,15 @@ def _find_opposing_under_legs(conn, game_id, opposing_team):
           AND ps.devigged_under IS NOT NULL
     ''', (game_id, f"%{opposing_team}%", *sharp_set)).fetchall()
 
+    # Latest sharp-book total for the opposing team's implied run total.
+    total_row = conn.execute(
+        "SELECT total FROM game_totals_history WHERE game_id = ? "
+        "ORDER BY timestamp DESC LIMIT 1",
+        (game_id,),
+    ).fetchone()
+    game_total = total_row['total'] if total_row else None
+    itt = _implied_team_total(game_total, side="opposing")
+
     return [{
         'player_name': r['player_name'],
         'market': r['market'],
@@ -170,6 +194,10 @@ def _find_opposing_under_legs(conn, game_id, opposing_team):
         'odds': r['under_odds'],
         'prob': r['devigged_under'],
         'bookmaker': r['bookmaker'],
+        'team': opposing_team,
+        'lineup_position': r['lineup_position'],
+        'mean_count': r['projected_mean'],
+        'implied_team_total': itt,
     } for r in rows]
 
 
@@ -179,6 +207,51 @@ def _team_matches(a, b):
     if not a or not b:
         return False
     return a in b or b in a
+
+
+def _apply_game_exposure_cap(kept):
+    """Trim/drop SGP stakes so per-game exposure (singles + SGPs) stays
+    within MAX_BETS_PER_GAME * fractional_kelly's 5% per-bet cap.
+
+    Today's `alerts_sent` rows are summed because the SGP is placed in
+    the same session — historical days don't share a bankroll allocation.
+    """
+    if not kept:
+        return kept
+    bankroll = get_current_bankroll()
+    per_bet_cap = bankroll * 0.05  # mirrors fractional_kelly's max_fraction
+    game_cap = per_bet_cap * MAX_BETS_PER_GAME
+    out = []
+    with get_db_connection() as conn:
+        # Aggregate same-game SGP stakes too, so multiple SGPs on one game
+        # don't all get sized against the same headroom.
+        used_today = {}
+        for c in kept:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(kelly_stake), 0) AS used "
+                "FROM alerts_sent WHERE game_id = ? "
+                "AND date(timestamp) = date('now')",
+                (c['game_id'],),
+            ).fetchone()
+            singles_used = float(row['used'] or 0.0) if row else 0.0
+            already = singles_used + used_today.get(c['game_id'], 0.0)
+            remaining = max(0.0, game_cap - already)
+            stake = min(c['kelly_stake'], remaining)
+            if stake <= 0:
+                logger.info(
+                    f"SGP dropped for game {c['game_id']}: exposure cap "
+                    f"reached (used={already:.2f} of cap={game_cap:.2f})"
+                )
+                continue
+            # Camouflage: snap to a round increment ($5 default) so the
+            # persisted/displayed stake doesn't fingerprint as a bot.
+            rounded_stake = round_stake(stake)
+            c['kelly_stake'] = rounded_stake
+            # Track the post-round value so a later SGP on the same game
+            # sees the actual exposure (an upward snap eats real headroom).
+            used_today[c['game_id']] = already + rounded_stake
+            out.append(c)
+    return out
 
 
 async def _persist_and_alert(candidates):
@@ -192,13 +265,13 @@ async def _persist_and_alert(candidates):
             conn.execute('''
                 INSERT INTO sgp_candidates
                 (game_id, legs_json, joint_prob, naive_parlay_odds,
-                 fair_odds, edge_vs_naive, bookmakers, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 fair_odds, edge_vs_naive, kelly_stake, bookmakers, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(game_id, legs_json) DO NOTHING
             ''', (
                 c['game_id'], legs_json, c['joint_prob'],
                 c['naive_parlay_odds'], c['fair_odds'], c['edge_vs_naive'],
-                books, datetime.utcnow().isoformat(),
+                c.get('kelly_stake'), books, datetime.utcnow().isoformat(),
             ))
             try:
                 await bot.send_message(_format_sgp_message(c))
@@ -222,6 +295,11 @@ def _format_sgp_message(c):
             f"{leg['line']} {market} @ {leg['odds']:.2f} "
             f"({leg['bookmaker']})"
         )
+    stake_line = ""
+    stake = c.get('kelly_stake')
+    if stake is not None and stake > 0:
+        pct = c.get('kelly_pct', 0.0) * 100
+        stake_line = f"Stake: <b>${stake:.2f}</b> ({pct:.2f}% bankroll)\n"
     return (
         f"<b>MLB SGP CANDIDATE</b>\n"
         f"{'=' * 30}\n"
@@ -230,6 +308,7 @@ def _format_sgp_message(c):
         f"Joint prob: <b>{c['joint_prob']:.1%}</b>\n"
         f"Naive parlay odds: {c['naive_parlay_odds']:.2f}\n"
         f"Fair (correlated) odds: {c['fair_odds']:.2f}\n"
-        f"Edge vs naive: <b>{c['edge_vs_naive']*100:.1f}%</b>\n\n"
+        f"Edge vs naive: <b>{c['edge_vs_naive']*100:.1f}%</b>\n"
+        f"{stake_line}\n"
         f"<i>Compare book's SGP builder price to fair odds before placing.</i>"
     )

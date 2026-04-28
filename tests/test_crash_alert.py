@@ -39,5 +39,6 @@ def test_notify_crash_truncates_long_error(mock_telegram_cls):
     _notify_crash("run", ValueError("x" * 5000))
 
     msg = mock_bot.send_message_sync.call_args[0][0]
-    # Long error gets clipped to 400 chars
-    assert len(msg) < 600
+    # Long error gets clipped (traceback tail capped at 800 chars + envelope)
+    assert len(msg) < 1100
+    assert "x" * 5000 not in msg

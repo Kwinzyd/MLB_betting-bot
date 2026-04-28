@@ -20,6 +20,7 @@ def init_db():
         conn.executescript(schema_sql)
         _migrate_games_columns(conn)
         _migrate_alerts_columns(conn)
+        _migrate_sgp_candidates_columns(conn)
         conn.commit()
     logger.info("Database initialized successfully.")
 
@@ -44,6 +45,13 @@ def _migrate_alerts_columns(conn):
         conn.execute("ALTER TABLE alerts_sent ADD COLUMN model_prob_over REAL")
     if 'model_prob_under' not in existing:
         conn.execute("ALTER TABLE alerts_sent ADD COLUMN model_prob_under REAL")
+
+
+def _migrate_sgp_candidates_columns(conn):
+    """Backfill stake column on existing sgp_candidates rows."""
+    existing = {row['name'] for row in conn.execute("PRAGMA table_info(sgp_candidates)").fetchall()}
+    if 'kelly_stake' not in existing:
+        conn.execute("ALTER TABLE sgp_candidates ADD COLUMN kelly_stake REAL")
 
 @contextmanager
 def get_db_connection():
