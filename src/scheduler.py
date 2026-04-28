@@ -117,11 +117,14 @@ def _notify_job_crash(command: str, exception: Exception) -> None:
     try:
         import traceback
         from src.clients.telegram_bot import TelegramClient
-        tail = ''.join(traceback.format_exception_only(type(exception), exception)).strip()
+        tb = ''.join(traceback.format_exception(
+            type(exception), exception, exception.__traceback__
+        ))
+        tail = '\n'.join(tb.strip().splitlines()[-16:])
         msg = (
             f"\U0001F6A8 <b>Scheduled Job Failed</b>\n"
             f"Job: <code>{command}</code>\n"
-            f"Error: <code>{tail[:400]}</code>"
+            f"<pre>{tail[:800]}</pre>"
         )
         TelegramClient().send_message_sync(msg)
     except Exception as notify_err:

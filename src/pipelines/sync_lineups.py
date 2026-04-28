@@ -45,10 +45,10 @@ async def sync_lineups():
 
     # Get today's games from DB
     with get_db_connection() as conn:
-        games = conn.execute(
+        games = [dict(r) for r in conn.execute(
             "SELECT game_id, bdl_game_id, home_team, away_team FROM games WHERE status != 'COMPLETED' AND date LIKE ?",
             (f"{today}%",)
-        ).fetchall()
+        ).fetchall()]
 
     if not games:
         logger.info("No games today for lineup sync.")
@@ -57,12 +57,23 @@ async def sync_lineups():
     lineup_count = 0
     pitcher_count = 0
 
+    failed_games = 0
     for game in games:
         bdl_game_id = game['bdl_game_id']
         if not bdl_game_id:
             continue
 
-        lineup_data = await bdl_client.get_lineups(bdl_game_id)
+        # Per-game isolation: a transient BDL 5xx on one game must not abort
+        # the rest of the pipeline (scan_props/send_alerts/SGP run after this).
+        try:
+            lineup_data = await bdl_client.get_lineups(bdl_game_id)
+        except Exception as e:
+            failed_games += 1
+            logger.warning(
+                f"Lineup fetch failed for game {game['game_id']} "
+                f"(bdl_game_id={bdl_game_id}): {e}. Skipping; pipeline continues."
+            )
+            continue
         if not lineup_data:
             logger.debug(f"No lineup data yet for game {game['game_id']}")
             continue
@@ -76,8 +87,13 @@ async def sync_lineups():
 
                 player_name = f"{player.get('first_name', '')} {player.get('last_name', '')}".strip()
                 player_id = player.get('id')
-                team_name = team_data.get('full_name', '') if isinstance(team_data, dict) else ''
-                throws = player.get('throws', '')
+                team_name = (
+                    team_data.get('display_name')
+                    or team_data.get('name')
+                    or ''
+                ) if isinstance(team_data, dict) else ''
+                bats_throws = player.get('bats_throws', '') or ''
+                throws = bats_throws.split('/', 1)[1].strip() if '/' in bats_throws else ''
                 is_probable_pitcher = entry.get('is_probable_pitcher', False)
                 batting_order = entry.get('batting_order') or entry.get('lineup_position')
 
@@ -109,4 +125,7 @@ async def sync_lineups():
             )
             conn.commit()
 
-    logger.info(f"Synced {lineup_count} lineup entries and {pitcher_count} probable pitchers for {today}.")
+    logger.info(
+        f"Synced {lineup_count} lineup entries and {pitcher_count} probable "
+        f"pitchers for {today}. Failed games: {failed_games}."
+    )

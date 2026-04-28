@@ -372,11 +372,13 @@ def build_pitcher_features(pitcher_logs: List[Dict],
     k_vol_l10 = _rolling_pitcher_start_stdev(logs, "strikeouts", 10)
     ip_vol_l10 = _rolling_pitcher_start_stdev(logs, "innings_pitched", 10)
 
-    h2h_k_delta = 0.0
-    if extra.get("db") and extra.get("pitcher_id") and extra.get("opp_team_id"):
-        h2h_k_delta = compute_pitcher_h2h_vs_team(
-            extra["pitcher_id"], extra["opp_team_id"], game_date, extra["db"]
-        )
+    h2h_k_delta = extra.get("h2h_k_delta")
+    if h2h_k_delta is None:
+        h2h_k_delta = 0.0
+        if extra.get("db") and extra.get("pitcher_id") and extra.get("opp_team_id"):
+            h2h_k_delta = compute_pitcher_h2h_vs_team(
+                extra["pitcher_id"], extra["opp_team_id"], game_date, extra["db"]
+            )
 
     values = [
         l5["k_per_9"],

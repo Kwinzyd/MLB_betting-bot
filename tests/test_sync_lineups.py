@@ -47,14 +47,14 @@ def memory_db():
 
 LINEUP_ENTRIES = [
     {
-        'player': {'id': 10, 'first_name': 'Gerrit', 'last_name': 'Cole', 'throws': 'R'},
-        'team': {'full_name': 'Yankees'},
+        'player': {'id': 10, 'first_name': 'Gerrit', 'last_name': 'Cole', 'bats_throws': 'Right/R'},
+        'team': {'display_name': 'Yankees'},
         'is_probable_pitcher': True,
         'batting_order': None,
     },
     {
-        'player': {'id': 20, 'first_name': 'Aaron', 'last_name': 'Judge', 'throws': 'R'},
-        'team': {'full_name': 'Yankees'},
+        'player': {'id': 20, 'first_name': 'Aaron', 'last_name': 'Judge', 'bats_throws': 'Right/R'},
+        'team': {'display_name': 'Yankees'},
         'is_probable_pitcher': False,
         'batting_order': 3,
     },
@@ -120,8 +120,8 @@ async def test_sync_lineups_pitcher_upsert(mock_client_cls, mock_get_db, _mock_d
     # Second run — different pitcher announced
     updated_entries = [
         {
-            'player': {'id': 11, 'first_name': 'Nathan', 'last_name': 'Eovaldi', 'throws': 'R'},
-            'team': {'full_name': 'Yankees'},
+            'player': {'id': 11, 'first_name': 'Nathan', 'last_name': 'Eovaldi', 'bats_throws': 'Right/R'},
+            'team': {'display_name': 'Yankees'},
             'is_probable_pitcher': True,
             'batting_order': None,
         }

@@ -40,6 +40,7 @@ def main():
     subparsers.add_parser('sgp', help="Find and alert Same Game Parlays (SGPs)")
     subparsers.add_parser('trigger', help="Run trigger watch for weather and umpires")
     subparsers.add_parser('fit-dispersion', help="Fit dispersion models for projections")
+    subparsers.add_parser('live', help="Run the continuous Live State Machine daemon for in-game prop sniping")
 
     # schedule
     subparsers.add_parser(
@@ -124,6 +125,11 @@ def main():
             logger.info("Running TRIGGER WATCH mode...")
             asyncio.run(run_trigger_watch())
 
+        elif args.command == 'live':
+            from src.pipelines.live_state_machine import run_live_state_machine
+            logger.info("Running LIVE STATE MACHINE daemon (Ctrl-C to stop)...")
+            asyncio.run(run_live_state_machine())
+
         elif args.command == 'walkforward':
             from src.pipelines.walk_forward import walk_forward_all, print_walk_forward_report
             logger.info(
@@ -207,11 +213,14 @@ def _notify_crash(command: str, exception: Exception) -> None:
     try:
         import traceback
         from src.clients.telegram_bot import TelegramClient
-        tail = ''.join(traceback.format_exception_only(type(exception), exception)).strip()
+        tb = ''.join(traceback.format_exception(
+            type(exception), exception, exception.__traceback__
+        ))
+        tail = '\n'.join(tb.strip().splitlines()[-16:])
         msg = (
             f"\U0001F6A8 <b>Pipeline Crash</b>\n"
             f"Command: <code>{command}</code>\n"
-            f"Error: <code>{tail[:400]}</code>"
+            f"<pre>{tail[:800]}</pre>"
         )
         TelegramClient().send_message_sync(msg)
     except Exception as notify_err:

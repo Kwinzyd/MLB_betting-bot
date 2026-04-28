@@ -1,22 +1,25 @@
 import json
 from datetime import datetime
-from src.clients.telegram_bot import TelegramClient
+from src.clients.execution import build_venue_registry
 from src.data.db import get_db_connection
 from src.config import MAX_BETS_PER_GAME, MAX_BETS_PER_PLAYER, BETTING_ENABLED
 from src.models.edge_ranker import rank_edge
 from src.utils.logging_utils import get_logger
+from src.utils.stake_rounding import round_stake
 
 logger = get_logger(__name__)
 
 
 async def send_alerts():
-    """Find high-edge projections and send Telegram alerts for unsent ones."""
+    """Find high-edge projections and dispatch them to every enabled execution venue."""
     logger.info("Executing pipeline: send_alerts")
-    bot = TelegramClient()
+    venues = build_venue_registry()
+    if not venues:
+        logger.warning("No execution venues enabled; send_alerts is a no-op.")
+        return
 
     with get_db_connection() as conn:
-        # Find projections with matching prop snapshots that haven't been alerted yet
-        rows = conn.execute('''
+        rows = [dict(r) for r in conn.execute('''
             SELECT
                 p.game_id, p.player_name, p.market, p.projected_mean,
                 p.prob_over, p.prob_under, p.context_json,
@@ -31,13 +34,12 @@ async def send_alerts():
             JOIN games g ON p.game_id = g.game_id
             WHERE g.status != 'COMPLETED'
             ORDER BY p.prob_over DESC
-        ''').fetchall()
+        ''').fetchall()]
 
     if not rows:
         logger.info("No projections found for alerting.")
         return
 
-    # 1. Score every row — collect playable candidates with their best side/edge.
     candidates = []
     for row in rows:
         projection = {
@@ -76,10 +78,8 @@ async def send_alerts():
             'edge': best_edge,
         })
 
-    # 2. Rank by edge desc so correlation guards keep the highest-edge bet.
     candidates.sort(key=lambda c: c['edge']['edge_pct'], reverse=True)
 
-    # 3. Apply correlation caps and send.
     seen_players: dict = {}
     game_counts: dict = {}
     seen_prop_key: set = set()
@@ -109,102 +109,89 @@ async def send_alerts():
             if existing:
                 continue
 
-            context = {}
+            model_context = {}
             if row['context_json']:
                 try:
-                    context = json.loads(row['context_json'])
+                    model_context = json.loads(row['context_json'])
                 except json.JSONDecodeError:
                     pass
 
-            message = _format_alert_message(
-                player_name=player_name,
-                market=market,
-                side=cand['side'],
-                line=line,
-                odds=cand['odds'],
-                bookmaker=bookmaker,
-                edge=cand['edge'],
-                projection=cand['projection'],
-                context=context,
-                home_team=row['home_team'],
-                away_team=row['away_team'],
-                venue=row['venue'],
-            )
+            display_stake = round_stake(cand['edge']['kelly']['recommended_stake'])
+            cand['edge']['kelly']['recommended_stake'] = display_stake
 
-            if BETTING_ENABLED:
-                try:
-                    await bot.send_message(message)
-                    logger.info(f"Alert sent: {player_name} {market} {cand['side'].upper()} {line}")
-                except Exception as e:
-                    logger.error(f"Failed to send Telegram alert: {e}")
-                    continue
-            else:
-                logger.info(
-                    f"[SHADOW] Would-alert: {player_name} {market} {cand['side'].upper()} {line} "
-                    f"@ {bookmaker} (edge {cand['edge']['edge_pct']:.1f}%). "
-                    f"Set BETTING_ENABLED=true to deliver."
-                )
+            execution_context = {
+                'player_name': player_name,
+                'market': market,
+                'side': cand['side'],
+                'line': line,
+                'odds': cand['odds'],
+                'bookmaker': bookmaker,
+                'game_id': game_id,
+                'home_team': row['home_team'],
+                'away_team': row['away_team'],
+                'game_venue': row['venue'],
+                'projection': cand['projection'],
+                'model_context': model_context,
+            }
 
             timestamp = datetime.utcnow().isoformat()
-            conn.execute('''
-                INSERT INTO alerts_sent
-                (player_name, market, line, side, edge, ev, kelly_stake,
-                 bookmaker, odds, opening_odds, model_prob_over, model_prob_under,
-                 game_id, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(player_name, market, line, bookmaker) DO NOTHING
-            ''', (
-                player_name, market, line, cand['side'],
-                cand['edge']['edge_pct'], cand['edge']['ev'],
-                cand['edge']['kelly']['recommended_stake'],
-                bookmaker, cand['odds'], cand['odds'],
-                row['prob_over'], row['prob_under'],
-                game_id, timestamp,
-            ))
+            alert_id = None
+            telegram_succeeded = False
+            order_records: list[dict] = []
+
+            for venue in venues:
+                record = await venue.place_order(cand['edge'], execution_context)
+                order_records.append(record)
+                if venue.name == 'telegram' and record['status'] in ('sent', 'skipped'):
+                    telegram_succeeded = True
+
+            should_record_alert = telegram_succeeded and BETTING_ENABLED and any(
+                r['venue'] == 'telegram' and r['status'] == 'sent' for r in order_records
+            )
+            if should_record_alert:
+                cur = conn.execute('''
+                    INSERT INTO alerts_sent
+                    (player_name, market, line, side, edge, ev, kelly_stake,
+                     bookmaker, odds, opening_odds, model_prob_over, model_prob_under,
+                     game_id, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(player_name, market, line, bookmaker) DO NOTHING
+                ''', (
+                    player_name, market, line, cand['side'],
+                    cand['edge']['edge_pct'], cand['edge']['ev'],
+                    cand['edge']['kelly']['recommended_stake'],
+                    bookmaker, cand['odds'], cand['odds'],
+                    row['prob_over'], row['prob_under'],
+                    game_id, timestamp,
+                ))
+                alert_id = cur.lastrowid
+
+            for record in order_records:
+                _persist_order(conn, record, execution_context, alert_id)
             conn.commit()
 
             seen_prop_key.add(prop_key)
             seen_players[player_name] = seen_players.get(player_name, 0) + 1
             game_counts[game_id] = game_counts.get(game_id, 0) + 1
-            alerts_sent_count += 1
+            if telegram_succeeded:
+                alerts_sent_count += 1
 
     logger.info(f"Alerts pipeline complete. Sent {alerts_sent_count} new alerts.")
 
 
-def _format_alert_message(player_name, market, side, line, odds, bookmaker,
-                          edge, projection, context, home_team, away_team, venue):
-    """Format a rich Telegram alert message."""
-    # Convert decimal odds to American
-    if odds >= 2.0:
-        american = f"+{int((odds - 1) * 100)}"
-    else:
-        american = f"-{int(100 / (odds - 1))}"
-
-    market_display = market.replace('_', ' ').title()
-    venue_display = venue or 'Unknown'
-
-    msg = (
-        f"<b>MLB PROP ALERT</b>\n"
-        f"{'=' * 30}\n"
-        f"<b>{player_name}</b> - {market_display}\n"
-        f"<b>{side.upper()} {line}</b>\n\n"
-        f"Book: {bookmaker.title()} @ {odds:.2f} ({american})\n"
-        f"Edge: <b>{edge['edge_pct']:.1f}%</b> | EV: {edge['ev']:+.3f}\n"
-        f"Model: {edge['model_prob']:.1%} | Book: {edge['book_implied']:.1%}\n"
-        f"Kelly Stake: <b>${edge['kelly']['recommended_stake']:.2f}</b>\n\n"
-        f"Matchup: {away_team} @ {home_team}\n"
-        f"Venue: {venue_display}\n"
-    )
-
-    # Add context details
-    if context:
-        if 'opp_k_rate' in context:
-            msg += f"Opp K%: {context['opp_k_rate']:.1%} (avg {0.225:.1%})\n"
-        if 'park_adj' in context:
-            msg += f"Park Adj: {context['park_adj']:.3f}\n"
-        if 'platoon_adj' in context:
-            msg += f"Platoon Adj: {context['platoon_adj']:.3f}\n"
-
-    msg += f"\nProjected: {projection['projected_mean']:.2f}"
-
-    return msg
+def _persist_order(conn, record: dict, ctx: dict, alert_id):
+    if record.get('status') in (None, 'skipped'):
+        return
+    conn.execute('''
+        INSERT INTO orders
+        (venue, alert_id, player_name, market, line, side, game_id, bookmaker,
+         offered_odds, fill_odds, stake, status, venue_order_id,
+         placed_at, filled_at, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        record['venue'], alert_id, ctx['player_name'], ctx['market'],
+        ctx['line'], ctx['side'], ctx['game_id'], ctx['bookmaker'],
+        record.get('offered_odds'), record.get('fill_odds'),
+        record.get('stake'), record['status'], record.get('venue_order_id'),
+        record.get('placed_at'), record.get('filled_at'), record.get('notes'),
+    ))

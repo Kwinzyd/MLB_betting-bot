@@ -202,7 +202,7 @@ class MLBStatsClient:
         Available from 2026 season; typically posted 1-2 hours before first pitch.
         """
         cache_key = f"bdl_mlb_lineups_{game_id}"
-        return await self._get("lineups", params={"game_id": game_id}, cache_key=cache_key, cache_ttl=3600)
+        return await self._get("lineups", params={"game_ids[]": game_id}, cache_key=cache_key, cache_ttl=3600)
 
     async def get_player_injuries(self, team_ids=None, player_ids=None):
         """

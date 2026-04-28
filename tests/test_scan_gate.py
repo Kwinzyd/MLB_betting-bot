@@ -14,7 +14,7 @@ def _game(game_time=None, lineups_confirmed_at=None, last_scanned_at=None):
 def test_skips_when_no_lineups_and_far_from_game_time():
     now = datetime(2026, 4, 13, 18, 0, tzinfo=timezone.utc)
     g = _game(game_time='2026-04-13T23:00:00+00:00')  # 5h away
-    assert _should_scan_game(g, now) is False
+    assert _should_scan_game(g, now)[0] == "skip"
 
 
 def test_scans_when_lineup_confirmed_and_never_scanned():
@@ -23,7 +23,7 @@ def test_scans_when_lineup_confirmed_and_never_scanned():
         game_time='2026-04-13T23:00:00+00:00',
         lineups_confirmed_at='2026-04-13T17:55:00+00:00',
     )
-    assert _should_scan_game(g, now) is True
+    assert _should_scan_game(g, now)[0] == "scan"
 
 
 def test_skips_when_already_scanned_since_lineup_drop():
@@ -33,7 +33,7 @@ def test_skips_when_already_scanned_since_lineup_drop():
         lineups_confirmed_at='2026-04-13T17:55:00+00:00',
         last_scanned_at='2026-04-13T17:56:00+00:00',
     )
-    assert _should_scan_game(g, now) is False
+    assert _should_scan_game(g, now)[0] == "skip"
 
 
 def test_scans_inside_pregame_window():
@@ -43,7 +43,7 @@ def test_scans_inside_pregame_window():
         game_time='2026-04-13T23:00:00+00:00',
         last_scanned_at='2026-04-13T20:00:00+00:00',
     )
-    assert _should_scan_game(g, now) is True
+    assert _should_scan_game(g, now)[0] == "scan"
 
 
 def test_skips_after_first_pitch():
@@ -52,7 +52,7 @@ def test_skips_after_first_pitch():
         game_time='2026-04-13T23:00:00+00:00',
         last_scanned_at='2026-04-13T22:30:00+00:00',
     )
-    assert _should_scan_game(g, now) is False
+    assert _should_scan_game(g, now)[0] == "skip"
 
 
 def test_scans_on_new_lineup_drop_after_prior_scan():
@@ -63,4 +63,4 @@ def test_scans_on_new_lineup_drop_after_prior_scan():
         lineups_confirmed_at='2026-04-13T19:55:00+00:00',
         last_scanned_at='2026-04-13T18:00:00+00:00',
     )
-    assert _should_scan_game(g, now) is True
+    assert _should_scan_game(g, now)[0] == "scan"

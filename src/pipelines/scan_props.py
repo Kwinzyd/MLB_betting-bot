@@ -1,11 +1,14 @@
 import uuid
 import json
 import os
+from collections import Counter
 from datetime import datetime, timezone, timedelta
 from src.config import (
     MARKETS_MAPPING, UMP_MIN_GAMES, UMP_K_WEIGHT, PREGAME_WINDOW_MINUTES,
-    SHARP_BOOKMAKERS,
+    SHARP_BOOKMAKERS, ALT_LINE_MAX_DISTANCE, MAX_BETS_PER_PLAYER,
+    SHARP_MODEL_AGREEMENT_TOL,
 )
+from src.models.distributions import get_probabilities
 from src.clients.odds_api import OddsAPIClient
 from src.clients.weather import WeatherClient
 from src.data.db import get_db_connection
@@ -14,7 +17,11 @@ from src.models.devig import devig_multiplicative
 from src.models.projections import ProjectionModel
 from src.models.edge_ranker import rank_edge
 from src.utils.logging_utils import get_logger
-from src.data.feature_builder import compute_bullpen_factor
+from src.data.feature_builder import (
+    compute_bullpen_factor,
+    compute_pitcher_h2h_vs_team,
+    compute_platoon_split,
+)
 from src.utils.time_utils import get_eastern_local_date
 
 logger = get_logger(__name__)
@@ -35,6 +42,12 @@ async def scan_props(force: bool = False, game_ids: list = None):
     cache for those events so the trigger path beats the 5-min TTL.
     """
     logger.info("Executing pipeline: scan_props")
+    
+    from src.data.cache import cache
+    if cache.get("odds_api_quota_exhausted"):
+        logger.error("Pipeline aborted: API Quota Circuit Breaker is active.")
+        return
+
     odds_client = OddsAPIClient()
     weather_client = WeatherClient()
     proj_model = ProjectionModel()
@@ -65,7 +78,7 @@ async def scan_props(force: bool = False, game_ids: list = None):
     markets = list(MARKETS_MAPPING.keys())
     api_markets = markets + ["totals"]
     total_edges = 0
-    skipped_quota = 0
+    skip_reasons: Counter = Counter()
 
     for game in games:
         game_id = game['game_id']
@@ -73,9 +86,14 @@ async def scan_props(force: bool = False, game_ids: list = None):
         away_team = game['away_team']
         venue = game['venue']
 
-        if not force and not _should_scan_game(game, now_utc):
-            skipped_quota += 1
-            continue
+        if not force:
+            decision, reason = _should_scan_game(game, now_utc)
+            if decision == "skip":
+                skip_reasons[reason] += 1
+                logger.debug(
+                    f"Skipping {away_team} @ {home_team} ({game_id}): {reason}"
+                )
+                continue
 
         logger.info(f"Scanning: {away_team} @ {home_team}")
 
@@ -97,117 +115,148 @@ async def scan_props(force: bool = False, game_ids: list = None):
         if not event_odds:
             continue
 
-        # 2. Parse odds and group by player+market+line for devigging
+        # 2. Parse odds and group by player+market(+line) for devigging
         player_lines = _parse_odds_by_player(event_odds)
+        player_market_groups = _group_by_player_market(player_lines)
         game_total = _parse_game_total(event_odds)
+        if game_total is not None:
+            _record_total_snapshot(game_id, game_total, source='scan')
 
-        # 3. For each player+market+line:
-        #    (a) Devig the sharp book → TRUE probability (source of truth).
-        #    (b) Hunt soft books for the best offer deviating from sharp consensus.
-        #    (c) rank_edge compares sharp_prob vs the soft-book's implied price.
-        #    Props with no sharp quote are skipped — we don't bet without truth.
-        for key, line_data in player_lines.items():
-            player_name, market_key, line = key
-
-            sharp_pair = _pick_sharp_pair(line_data, SHARP_BOOKMAKERS)
-            if sharp_pair is None:
+        # 3. For each (player, market):
+        #    (a) Pick a sharp-anchored line and devig → TRUE probability at anchor.
+        #    (b) Build the projection ONCE; agreement-gate model vs sharp at anchor.
+        #    (c) For each soft-quoted alt-line within ALT_LINE_MAX_DISTANCE,
+        #        re-price model probability via get_probabilities and rank_edge
+        #        against the best soft offer at that line.
+        #    (d) Keep up to MAX_BETS_PER_PLAYER highest-EV winners per player.
+        for (player_name, market_key), lines_for_market in player_market_groups.items():
+            anchor = _pick_anchor_line(lines_for_market, SHARP_BOOKMAKERS)
+            if anchor is None:
                 continue
-
-            sharp_over_odds, sharp_under_odds, sharp_book = sharp_pair
-            sharp_prob_over, sharp_prob_under = devig_multiplicative(
+            anchor_line, sharp_over_odds, sharp_under_odds, sharp_book = anchor
+            sharp_prob_over_anchor, sharp_prob_under_anchor = devig_multiplicative(
                 sharp_over_odds, sharp_under_odds
             )
-            if sharp_prob_over is None:
-                # Devig sanity check rejected the sharp pair — treat as no truth.
-                continue
-
-            soft_best = _pick_best_soft_line(line_data, SHARP_BOOKMAKERS)
-            over_odds, over_book = soft_best['over']
-            under_odds, under_book = soft_best['under']
-            if not over_odds or not under_odds:
-                continue
-            if over_odds <= 1.0 or under_odds <= 1.0:
+            if sharp_prob_over_anchor is None:
                 continue
 
             projection = _build_projection(
-                proj_model, player_name, market_key, line,
+                proj_model, player_name, market_key, anchor_line,
                 game_id, home_team, away_team, venue,
                 weather=weather, ump_k_factor=ump_k_factor,
                 game_total=game_total,
             )
-
             if not projection:
                 continue
-
             projection['player_name'] = player_name
 
-            # Composite book label when over and under come from different soft books
-            book_label = over_book if over_book == under_book else f"{over_book}/{under_book}"
+            # Anchor-level agreement gate. If model and sharp disagree at the
+            # consensus line, we don't trust the model anywhere — bail on this
+            # (player, market) before evaluating any alt-lines.
+            if abs(projection['prob_over'] - sharp_prob_over_anchor) > SHARP_MODEL_AGREEMENT_TOL:
+                continue
 
-            snapshot_id = str(uuid.uuid4())
             timestamp = datetime.utcnow().isoformat()
 
+            # Walk every soft-quoted alt-line within range; collect playable edges.
+            candidates = []  # (ev, line, side, soft_book, odds, edge_result, line_data)
             with get_db_connection() as conn:
-                # Fetch opening prob before inserting new snapshot
-                opening_row = conn.execute('''
-                    SELECT devigged_over, devigged_under 
-                    FROM prop_snapshots 
-                    WHERE game_id = ? AND player_name = ? AND market = ? AND line = ?
-                      AND devigged_over IS NOT NULL
-                    ORDER BY timestamp ASC 
-                    LIMIT 1
-                ''', (game_id, player_name, market_key, line)).fetchone()
-
-                # Pre-calculate steam detection before overwriting latest snaps
-                steam_over = _detect_steam_in_soft_books(conn, game_id, player_name, market_key, line, 'over', line_data, SHARP_BOOKMAKERS)
-                steam_under = _detect_steam_in_soft_books(conn, game_id, player_name, market_key, line, 'under', line_data, SHARP_BOOKMAKERS)
-
-                # Store snapshots for all books to track convergence and market sweeps
-                for book, pair in line_data.items():
-                    o_odds = pair.get('over')
-                    u_odds = pair.get('under')
-                    if not o_odds or not u_odds or o_odds <= 1.0 or u_odds <= 1.0:
+                for line, line_data in lines_for_market.items():
+                    if abs(line - anchor_line) > ALT_LINE_MAX_DISTANCE:
                         continue
-                        
-                    dev_o, dev_u = None, None
-                    if book in SHARP_BOOKMAKERS:
-                        dev_o, dev_u = devig_multiplicative(o_odds, u_odds)
-                        
-                    conn.execute('''
-                        INSERT INTO prop_snapshots
-                        (snapshot_id, game_id, player_name, market, line,
-                         over_odds, under_odds, bookmaker, timestamp,
-                         devigged_over, devigged_under)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (
-                        str(uuid.uuid4()), game_id, player_name, market_key,
-                        line, o_odds, u_odds, book, timestamp,
-                        dev_o, dev_u,
-                    ))
 
-                playable_any = False
-                for side, odds_val, sharp_prob, side_book in [
-                    ('over', over_odds, sharp_prob_over, over_book),
-                    ('under', under_odds, sharp_prob_under, under_book),
-                ]:
-                    opening_prob = opening_row[f'devigged_{side}'] if opening_row else None
-                    is_steam = steam_over if side == 'over' else steam_under
-                    edge_result = rank_edge(
-                        projection, odds_val, side, sharp_prob, 
-                        opening_prob=opening_prob, steam_detected=is_steam
+                    soft_best = _pick_best_soft_line(line_data, SHARP_BOOKMAKERS)
+                    over_odds, over_book = soft_best['over']
+                    under_odds, under_book = soft_best['under']
+
+                    # Re-price model at this line. The projection mean and
+                    # dispersion are line-independent, so we just recompute
+                    # over/under probabilities at the alt-line.
+                    prob_over_line, prob_under_line = get_probabilities(
+                        projection['projected_mean'], line, market_key,
+                        alpha=projection.get('alpha'),
+                        sigma=projection.get('sigma'),
+                    )
+                    line_proj = dict(projection)
+                    line_proj['line'] = line
+                    line_proj['prob_over'] = prob_over_line
+                    line_proj['prob_under'] = prob_under_line
+
+                    opening_row = conn.execute('''
+                        SELECT devigged_over, devigged_under
+                        FROM prop_snapshots
+                        WHERE game_id = ? AND player_name = ? AND market = ? AND line = ?
+                          AND devigged_over IS NOT NULL
+                        ORDER BY timestamp ASC
+                        LIMIT 1
+                    ''', (game_id, player_name, market_key, line)).fetchone()
+
+                    steam_over = _detect_steam_in_soft_books(conn, game_id, player_name, market_key, line, 'over', line_data, SHARP_BOOKMAKERS)
+                    steam_under = _detect_steam_in_soft_books(conn, game_id, player_name, market_key, line, 'under', line_data, SHARP_BOOKMAKERS)
+
+                    # Snapshot every book at this line — schema unchanged.
+                    for book, pair in line_data.items():
+                        o_odds = pair.get('over')
+                        u_odds = pair.get('under')
+                        if not o_odds or not u_odds or o_odds <= 1.0 or u_odds <= 1.0:
+                            continue
+                        dev_o, dev_u = None, None
+                        if book in SHARP_BOOKMAKERS:
+                            dev_o, dev_u = devig_multiplicative(o_odds, u_odds)
+                        conn.execute('''
+                            INSERT INTO prop_snapshots
+                            (snapshot_id, game_id, player_name, market, line,
+                             over_odds, under_odds, bookmaker, timestamp,
+                             devigged_over, devigged_under)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (
+                            str(uuid.uuid4()), game_id, player_name, market_key,
+                            line, o_odds, u_odds, book, timestamp,
+                            dev_o, dev_u,
+                        ))
+
+                    # Truth source per line:
+                    #   anchor line → devigged sharp (Pinnacle/Circa) probability.
+                    #   alt-line    → model probability at that line. The model
+                    #                 was anchor-validated against sharp at the
+                    #                 consensus line, so its CDF shape is
+                    #                 trusted across nearby alt-lines.
+                    if line == anchor_line:
+                        truth_over = sharp_prob_over_anchor
+                        truth_under = sharp_prob_under_anchor
+                    else:
+                        truth_over = prob_over_line
+                        truth_under = prob_under_line
+                    for side, odds_val, side_book, sharp_prob, is_steam in [
+                        ('over', over_odds, over_book, truth_over, steam_over),
+                        ('under', under_odds, under_book, truth_under, steam_under),
+                    ]:
+                        if not odds_val or odds_val <= 1.0:
+                            continue
+                        opening_prob = opening_row[f'devigged_{side}'] if opening_row else None
+                        edge_result = rank_edge(
+                            line_proj, odds_val, side, sharp_prob,
+                            opening_prob=opening_prob, steam_detected=is_steam,
+                        )
+                        if edge_result['is_playable']:
+                            candidates.append((
+                                edge_result['ev'], line, side, side_book,
+                                odds_val, edge_result, sharp_book,
+                            ))
+
+                # Pick top MAX_BETS_PER_PLAYER by EV; log the winners.
+                candidates.sort(key=lambda c: c[0], reverse=True)
+                winners = candidates[:MAX_BETS_PER_PLAYER]
+                for ev, line, side, side_book, odds_val, edge_result, sharp_book_used in winners:
+                    total_edges += 1
+                    logger.info(
+                        f"EDGE FOUND: {player_name} {market_key} {side.upper()} {line} "
+                        f"@ {side_book} (vs {sharp_book_used}, anchor {anchor_line}) | "
+                        f"Edge: {edge_result['edge_pct']:.1f}% | EV: {ev:.3f} | "
+                        f"Kelly: ${edge_result['kelly']['recommended_stake']}"
                     )
 
-                    if edge_result['is_playable']:
-                        total_edges += 1
-                        playable_any = True
-                        logger.info(
-                            f"EDGE FOUND: {player_name} {market_key} {side.upper()} {line} "
-                            f"@ {side_book} (vs {sharp_book}) | Edge: {edge_result['edge_pct']:.1f}% | "
-                            f"EV: {edge_result['ev']:.3f} | "
-                            f"Kelly: ${edge_result['kelly']['recommended_stake']}"
-                        )
-
-                if playable_any:
+                if winners:
                     context_json = json.dumps(projection.get('context', {}))
                     conn.execute('''
                         INSERT INTO projections
@@ -227,17 +276,19 @@ async def scan_props(force: bool = False, game_ids: list = None):
                         context_json, timestamp,
                     ))
 
-                # Stamp last_scanned_at so subsequent scans respect the gate
                 conn.execute(
                     "UPDATE games SET last_scanned_at = ? WHERE game_id = ?",
                     (now_utc.isoformat(), game_id),
                 )
                 conn.commit()
 
-    logger.info(
-        f"Scan complete. Found {total_edges} playable edges; "
-        f"skipped {skipped_quota} games by quota gate."
-    )
+    skipped_total = sum(skip_reasons.values())
+    if skip_reasons:
+        breakdown = ", ".join(f"{k}={v}" for k, v in sorted(skip_reasons.items()))
+        skip_str = f"skipped {skipped_total} games ({breakdown})"
+    else:
+        skip_str = f"skipped {skipped_total} games"
+    logger.info(f"Scan complete. Found {total_edges} playable edges; {skip_str}.")
 
 
 def _parse_iso(ts: str):
@@ -283,9 +334,16 @@ def _detect_steam_in_soft_books(conn, game_id, player_name, market_key, line, si
     return steam_count >= 3
 
 
-def _should_scan_game(game, now_utc: datetime) -> bool:
+def _should_scan_game(game, now_utc: datetime) -> tuple[str, str | None]:
     """
-    Quota gate. Scan a game only if either:
+    Eligibility gate. Returns ("scan", None) if the game should be scanned,
+    else ("skip", reason). Reasons:
+      - "no_lineup_confirm": lineups not yet stamped, and outside pregame window
+      - "already_scanned":   lineups stamped but already scanned since
+      - "outside_window":    lineups stamped+already scanned (or absent) and
+                             first pitch is not within PREGAME_WINDOW_MINUTES
+
+    Scan when either:
       (a) lineups were confirmed after the last scan (new info → re-price), or
       (b) first pitch is within PREGAME_WINDOW_MINUTES (high-volatility window).
     """
@@ -296,15 +354,19 @@ def _should_scan_game(game, now_utc: datetime) -> bool:
     # (a) Lineup drop triggers one re-scan.
     if confirmed_at is not None:
         if last_scanned is None or last_scanned < confirmed_at:
-            return True
+            return ("scan", None)
 
     # (b) Pregame window: first pitch within PREGAME_WINDOW_MINUTES from now.
     if game_time is not None:
         minutes_until = (game_time - now_utc).total_seconds() / 60.0
         if 0 <= minutes_until <= PREGAME_WINDOW_MINUTES:
-            return True
+            return ("scan", None)
 
-    return False
+    if confirmed_at is None:
+        return ("skip", "no_lineup_confirm")
+    if last_scanned is not None and last_scanned >= confirmed_at:
+        return ("skip", "already_scanned")
+    return ("skip", "outside_window")
 
 
 def _pick_best_line(line_data: dict) -> dict:
@@ -370,6 +432,31 @@ def _pick_best_soft_line(line_data: dict, sharp_books: list) -> dict:
     return {'over': best_over, 'under': best_under}
 
 
+def _group_by_player_market(player_lines: dict) -> dict:
+    """Re-bucket {(player, market, line): book_data} into
+    {(player, market): {line: book_data}}. Lets the scan loop iterate one
+    (player, market) at a time and consider every quoted line within range
+    instead of only sharp-anchored lines."""
+    grouped = {}
+    for (player, market, line), book_data in player_lines.items():
+        grouped.setdefault((player, market), {})[line] = book_data
+    return grouped
+
+
+def _pick_anchor_line(lines_for_market: dict, sharp_books: list):
+    """Find the first line for a (player, market) where a sharp book quotes
+    a valid two-sided pair. Returns (line, sharp_over, sharp_under, book) or
+    None. The anchor's devigged probability is the source-of-truth used to
+    re-price every alt-line in this market."""
+    for line in sorted(lines_for_market.keys()):
+        sharp_pair = _pick_sharp_pair(lines_for_market[line], sharp_books)
+        if sharp_pair is None:
+            continue
+        sharp_over, sharp_under, book = sharp_pair
+        return (line, sharp_over, sharp_under, book)
+    return None
+
+
 def _parse_odds_by_player(event_odds: dict) -> dict:
     """
     Parse the Odds API response into a structure grouped by (player, market, line).
@@ -402,6 +489,21 @@ def _parse_odds_by_player(event_odds: dict) -> dict:
                 result[key][book][side] = price
 
     return result
+
+
+def _record_total_snapshot(game_id: str, total: float, source: str) -> None:
+    """Persist a game-total observation. Read by trigger_watch as the
+    baseline for between-scan shift detection."""
+    try:
+        with get_db_connection() as conn:
+            conn.execute(
+                "INSERT INTO game_totals_history (game_id, total, source, timestamp) "
+                "VALUES (?, ?, ?, ?)",
+                (game_id, float(total), source, datetime.now(timezone.utc).isoformat()),
+            )
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"Failed to record game total for {game_id}: {e}")
 
 
 def _parse_game_total(event_odds: dict) -> float | None:
@@ -476,12 +578,16 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
             
         pitcher_bullpen_era = compute_bullpen_factor(team_id, today, db=conn)
         opp_bullpen_era = compute_bullpen_factor(opp_team_id, today, db=conn)
+        # Materialize DB-derived features here so the conn never escapes this
+        # context manager. Downstream feature builders prefer these scalars
+        # over their `extra["db"]` fallback path.
+        h2h_k_delta = compute_pitcher_h2h_vs_team(player_id, opp_team_id, today, db=conn)
         extra_features = {
             'pitcher_bullpen_era': pitcher_bullpen_era,
             'opp_bullpen_era': opp_bullpen_era,
             'opp_team_id': opp_team_id,
             'pitcher_id': player_id,
-            'db': conn
+            'h2h_k_delta': h2h_k_delta,
         }
 
         # Build projection based on market type
@@ -546,11 +652,20 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
             # Look up today's lineup position for PA projection
             lineup_position = _get_lineup_position(conn, player_name, game_id)
 
+            # Materialize platoon rate here while conn is alive so the feature
+            # builder doesn't need to reach back into the DB after this block.
+            batter_extra = dict(extra_features)
+            batter_extra['batter_id'] = player_id
+            batter_extra['platoon_rate_vs_hand'] = compute_platoon_split(
+                batter_logs=logs, vs_hand=pitcher_hand or '', stat_key=stat_type,
+                db=conn, batter_id=player_id,
+            )
+
             proj = proj_model.project_batter_stat(
                 logs, stat_type, pitcher_hand, bats, venue, line,
                 lineup_position=lineup_position,
                 weather=weather,
-                extra_features=extra_features,
+                extra_features=batter_extra,
                 player_id=player_id,
                 game_total=game_total,
             )
