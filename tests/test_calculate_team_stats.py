@@ -33,17 +33,17 @@ def memory_db():
 
 
 @patch('src.pipelines.calculate_team_stats.get_db_connection')
-@patch('src.pipelines.calculate_team_stats.datetime')
-def test_calculate_team_stats_mocks_datetime(mock_datetime, mock_get_db, memory_db):
+@patch('src.pipelines.calculate_team_stats.utcnow')
+def test_calculate_team_stats_mocks_datetime(mock_utcnow, mock_get_db, memory_db):
     """Test that team stats are calculated correctly and the timestamp is applied."""
     # 1. Intercept the database connection
     mock_get_db.return_value.__enter__.return_value = memory_db
     mock_get_db.return_value.__exit__.return_value = None
 
-    # 2. Mock datetime.utcnow().isoformat()
+    # 2. Mock utcnow().isoformat()
     mock_now = MagicMock()
     mock_now.isoformat.return_value = '2025-01-01T12:00:00'
-    mock_datetime.utcnow.return_value = mock_now
+    mock_utcnow.return_value = mock_now
 
     # 3. Execute the pipeline
     from src.pipelines.calculate_team_stats import calculate_team_stats

@@ -1,19 +1,25 @@
-"""Train a PoissonGLM per market on historical game logs.
+"""Train a Poisson model per market on historical game logs.
 
-Usage (via CLI):
+Primary model: LGBMPoissonModel (LightGBM with Poisson objective + Optuna tuning).
+Fallback: PoissonGLM when lightgbm is not installed or data is too sparse.
+
+Champion/challenger: after training, the new model is only promoted to champion
+if its val MAE beats the current champion's val MAE by ≥ 2%. This prevents a
+noisy retraining run from replacing a good model.
+
+Each training run writes a row to model_registry and SHAP importances to
+model_feature_importance.
+
+Usage:
     python main.py train
     python main.py train --compare sklearn
-
-Splits on game date: 2022–2024 → train, 2025+ → validation. Validation metrics
-reported: mean projected count vs actual (MAE), Poisson deviance, and — to
-measure betting utility — calibration of simulated P(over) vs actual over
-rate at simulated half-point lines.
 """
 from __future__ import annotations
 
-import math
+import json
 import os
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -24,7 +30,7 @@ from src.data.feature_builder import (
     build_batter_features, build_pitcher_features,
     compute_bullpen_factor, compute_rest_days,
 )
-from src.models.ml_model import PoissonGLM
+from src.models.ml_model import LGBMPoissonModel, PoissonGLM
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -214,63 +220,248 @@ def _batch_predict(glm: PoissonGLM, X: np.ndarray, exposure: np.ndarray) -> np.n
 # Orchestrator
 # ---------------------------------------------------------------------------
 
-def train_market(market: str, compare_sklearn: bool = False) -> Dict[str, float]:
-    logger.info(f"Training GLM for market={market}")
+# ---------------------------------------------------------------------------
+# Optuna hyperparameter search (LightGBM)
+# ---------------------------------------------------------------------------
+
+def _tune_lgbm(X_tr: np.ndarray, y_tr: np.ndarray, exp_tr: np.ndarray,
+               X_val: np.ndarray, y_val: np.ndarray, exp_val: np.ndarray,
+               feature_names: List[str], n_trials: int = 50) -> Dict:
+    """Return best LightGBM hyperparams via Optuna. Falls back to defaults on error."""
+    try:
+        import optuna
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+    except ImportError:
+        logger.info("optuna not installed — using default LGBM hyperparams")
+        return {}
+
+    def objective(trial):
+        params = {
+            "n_estimators":    trial.suggest_int("n_estimators", 100, 500),
+            "max_depth":       trial.suggest_int("max_depth", 3, 8),
+            "num_leaves":      trial.suggest_int("num_leaves", 15, 63),
+            "learning_rate":   trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
+            "min_child_samples": trial.suggest_int("min_child_samples", 10, 50),
+            "reg_lambda":      trial.suggest_float("reg_lambda", 0.1, 10.0, log=True),
+        }
+        m = LGBMPoissonModel(feature_names=feature_names, **params)
+        try:
+            m.fit(X_tr, y_tr, exp_tr, X_val, y_val, exp_val)
+            mu = m.predict_mean(X_val, exposure=exp_val)
+            return float(np.mean(np.abs(y_val - mu)))
+        except Exception:
+            return 1e9
+
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    return study.best_params
+
+
+# ---------------------------------------------------------------------------
+# Model registry helpers
+# ---------------------------------------------------------------------------
+
+def _get_champion_val_mae(market: str) -> float:
+    """Return the val_mae of the current champion, or inf if none exists."""
+    try:
+        with get_db_connection() as conn:
+            row = conn.execute(
+                "SELECT val_mae FROM model_registry WHERE market=? AND is_champion=1 ORDER BY trained_at DESC LIMIT 1",
+                (market,),
+            ).fetchone()
+        return float(row["val_mae"]) if row and row["val_mae"] is not None else float("inf")
+    except Exception:
+        return float("inf")
+
+
+def _register_model(market: str, model_type: str, version: str,
+                    train_metrics: Dict, val_metrics: Dict,
+                    feature_names: List[str], is_champion: bool) -> None:
+    """Write a row to model_registry; demote previous champion if promoting new one."""
+    with get_db_connection() as conn:
+        if is_champion:
+            conn.execute(
+                "UPDATE model_registry SET is_champion=0 WHERE market=?", (market,)
+            )
+        conn.execute(
+            """INSERT INTO model_registry
+               (market, model_type, version, train_mae, val_mae, poisson_deviance,
+                n_train, n_val, feature_list, is_champion, trained_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                market, model_type, version,
+                train_metrics.get("mae"), val_metrics.get("mae"),
+                val_metrics.get("poisson_deviance"),
+                train_metrics.get("n"), val_metrics.get("n"),
+                json.dumps(feature_names),
+                1 if is_champion else 0,
+                version,
+            ),
+        )
+        conn.commit()
+
+
+def _write_training_baseline(market: str, version: str, model,
+                              X_val: np.ndarray, exp_val: np.ndarray) -> None:
+    """Store val-set predicted-mean distribution stats for drift monitoring."""
+    if X_val.size == 0:
+        return
+    try:
+        mu = np.empty(X_val.shape[0])
+        for i in range(X_val.shape[0]):
+            mu[i] = model.predict_mean(X_val[i], exposure=float(exp_val[i]))
+        mu = np.clip(mu, 0.0, None)
+        stats = (
+            float(np.mean(mu)),
+            float(np.std(mu)),
+            float(np.percentile(mu, 10)),
+            float(np.percentile(mu, 50)),
+            float(np.percentile(mu, 90)),
+        )
+        with get_db_connection() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO model_training_baseline
+                   (market, model_version, feature, mean, std, p10, p50, p90)
+                   VALUES (?, ?, 'val_mu', ?, ?, ?, ?, ?)""",
+                (market, version) + stats,
+            )
+            conn.commit()
+        logger.info("  %s: training baseline written (mu mean=%.3f std=%.3f)", market, stats[0], stats[1])
+    except Exception as e:
+        logger.warning("  %s: could not write training baseline: %s", market, e)
+
+
+def _save_shap_importances(market: str, version: str, model, X_sample: np.ndarray,
+                           feature_names: List[str]) -> None:
+    """Compute SHAP mean |value| per feature and write to model_feature_importance."""
+    try:
+        shap_vals = model.shap_values(X_sample[:min(500, len(X_sample))])
+        mean_abs = np.abs(shap_vals).mean(axis=0)
+        ranked = sorted(enumerate(mean_abs), key=lambda x: x[1], reverse=True)
+        now = datetime.now(timezone.utc).isoformat()
+        with get_db_connection() as conn:
+            for rank, (idx, importance) in enumerate(ranked, 1):
+                fname = feature_names[idx] if idx < len(feature_names) else f"f{idx}"
+                conn.execute(
+                    """INSERT INTO model_feature_importance
+                       (market, model_version, feature, shap_mean_abs, rank, computed_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (market, version, fname, float(importance), rank, now),
+                )
+            conn.commit()
+        logger.info("  %s: SHAP importances written (%d features)", market, len(ranked))
+    except Exception as e:
+        logger.warning("  %s: SHAP computation failed: %s", market, e)
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
+
+def train_market(market: str, compare_sklearn: bool = False) -> Dict:
+    logger.info("Training model for market=%s", market)
     if market in _PITCHER_MARKETS:
         X, y, exp_, dates, names = _build_pitcher_dataset(market)
     else:
         X, y, exp_, dates, names = _build_batter_dataset(market)
 
     if X.size == 0:
-        logger.warning(f"No training data for {market} — skipping.")
+        logger.warning("  %s: no training data — skipping.", market)
         return {"market": market, "trained": False}
 
     train_mask = dates < _VAL_SPLIT_DATE
     val_mask = ~train_mask
+    n_train, n_val = int(train_mask.sum()), int(val_mask.sum())
+    logger.info("  %s: %d train rows, %d val rows", market, n_train, n_val)
 
-    n_train = int(train_mask.sum())
-    n_val = int(val_mask.sum())
-    logger.info(f"  {market}: {n_train} train rows, {n_val} validation rows")
     if n_train < 100:
-        logger.warning(f"  {market}: too few training rows ({n_train}) — skipping.")
+        logger.warning("  %s: too few training rows (%d) — skipping.", market, n_train)
         return {"market": market, "trained": False}
 
-    glm = PoissonGLM(feature_names=list(names), l2=0.01)
-    glm.fit(X[train_mask], y[train_mask], exposure=exp_[train_mask])
+    version = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    X_tr, y_tr, exp_tr = X[train_mask], y[train_mask], exp_[train_mask]
+    X_val = X[val_mask] if n_val else X_tr[:1]
+    y_val = y[val_mask] if n_val else y_tr[:1]
+    exp_val = exp_[val_mask] if n_val else exp_tr[:1]
 
-    train_metrics = _evaluate(glm, X[train_mask], y[train_mask], exp_[train_mask])
-    val_metrics = _evaluate(glm, X[val_mask], y[val_mask], exp_[val_mask]) if n_val else {"n": 0}
-    logger.info(f"  {market} train: {train_metrics}")
-    logger.info(f"  {market} val  : {val_metrics}")
+    # ---- Try LightGBM (champion path) ----
+    model = None
+    model_type = "glm"
+    if LGBMPoissonModel.available():
+        try:
+            best_params = _tune_lgbm(X_tr, y_tr, exp_tr, X_val, y_val, exp_val,
+                                     list(names), n_trials=50)
+            lgbm = LGBMPoissonModel(feature_names=list(names), **best_params)
+            lgbm.fit(X_tr, y_tr, exp_tr, X_val, y_val, exp_val)
+            model = lgbm
+            model_type = "lgbm"
+            logger.info("  %s: LightGBM trained (%d trees)", market, lgbm.n_iter_)
+        except Exception as e:
+            logger.warning("  %s: LightGBM training failed (%s) — falling back to GLM", market, e)
 
-    path = os.path.join(_MODELS_DIR, f"mlb_poisson_{market}.pkl")
-    glm.save(path)
-    logger.info(f"  saved → {path}")
+    # ---- Fallback: GLM ----
+    if model is None:
+        glm = PoissonGLM(feature_names=list(names), l2=0.01)
+        glm.fit(X_tr, y_tr, exposure=exp_tr)
+        model = glm
+
+    train_metrics = _evaluate(model, X_tr, y_tr, exp_tr)
+    val_metrics = _evaluate(model, X_val, y_val, exp_val) if n_val else {"n": 0}
+    logger.info("  %s %s train=%s val=%s", market, model_type, train_metrics, val_metrics)
+
+    # ---- Champion/challenger ----
+    current_best_mae = _get_champion_val_mae(market)
+    new_mae = val_metrics.get("mae") or float("inf")
+    # Promote if: no existing champion OR new model is ≥2% better
+    is_champion = (new_mae < current_best_mae * 0.98) or (current_best_mae == float("inf"))
+    if not is_champion:
+        logger.info("  %s: new model (mae=%.4f) does not beat champion (mae=%.4f) by 2%% — not promoting",
+                    market, new_mae, current_best_mae)
+
+    # ---- Save model file ----
+    suffix = ".pkl"
+    path = os.path.join(_MODELS_DIR, f"mlb_poisson_{market}{suffix}")
+    if is_champion:
+        model.save(path)
+        logger.info("  %s: champion saved → %s", market, path)
+    else:
+        challenger_path = os.path.join(_MODELS_DIR, f"mlb_poisson_{market}_challenger_{version}.pkl")
+        model.save(challenger_path)
+        logger.info("  %s: challenger saved → %s", market, challenger_path)
+
+    # ---- Registry + SHAP + training baseline ----
+    _register_model(market, model_type, version, train_metrics, val_metrics,
+                    list(names), is_champion)
+    if model_type == "lgbm" and is_champion:
+        _save_shap_importances(market, version, model, X_tr, list(names))
+    if is_champion and n_val:
+        _write_training_baseline(market, version, model, X_val, exp_val)
 
     result = {
         "market": market,
         "trained": True,
+        "model_type": model_type,
+        "is_champion": is_champion,
         "train": train_metrics,
         "val": val_metrics,
-        "converged": glm.converged_,
-        "n_iter": glm.n_iter_,
+        "converged": model.converged_,
+        "n_iter": model.n_iter_,
+        "version": version,
     }
 
     if compare_sklearn:
         try:
             from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
             rf = RandomForestRegressor(n_estimators=200, max_depth=8, n_jobs=-1, random_state=0)
-            rf.fit(X[train_mask], y[train_mask])
-            mu = np.clip(rf.predict(X[val_mask]), 1e-6, None) if n_val else np.array([])
+            rf.fit(X_tr, y_tr)
             if n_val:
-                result["val_rf_mae"] = round(float(np.mean(np.abs(y[val_mask] - mu))), 4)
-                result["val_rf_dev"] = round(_poisson_deviance(y[val_mask], mu), 4)
+                mu = np.clip(rf.predict(X_val), 1e-6, None)
+                result["val_rf_mae"] = round(float(np.mean(np.abs(y_val - mu))), 4)
             gb = GradientBoostingRegressor(random_state=0)
-            gb.fit(X[train_mask], y[train_mask])
-            mu2 = np.clip(gb.predict(X[val_mask]), 1e-6, None) if n_val else np.array([])
+            gb.fit(X_tr, y_tr)
             if n_val:
-                result["val_gb_mae"] = round(float(np.mean(np.abs(y[val_mask] - mu2))), 4)
-                result["val_gb_dev"] = round(_poisson_deviance(y[val_mask], mu2), 4)
+                mu2 = np.clip(gb.predict(X_val), 1e-6, None)
+                result["val_gb_mae"] = round(float(np.mean(np.abs(y_val - mu2))), 4)
         except ImportError:
             logger.warning("scikit-learn not installed; skipping --compare sklearn.")
 
@@ -284,13 +475,13 @@ def train_all(compare_sklearn: bool = False) -> List[Dict]:
         try:
             results.append(train_market(market, compare_sklearn=compare_sklearn))
         except Exception as e:
-            logger.error(f"Training failed for {market}: {e}", exc_info=True)
+            logger.error("Training failed for %s: %s", market, e, exc_info=True)
             results.append({"market": market, "trained": False, "error": str(e)})
 
     try:
         from src.pipelines.fit_dispersion import fit_all_dispersion
         fit_all_dispersion()
     except Exception as e:
-        logger.error(f"Dispersion fitting failed: {e}", exc_info=True)
+        logger.error("Dispersion fitting failed: %s", e, exc_info=True)
 
     return results

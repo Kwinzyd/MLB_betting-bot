@@ -1,12 +1,13 @@
 import uuid
 import json
 import os
+import time
 from collections import Counter
 from datetime import datetime, timezone, timedelta
 from src.config import (
     MARKETS_MAPPING, UMP_MIN_GAMES, UMP_K_WEIGHT, PREGAME_WINDOW_MINUTES,
     SHARP_BOOKMAKERS, ALT_LINE_MAX_DISTANCE, MAX_BETS_PER_PLAYER,
-    SHARP_MODEL_AGREEMENT_TOL,
+    SHARP_MODEL_AGREEMENT_TOL, BOOKMAKER_BIAS_THRESHOLD, EDGE_MIN,
 )
 from src.models.distributions import get_probabilities
 from src.clients.odds_api import OddsAPIClient
@@ -22,9 +23,38 @@ from src.data.feature_builder import (
     compute_pitcher_h2h_vs_team,
     compute_platoon_split,
 )
-from src.utils.time_utils import get_eastern_local_date
+from src.utils.time_utils import get_eastern_local_date, utcnow
 
 logger = get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Bookmaker bias cache — refreshed at most once per day
+# ---------------------------------------------------------------------------
+_bias_cache: dict = {}   # (bookmaker, market, side) → avg_bias float
+_bias_cache_ts: float = 0.0
+_BIAS_CACHE_TTL = 86400.0  # 24h
+
+
+def _load_bookmaker_bias() -> dict:
+    """Load active bookmaker_bias rows from DB with 24h TTL."""
+    global _bias_cache, _bias_cache_ts
+    now = time.monotonic()
+    if _bias_cache and (now - _bias_cache_ts) < _BIAS_CACHE_TTL:
+        return _bias_cache
+    result: dict = {}
+    try:
+        with get_db_connection() as conn:
+            rows = conn.execute(
+                "SELECT bookmaker, market, side, avg_bias FROM bookmaker_bias "
+                "WHERE avg_bias IS NOT NULL"
+            ).fetchall()
+        for r in rows:
+            result[(r["bookmaker"], r["market"], r["side"])] = float(r["avg_bias"])
+    except Exception as e:
+        logger.debug("Could not load bookmaker_bias: %s", e)
+    _bias_cache = result
+    _bias_cache_ts = now
+    return result
 
 
 async def scan_props(force: bool = False, game_ids: list = None):
@@ -51,6 +81,7 @@ async def scan_props(force: bool = False, game_ids: list = None):
     odds_client = OddsAPIClient()
     weather_client = WeatherClient()
     proj_model = ProjectionModel()
+    bias_map = _load_bookmaker_bias()
 
     force = force or os.getenv("ODDS_SCAN_FORCE", "").lower() in ("1", "true", "yes")
     targeted = bool(game_ids)
@@ -156,7 +187,7 @@ async def scan_props(force: bool = False, game_ids: list = None):
             if abs(projection['prob_over'] - sharp_prob_over_anchor) > SHARP_MODEL_AGREEMENT_TOL:
                 continue
 
-            timestamp = datetime.utcnow().isoformat()
+            timestamp = utcnow().isoformat()
 
             # Walk every soft-quoted alt-line within range; collect playable edges.
             candidates = []  # (ev, line, side, soft_book, odds, edge_result, line_data)
@@ -238,6 +269,23 @@ async def scan_props(force: bool = False, game_ids: list = None):
                             line_proj, odds_val, side, sharp_prob,
                             opening_prob=opening_prob, steam_detected=is_steam,
                         )
+                        # Bookmaker bias boost: if this book systematically
+                        # underprices this (market, side) vs sharp, add a small
+                        # edge credit and re-flag as playable if it crosses the bar.
+                        bias = bias_map.get((side_book, market_key, side), 0.0)
+                        if bias > BOOKMAKER_BIAS_THRESHOLD:
+                            edge_result = dict(edge_result)
+                            edge_result['edge_pct'] = round(
+                                edge_result['edge_pct'] + 0.5, 4
+                            )
+                            edge_result['bias_boosted'] = True
+                            if not edge_result['is_playable']:
+                                edge_result['is_playable'] = edge_result['edge_pct'] >= EDGE_MIN
+                                if edge_result['is_playable']:
+                                    logger.debug(
+                                        "Bias boost made playable: %s %s %s @ %s (bias=%.3f)",
+                                        player_name, market_key, side, side_book, bias,
+                                    )
                         if edge_result['is_playable']:
                             candidates.append((
                                 edge_result['ev'], line, side, side_book,
@@ -257,7 +305,9 @@ async def scan_props(force: bool = False, game_ids: list = None):
                     )
 
                 if winners:
-                    context_json = json.dumps(projection.get('context', {}))
+                    ctx = dict(projection.get('context', {}))
+                    ctx['sample_size'] = projection.get('sample_size', 0)
+                    context_json = json.dumps(ctx)
                     conn.execute('''
                         INSERT INTO projections
                         (game_id, player_name, market, projected_mean,
@@ -588,6 +638,7 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
             'opp_team_id': opp_team_id,
             'pitcher_id': player_id,
             'h2h_k_delta': h2h_k_delta,
+            'db': conn,
         }
 
         # Build projection based on market type

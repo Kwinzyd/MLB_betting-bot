@@ -34,7 +34,8 @@ def get_current_bankroll() -> float:
 
 
 def fractional_kelly(model_prob: float, decimal_odds: float,
-                     fraction: float = None, bankroll: float = None) -> dict:
+                     fraction: float = None, bankroll: float = None,
+                     kelly_fraction_override: float = 1.0) -> dict:
     """
     Calculate fractional Kelly stake.
 
@@ -64,7 +65,7 @@ def fractional_kelly(model_prob: float, decimal_odds: float,
     if full_kelly <= 0:
         return {"kelly_fraction": 0.0, "recommended_stake": 0.0, "full_kelly_pct": full_kelly}
 
-    adjusted_kelly = full_kelly * fraction
+    adjusted_kelly = full_kelly * fraction * kelly_fraction_override
 
     # Cap at 5% of bankroll max per single bet
     max_fraction = 0.05

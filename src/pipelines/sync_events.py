@@ -48,7 +48,7 @@ async def sync_events():
                 ''', (
                     team.get('id'),
                     team.get('abbreviation', ''),
-                    team.get('full_name', ''),
+                    team.get('display_name', ''),
                     team.get('league', ''),
                     team.get('division', ''),
                 ))
@@ -155,8 +155,9 @@ def _cleanup_stale_data(retention_days: int = 3):
     Delete prop_snapshots, projections, daily_lineups, probable_pitchers,
     and injury_reports older than retention_days to keep SQLite fast.
     """
-    from datetime import datetime, timedelta
-    cutoff = (datetime.utcnow() - timedelta(days=retention_days)).isoformat()
+    from datetime import timedelta
+    from src.utils.time_utils import utcnow
+    cutoff = (utcnow() - timedelta(days=retention_days)).isoformat()
 
     with get_db_connection() as conn:
         tables = {

@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+from datetime import datetime
 from src.data.db import init_db
 from src.pipelines.sync_events import sync_events
 from src.pipelines.sync_injuries import sync_injuries
@@ -87,6 +88,30 @@ def main():
                            help="step size between folds in days (default 7)")
     wf_parser.add_argument('--mode', choices=['sliding', 'expanding'], default='sliding',
                            help="sliding (fixed window) or expanding training set")
+    wf_parser.add_argument('--market', action='append', dest='markets', metavar='MARKET',
+                           help="Restrict to specific market(s); repeatable")
+    wf_parser.add_argument('--model', choices=['glm', 'lgbm'], default='glm',
+                           help="Model type to use for walk-forward (default: glm)")
+    wf_parser.add_argument('--compare-versions', action='store_true',
+                           help="Run both GLM and LGBM and print a side-by-side comparison")
+    wf_parser.add_argument('--history', action='store_true',
+                           help="Show historical walk-forward results from DB instead of running a new backtest")
+    wf_parser.add_argument('--last', type=int, default=5, metavar='N',
+                           help="Number of past runs to show per market with --history (default 5)")
+
+    # statcast / calibrate / fit-correlations / monitor-drift
+    statcast_parser = subparsers.add_parser(
+        'statcast', help="Sync Baseball Savant Statcast leaderboards"
+    )
+    statcast_parser.add_argument(
+        '--season', type=int, default=None,
+        help="Season year to sync (default: current year)"
+    )
+    subparsers.add_parser('calibrate', help="Fit Platt/isotonic calibration params per market")
+    subparsers.add_parser('fit-correlations',
+                          help="Fit empirical portfolio correlations from settled bets")
+    subparsers.add_parser('monitor-drift',
+                          help="Check model drift; retrain if drift_score > 0.15 or PSI > 0.20")
 
     args = parser.parse_args()
 
@@ -101,6 +126,8 @@ def main():
             asyncio.run(sync_stats())
             asyncio.run(sync_lineups())
             sync_umpires()
+            from src.pipelines.sync_statcast import sync_statcast
+            asyncio.run(sync_statcast())
 
         elif args.command == 'scan':
             logger.info("Running SCAN mode...")
@@ -131,18 +158,34 @@ def main():
             asyncio.run(run_live_state_machine())
 
         elif args.command == 'walkforward':
-            from src.pipelines.walk_forward import walk_forward_all, print_walk_forward_report
-            logger.info(
-                f"Running WALK-FORWARD backtest "
-                f"(window={args.train_window}d, step={args.step}d, mode={args.mode})..."
+            from src.pipelines.walk_forward import (
+                walk_forward_all, print_walk_forward_report,
+                compare_walk_forward_market, print_compare_report,
+                print_walk_forward_history,
             )
-            results = walk_forward_all(
-                markets=args.markets,
-                train_window_days=args.train_window,
-                step_days=args.step,
-                mode=args.mode,
-            )
-            print_walk_forward_report(results)
+            if args.history:
+                print_walk_forward_history(markets=args.markets, last_n=args.last)
+            elif args.compare_versions:
+                targets = list(args.markets) if args.markets else None
+                from src.pipelines.train_model import _ALL_MARKETS
+                targets = targets or list(_ALL_MARKETS)
+                for m in targets:
+                    comparison = compare_walk_forward_market(
+                        m,
+                        train_window_days=args.train_window,
+                        step_days=args.step,
+                        mode=args.mode,
+                    )
+                    print_compare_report(comparison)
+            else:
+                results = walk_forward_all(
+                    markets=args.markets,
+                    train_window_days=args.train_window,
+                    step_days=args.step,
+                    mode=args.mode,
+                    model_type=args.model,
+                )
+                print_walk_forward_report(results)
 
         elif args.command == 'settle':
             logger.info("Running SETTLE mode...")
@@ -179,6 +222,27 @@ def main():
             results = train_all(compare_sklearn=(args.compare == 'sklearn'))
             for r in results:
                 logger.info(f"Training result: {r}")
+
+        elif args.command == 'statcast':
+            from src.pipelines.sync_statcast import sync_statcast
+            season = args.season or datetime.now().year
+            logger.info(f"Running STATCAST sync for season {season}...")
+            asyncio.run(sync_statcast(season=season))
+
+        elif args.command == 'calibrate':
+            from src.pipelines.calibrate_model import calibrate_all
+            logger.info("Running CALIBRATE...")
+            calibrate_all()
+
+        elif args.command == 'fit-correlations':
+            from src.pipelines.fit_correlations import fit_correlations
+            logger.info("Running FIT-CORRELATIONS...")
+            fit_correlations()
+
+        elif args.command == 'monitor-drift':
+            from src.pipelines.monitor_drift import monitor_drift
+            logger.info("Running MONITOR-DRIFT...")
+            monitor_drift()
 
         elif args.command == 'backtest':
             from src.backtesting.engine import BacktestEngine

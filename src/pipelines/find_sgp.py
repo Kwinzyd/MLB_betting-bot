@@ -14,7 +14,7 @@ price for the user to compare against.
 """
 import json
 import itertools
-from datetime import datetime
+from src.utils.time_utils import utcnow
 
 from src.clients.telegram_bot import TelegramClient
 from src.data.db import get_db_connection
@@ -271,7 +271,7 @@ async def _persist_and_alert(candidates):
             ''', (
                 c['game_id'], legs_json, c['joint_prob'],
                 c['naive_parlay_odds'], c['fair_odds'], c['edge_vs_naive'],
-                c.get('kelly_stake'), books, datetime.utcnow().isoformat(),
+                c.get('kelly_stake'), books, utcnow().isoformat(),
             ))
             try:
                 await bot.send_message(_format_sgp_message(c))

@@ -1,67 +1,17 @@
 import pytest
-import sqlite3
 from unittest.mock import patch
+
+from tests.fixtures.fixture_db import memory_conn
 
 
 @pytest.fixture
 def memory_db():
-    """In-memory DB seeded with a completed game, a player, and game logs."""
-    conn = sqlite3.connect(':memory:')
-    conn.row_factory = sqlite3.Row
-    conn.executescript('''
-        CREATE TABLE games (
-            game_id TEXT PRIMARY KEY, bdl_game_id INTEGER, status TEXT
-        );
-        CREATE TABLE players (
-            player_id INTEGER PRIMARY KEY, name TEXT
-        );
-        CREATE TABLE alerts_sent (
-            alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            player_name TEXT, market TEXT, line REAL, side TEXT,
-            odds REAL, opening_odds REAL, kelly_stake REAL, game_id TEXT,
-            timestamp TEXT, edge REAL, ev REAL, bookmaker TEXT,
-            UNIQUE(player_name, market, line, bookmaker)
-        );
-        CREATE TABLE bet_results (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            alert_id INTEGER, actual_value REAL, result TEXT,
-            profit REAL, closing_odds REAL, clv REAL
-        );
-        CREATE TABLE pitcher_game_logs (
-            game_id INTEGER, player_id INTEGER, date TEXT,
-            innings_pitched REAL, hits_allowed INTEGER, runs_allowed INTEGER,
-            earned_runs INTEGER, walks INTEGER, strikeouts INTEGER,
-            home_runs_allowed INTEGER, pitches_thrown INTEGER,
-            PRIMARY KEY (game_id, player_id)
-        );
-        CREATE TABLE batter_game_logs (
-            game_id INTEGER, player_id INTEGER, date TEXT,
-            at_bats INTEGER, hits INTEGER, doubles INTEGER, triples INTEGER,
-            home_runs INTEGER, runs INTEGER, rbis INTEGER, walks INTEGER,
-            strikeouts INTEGER, total_bases INTEGER, plate_appearances INTEGER,
-            PRIMARY KEY (game_id, player_id)
-        );
-        CREATE TABLE prop_snapshots (
-            snapshot_id TEXT PRIMARY KEY, game_id TEXT, player_name TEXT,
-            market TEXT, line REAL, over_odds REAL, under_odds REAL,
-            bookmaker TEXT, timestamp TEXT, devigged_over REAL, devigged_under REAL
-        );
-        CREATE TABLE sgp_candidates (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            game_id TEXT, legs_json TEXT, joint_prob REAL,
-            naive_parlay_odds REAL, fair_odds REAL, edge_vs_naive REAL,
-            kelly_stake REAL, bookmakers TEXT, timestamp TEXT
-        );
-        CREATE TABLE sgp_results (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sgp_candidate_id INTEGER UNIQUE,
-            leg_results_json TEXT, voided_legs_json TEXT,
-            surviving_legs INTEGER, recalc_odds REAL,
-            result TEXT, profit REAL, settled_at TEXT
-        );
-    ''')
-    conn.execute("INSERT INTO games VALUES ('g1', 999, 'COMPLETED')")
-    conn.execute("INSERT INTO players VALUES (10, 'Gerrit Cole')")
+    """In-memory DB (full production schema) seeded with a completed game,
+    a player, and game logs. Built from schema.sql via memory_conn() so it can
+    never drift from production columns the way a hand-rolled schema would."""
+    conn = memory_conn()
+    conn.execute("INSERT INTO games (game_id, bdl_game_id, status) VALUES ('g1', 999, 'COMPLETED')")
+    conn.execute("INSERT INTO players (player_id, name) VALUES (10, 'Gerrit Cole')")
     conn.execute(
         "INSERT INTO pitcher_game_logs (game_id, player_id, date, innings_pitched, "
         "hits_allowed, runs_allowed, earned_runs, walks, strikeouts, home_runs_allowed, pitches_thrown) "
@@ -69,7 +19,9 @@ def memory_db():
     )
     # Prop snapshot used for CLV calculation
     conn.execute(
-        "INSERT INTO prop_snapshots VALUES "
+        "INSERT INTO prop_snapshots "
+        "(snapshot_id, game_id, player_name, market, line, over_odds, under_odds, "
+        "bookmaker, timestamp, devigged_over, devigged_under) VALUES "
         "('snap1', 'g1', 'Gerrit Cole', 'pitcher_strikeouts', 6.5, 2.1, 1.75, "
         "'draftkings', '2024-05-01T20:00:00', NULL, NULL)"
     )
@@ -172,7 +124,7 @@ def test_settle_results_idempotent(mock_get_db, memory_db):
 @patch('src.pipelines.settle_results.get_db_connection')
 def test_single_voided_when_player_dnp(mock_get_db, memory_db):
     """Late scratch: box score is in for the game but the player has no row -> VOID + refund."""
-    memory_db.execute("INSERT INTO players VALUES (30, 'Mookie Betts')")
+    memory_db.execute("INSERT INTO players (player_id, name) VALUES (30, 'Mookie Betts')")
     # batter_game_logs has rows for the game (someone played) but not for Mookie.
     memory_db.execute(
         "INSERT INTO batter_game_logs (game_id, player_id, date, at_bats, hits, "
@@ -204,7 +156,7 @@ def test_single_voided_when_player_dnp(mock_get_db, memory_db):
 @patch('src.pipelines.settle_results.get_db_connection')
 def test_single_pending_when_box_score_not_synced(mock_get_db, memory_db):
     """If the batter table has zero rows for the game, treat it as not-yet-synced (skip, don't void)."""
-    memory_db.execute("INSERT INTO players VALUES (31, 'Freddie Freeman')")
+    memory_db.execute("INSERT INTO players (player_id, name) VALUES (31, 'Freddie Freeman')")
     memory_db.execute('''
         INSERT INTO alerts_sent
         (player_name, market, line, side, odds, opening_odds, kelly_stake, game_id, bookmaker)
@@ -229,9 +181,9 @@ def test_sgp_void_recalculates_payout(mock_get_db, memory_db):
     """3-leg SGP with one DNP leg pays out as a 2-leg parlay on remaining legs' odds."""
     import json as _json
     # Two batters with hits. Third batter has no row but team's box score is in -> DNP.
-    memory_db.execute("INSERT INTO players VALUES (40, 'A B')")
-    memory_db.execute("INSERT INTO players VALUES (41, 'C D')")
-    memory_db.execute("INSERT INTO players VALUES (42, 'E F')")
+    memory_db.execute("INSERT INTO players (player_id, name) VALUES (40, 'A B')")
+    memory_db.execute("INSERT INTO players (player_id, name) VALUES (41, 'C D')")
+    memory_db.execute("INSERT INTO players (player_id, name) VALUES (42, 'E F')")
     for pid in (40, 41):
         memory_db.execute(
             "INSERT INTO batter_game_logs (game_id, player_id, date, at_bats, hits, "
@@ -273,8 +225,8 @@ def test_sgp_full_refund_when_all_legs_void(mock_get_db, memory_db):
     """If every leg voids, SGP is fully refunded (profit = 0)."""
     import json as _json
     # Box score has a row for an unrelated player so DNP detection triggers for our two scratches.
-    memory_db.execute("INSERT INTO players VALUES (50, 'X Y')")
-    memory_db.execute("INSERT INTO players VALUES (51, 'Z W')")
+    memory_db.execute("INSERT INTO players (player_id, name) VALUES (50, 'X Y')")
+    memory_db.execute("INSERT INTO players (player_id, name) VALUES (51, 'Z W')")
     memory_db.execute(
         "INSERT INTO batter_game_logs (game_id, player_id, date, at_bats, hits, "
         "doubles, triples, home_runs, runs, rbis, walks, strikeouts, total_bases, plate_appearances) "
@@ -309,7 +261,7 @@ def test_sgp_full_refund_when_all_legs_void(mock_get_db, memory_db):
 @patch('src.pipelines.settle_results.get_db_connection')
 def test_settle_results_batter_hits(mock_get_db, memory_db):
     """The batter_hits market resolves using the hits column from batter_game_logs."""
-    memory_db.execute("INSERT INTO players VALUES (20, 'Aaron Judge')")
+    memory_db.execute("INSERT INTO players (player_id, name) VALUES (20, 'Aaron Judge')")
     memory_db.execute(
         "INSERT INTO batter_game_logs (game_id, player_id, date, at_bats, hits, "
         "doubles, triples, home_runs, runs, rbis, walks, strikeouts, total_bases, plate_appearances) "

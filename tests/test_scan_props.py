@@ -134,4 +134,6 @@ async def test_scan_props_database_inserts(
     assert proj['player_name'] == 'Gerrit Cole'
     assert proj['market'] == 'pitcher_strikeouts'
     assert proj['prob_over'] == 0.60
-    assert json.loads(proj['context_json']) == {'mock_data': True}
+    # scan_props merges the projection's sample_size into context_json so the
+    # downstream rank_edge MIN_SAMPLE_SIZE gate can read it.
+    assert json.loads(proj['context_json']) == {'mock_data': True, 'sample_size': 20}

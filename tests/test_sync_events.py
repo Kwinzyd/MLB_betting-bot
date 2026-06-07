@@ -1,9 +1,10 @@
 import pytest
 import sqlite3
-import datetime
 import asyncio
 from unittest.mock import patch, MagicMock, AsyncMock
 from freezegun import freeze_time
+
+from src.utils.time_utils import utcnow
 from src.pipelines.sync_events import sync_events
 
 
@@ -105,7 +106,7 @@ def test_sync_events_with_dynamic_frozen_date(mock_session_get, mock_get_db, moc
     mock_get_db.return_value.__enter__.return_value = memory_db
     mock_get_db.return_value.__exit__.return_value = None
 
-    frozen_now = datetime.datetime.utcnow()
+    frozen_now = utcnow()
     mock_commence_time = frozen_now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     mock_response = MagicMock()

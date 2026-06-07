@@ -1,42 +1,15 @@
 import pytest
-import sqlite3
 from unittest.mock import patch, MagicMock, AsyncMock
+
+from tests.fixtures.fixture_db import memory_conn
 
 
 @pytest.fixture
 def memory_db():
-    """In-memory DB with the tables sync_stats reads from and writes to."""
-    conn = sqlite3.connect(':memory:')
-    conn.row_factory = sqlite3.Row
-    conn.executescript('''
-        CREATE TABLE games (
-            game_id TEXT PRIMARY KEY, bdl_game_id INTEGER,
-            home_team TEXT, away_team TEXT, home_team_id INTEGER,
-            away_team_id INTEGER, status TEXT
-        );
-        CREATE TABLE teams (
-            team_id INTEGER PRIMARY KEY, abbreviation TEXT, name TEXT,
-            league TEXT, division TEXT
-        );
-        CREATE TABLE players (
-            player_id INTEGER PRIMARY KEY, name TEXT, team_id INTEGER,
-            position TEXT, bats TEXT, throws TEXT, active BOOLEAN DEFAULT 1
-        );
-        CREATE TABLE pitcher_game_logs (
-            game_id INTEGER, player_id INTEGER, date TEXT,
-            innings_pitched REAL, hits_allowed INTEGER, runs_allowed INTEGER,
-            earned_runs INTEGER, walks INTEGER, strikeouts INTEGER,
-            home_runs_allowed INTEGER, pitches_thrown INTEGER,
-            PRIMARY KEY (game_id, player_id)
-        );
-        CREATE TABLE batter_game_logs (
-            game_id INTEGER, player_id INTEGER, date TEXT,
-            at_bats INTEGER, hits INTEGER, doubles INTEGER, triples INTEGER,
-            home_runs INTEGER, runs INTEGER, rbis INTEGER, walks INTEGER,
-            strikeouts INTEGER, total_bases INTEGER, plate_appearances INTEGER,
-            PRIMARY KEY (game_id, player_id)
-        );
-    ''')
+    """In-memory DB (full production schema) with the tables sync_stats reads
+    from and writes to. Built via memory_conn() so columns like last_synced_at
+    that sync_stats now depends on are always present."""
+    conn = memory_conn()
     conn.execute('''
         INSERT INTO games (game_id, bdl_game_id, home_team, away_team,
                            home_team_id, away_team_id, status)

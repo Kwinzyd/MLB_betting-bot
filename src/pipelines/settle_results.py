@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 
 from src.config import BANKROLL, SHARP_BOOKMAKERS
 from src.data.db import get_db_connection
@@ -25,7 +26,8 @@ def settle_results():
         unsettled = conn.execute('''
             SELECT
                 a.alert_id, a.player_name, a.market, a.line, a.side,
-                a.odds, a.opening_odds, a.kelly_stake, a.game_id
+                a.odds, a.opening_odds, a.kelly_stake, a.game_id,
+                a.model_prob_over, a.model_prob_under
             FROM alerts_sent a
             JOIN games g ON a.game_id = g.game_id
             WHERE g.status = 'COMPLETED'
@@ -34,6 +36,7 @@ def settle_results():
 
     settled_count = 0
     total_profit = 0.0
+    settled_game_ids: set = set()
 
     if not unsettled:
         logger.info("No unsettled single-bet alerts.")
@@ -65,6 +68,7 @@ def settle_results():
                     ''', (alert_id, odds, clv))
                     conn.commit()
                 settled_count += 1
+                settled_game_ids.add(alert['game_id'])
                 logger.info(
                     f"VOIDED (DNP): {player_name} {market} {side.upper()} {line} - "
                     f"stake ${stake:.2f} refunded."
@@ -106,10 +110,14 @@ def settle_results():
                 INSERT INTO bet_results (alert_id, actual_value, result, profit, closing_odds, clv)
                 VALUES (?, ?, ?, ?, ?, ?)
             ''', (alert_id, actual, result, round(profit, 2), odds, clv))
+            if result in ('WIN', 'LOSS'):
+                _write_calibration_log(conn, alert_id, market, side, result,
+                                       alert['model_prob_over'], alert['model_prob_under'])
             conn.commit()
 
         total_profit += profit
         settled_count += 1
+        settled_game_ids.add(alert['game_id'])
         logger.info(
             f"SETTLED: {player_name} {market} {side.upper()} {line} - "
             f"Actual: {actual} | {result} | P&L: ${profit:+.2f} | CLV: {clv:+.3f}"
@@ -120,10 +128,12 @@ def settle_results():
     settled_count += sgp_settled
     total_profit += sgp_profit
 
-    # Log summary
+    # Log summary and update bankroll snapshot
     if settled_count > 0:
         _log_pnl_summary()
 
+    _emit_pair_outcomes(settled_game_ids)
+    _update_bankroll_snapshot(total_profit)
     logger.info(f"Settlement complete. Settled {settled_count} bets. Session P&L: ${total_profit:+.2f}")
 
 
@@ -414,6 +424,226 @@ def _calculate_clv(game_id: str, player_name: str, market: str,
         opening_implied = 1.0 / opening_odds
         closing_implied = closing_over if side == 'over' else closing_under
         return round(closing_implied - opening_implied, 4)
+
+
+def _classify_pair(a: dict, b: dict) -> str:
+    """Return pair_type for two bets from the same game."""
+    a_type = "pitcher" if a["market"].startswith("pitcher_") else "batter"
+    b_type = "pitcher" if b["market"].startswith("pitcher_") else "batter"
+    if a["player_team"] == b["player_team"]:
+        return "pitcher_batter" if a_type != b_type else "same_team_batters"
+    return "same_game_opp"
+
+
+def _emit_pair_outcomes(game_ids=None) -> None:
+    """Record pairwise joint outcomes for correlation learning (bet_pair_outcomes table).
+
+    Scopes to the games settled in this run (`game_ids`) rather than to bets
+    *placed* today: a bet placed before a night game routinely settles after the
+    next UTC midnight, so the old `date(a.timestamp) = today` filter silently
+    dropped exactly the same-game pairs correlation learning needs. INSERT OR
+    IGNORE on the (alert_id_a, alert_id_b) key keeps re-runs idempotent.
+    """
+    from itertools import combinations
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    game_ids = list(game_ids) if game_ids else []
+    if not game_ids:
+        return
+
+    placeholders = ",".join("?" for _ in game_ids)
+    with get_db_connection() as conn:
+        rows = [dict(r) for r in conn.execute(
+            f"""SELECT br.alert_id, a.game_id, a.market, br.result,
+                      COALESCE(
+                          (SELECT t.abbreviation FROM players pl
+                           JOIN teams t ON pl.team_id = t.team_id
+                           WHERE pl.name = a.player_name LIMIT 1),
+                          ''
+                      ) AS player_team
+               FROM bet_results br
+               JOIN alerts_sent a ON br.alert_id = a.alert_id
+               WHERE a.game_id IN ({placeholders})
+                 AND br.result IN ('WIN', 'LOSS')""",
+            game_ids,
+        ).fetchall()]
+
+        # Group by game_id and emit a row for every pair
+        by_game: dict = {}
+        for r in rows:
+            by_game.setdefault(r["game_id"], []).append(r)
+
+        inserted = 0
+        for game_id, bets in by_game.items():
+            if len(bets) < 2:
+                continue
+            for a, b in combinations(bets, 2):
+                pair_type = _classify_pair(a, b)
+                try:
+                    conn.execute(
+                        """INSERT OR IGNORE INTO bet_pair_outcomes
+                           (alert_id_a, alert_id_b, pair_type,
+                            both_won, a_won, b_won, game_id, settled_date)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            a["alert_id"], b["alert_id"], pair_type,
+                            int(a["result"] == "WIN" and b["result"] == "WIN"),
+                            int(a["result"] == "WIN"),
+                            int(b["result"] == "WIN"),
+                            game_id, today,
+                        ),
+                    )
+                    inserted += 1
+                except Exception as e:
+                    logger.debug("bet_pair_outcomes insert failed: %s", e)
+        if inserted:
+            conn.commit()
+            logger.info("Emitted %d bet pair outcome records.", inserted)
+
+
+def _write_calibration_log(conn, alert_id: int, market: str, side: str,
+                           result: str, model_prob_over, model_prob_under) -> None:
+    """Append a resolved bet to calibration_log for probability calibration fitting."""
+    predicted_prob = model_prob_over if side == 'over' else model_prob_under
+    if predicted_prob is None:
+        return
+    prob_bin = round(round(predicted_prob / 0.05) * 0.05, 2)
+    actual_outcome = 1 if result == 'WIN' else 0
+    settled_at = datetime.now(timezone.utc).isoformat()
+    try:
+        conn.execute(
+            """INSERT OR IGNORE INTO calibration_log
+               (alert_id, market, predicted_prob, prob_bin, actual_outcome, settled_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (alert_id, market, predicted_prob, prob_bin, actual_outcome, settled_at),
+        )
+    except Exception as e:
+        logger.warning("calibration_log insert failed: %s", e)
+
+
+def _send_circuit_breaker_alert(message: str) -> None:
+    """Best-effort Telegram alert for circuit breaker events."""
+    logger.warning("Circuit breaker: %s", message)
+    try:
+        from src.clients.telegram_bot import TelegramClient
+        TelegramClient().send_message_sync(f"⚠️ <b>Circuit Breaker</b>\n{message}")
+    except Exception as e:
+        logger.error("Circuit breaker Telegram alert failed: %s", e)
+
+
+def _update_bankroll_snapshot(session_profit: float) -> None:
+    """Write today's bankroll snapshot and evaluate circuit breakers."""
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    with get_db_connection() as conn:
+        try:
+            daily_row = conn.execute(
+                """SELECT COALESCE(SUM(br.profit), 0.0) AS daily_pnl
+                   FROM bet_results br
+                   JOIN alerts_sent a ON br.alert_id = a.alert_id
+                   WHERE date(a.timestamp) = ?""",
+                (today,),
+            ).fetchone()
+            daily_pnl = float(daily_row['daily_pnl']) if daily_row else 0.0
+        except Exception:
+            daily_pnl = session_profit
+
+        try:
+            roll_row = conn.execute(
+                """SELECT COALESCE(SUM(br.profit), 0.0) AS pnl,
+                          COALESCE(SUM(a.kelly_stake), 0.0) AS staked
+                   FROM bet_results br
+                   JOIN alerts_sent a ON br.alert_id = a.alert_id
+                   WHERE date(a.timestamp) >= date('now', '-7 days')""",
+            ).fetchone()
+            rolling_7d_pnl = float(roll_row['pnl'] or 0.0)
+            staked_7d = float(roll_row['staked'] or 0.0)
+            rolling_7d_roi = rolling_7d_pnl / staked_7d if staked_7d > 0 else 0.0
+        except Exception:
+            rolling_7d_pnl = 0.0
+            rolling_7d_roi = 0.0
+
+        try:
+            stats = conn.execute(
+                """SELECT COUNT(*) as total_bets,
+                          SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) as total_wins
+                   FROM bet_results WHERE result IN ('WIN', 'LOSS')""",
+            ).fetchone()
+            total_bets = int(stats['total_bets'] or 0)
+            total_wins = int(stats['total_wins'] or 0)
+        except Exception:
+            total_bets = total_wins = 0
+
+        current_bankroll = get_current_bankroll()
+
+        # Carry forward existing override state for today if already written
+        kelly_override = 1.0
+        full_stop = 0
+        halved_at = None
+        try:
+            existing = conn.execute(
+                "SELECT kelly_fraction_override, halved_at, full_stop "
+                "FROM bankroll_snapshots WHERE snapshot_date=?",
+                (today,),
+            ).fetchone()
+            if existing:
+                kelly_override = float(existing['kelly_fraction_override'] or 1.0)
+                halved_at = existing['halved_at']
+                full_stop = int(existing['full_stop'] or 0)
+        except Exception:
+            pass
+
+        # Breaker 1: 7-day ROI < -15% → halve Kelly
+        if rolling_7d_roi < -0.15 and kelly_override == 1.0 and full_stop == 0:
+            kelly_override = 0.5
+            halved_at = now_iso
+            _send_circuit_breaker_alert(
+                f"7-day ROI {rolling_7d_roi:.1%} below -15%. Kelly halved to 0.5."
+            )
+        elif rolling_7d_roi > -0.05 and kelly_override < 1.0 and full_stop == 0:
+            kelly_override = 1.0
+            halved_at = None
+            _send_circuit_breaker_alert("7-day ROI recovered above -5%. Kelly restored to 1.0.")
+
+        # Breaker 2: daily P&L < -5% of starting bankroll → full stop
+        if daily_pnl < -(BANKROLL * 0.05) and full_stop == 0:
+            full_stop = 1
+            _send_circuit_breaker_alert(
+                f"Daily P&L ${daily_pnl:+.2f} exceeds -5% of bankroll. FULL STOP activated."
+            )
+
+        try:
+            conn.execute(
+                """INSERT INTO bankroll_snapshots
+                   (snapshot_date, bankroll, daily_pnl, rolling_7d_pnl, rolling_7d_roi,
+                    total_bets, total_wins, kelly_fraction_override, halved_at, full_stop)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(snapshot_date) DO UPDATE SET
+                       bankroll=excluded.bankroll,
+                       daily_pnl=excluded.daily_pnl,
+                       rolling_7d_pnl=excluded.rolling_7d_pnl,
+                       rolling_7d_roi=excluded.rolling_7d_roi,
+                       total_bets=excluded.total_bets,
+                       total_wins=excluded.total_wins,
+                       kelly_fraction_override=excluded.kelly_fraction_override,
+                       halved_at=COALESCE(excluded.halved_at, bankroll_snapshots.halved_at),
+                       full_stop=excluded.full_stop""",
+                (
+                    today, round(current_bankroll, 2), round(daily_pnl, 2),
+                    round(rolling_7d_pnl, 2), round(rolling_7d_roi, 4),
+                    total_bets, total_wins, kelly_override, halved_at, full_stop,
+                ),
+            )
+            conn.commit()
+        except Exception as e:
+            logger.error("Failed to write bankroll_snapshots: %s", e)
+
+    logger.info(
+        "Bankroll snapshot: $%.2f | daily=%+.2f | 7d_roi=%.1f%% | "
+        "kelly_override=%.1f | full_stop=%d",
+        current_bankroll, daily_pnl, rolling_7d_roi * 100, kelly_override, full_stop,
+    )
 
 
 def _log_pnl_summary():

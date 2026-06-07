@@ -1,18 +1,44 @@
 import json
-from datetime import datetime
 from src.clients.execution import build_venue_registry
+from src.utils.time_utils import utcnow
 from src.data.db import get_db_connection
 from src.config import MAX_BETS_PER_GAME, MAX_BETS_PER_PLAYER, BETTING_ENABLED
 from src.models.edge_ranker import rank_edge
+from src.models.kelly import get_current_bankroll
+from src.models.portfolio_kelly import apply_portfolio_kelly
 from src.utils.logging_utils import get_logger
+from src.models.distributions import get_probabilities
 from src.utils.stake_rounding import round_stake
 
 logger = get_logger(__name__)
 
 
+def _load_bankroll_snapshot() -> dict:
+    """Return today's bankroll_snapshots row as a plain dict, or empty dict on any error."""
+    try:
+        from src.data.db import get_db_connection
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        with get_db_connection() as conn:
+            row = conn.execute(
+                "SELECT full_stop, kelly_fraction_override FROM bankroll_snapshots "
+                "WHERE snapshot_date=?", (today,)
+            ).fetchone()
+            return dict(row) if row else {}
+    except Exception:
+        return {}
+
+
 async def send_alerts():
     """Find high-edge projections and dispatch them to every enabled execution venue."""
     logger.info("Executing pipeline: send_alerts")
+
+    snapshot = _load_bankroll_snapshot()
+    if snapshot.get('full_stop'):
+        logger.warning("send_alerts: FULL STOP active — no alerts sent today.")
+        return
+    kelly_override = float(snapshot.get('kelly_fraction_override') or 1.0)
+
     venues = build_venue_registry()
     if not venues:
         logger.warning("No execution venues enabled; send_alerts is a no-op.")
@@ -25,7 +51,13 @@ async def send_alerts():
                 p.prob_over, p.prob_under, p.context_json,
                 ps.line, ps.over_odds, ps.under_odds, ps.bookmaker,
                 ps.devigged_over, ps.devigged_under,
-                g.home_team, g.away_team, g.venue, g.date
+                g.home_team, g.away_team, g.venue, g.date,
+                COALESCE(
+                    (SELECT t.abbreviation FROM players pl
+                     JOIN teams t ON pl.team_id = t.team_id
+                     WHERE pl.name = p.player_name LIMIT 1),
+                    g.home_team
+                ) AS player_team
             FROM projections p
             JOIN prop_snapshots ps ON
                 p.game_id = ps.game_id AND
@@ -42,12 +74,20 @@ async def send_alerts():
 
     candidates = []
     for row in rows:
+        # Extract sample_size stored in context_json by scan_props; fall back to 0
+        # so rank_edge's MIN_SAMPLE_SIZE gate can correctly reject small samples.
+        ctx_data = {}
+        if row['context_json']:
+            try:
+                ctx_data = json.loads(row['context_json'])
+            except json.JSONDecodeError:
+                pass
         projection = {
             'prob_over': row['prob_over'],
             'prob_under': row['prob_under'],
             'projected_mean': row['projected_mean'],
             'injury_status': 'Healthy',
-            'sample_size': 10,
+            'sample_size': ctx_data.get('sample_size', 0),
         }
 
         best_side = None
@@ -60,7 +100,18 @@ async def send_alerts():
         ]:
             if not odds_val or odds_val <= 1.0:
                 continue
-            edge_result = rank_edge(projection, odds_val, side, dev_prob)
+            
+            truth_prob = dev_prob
+            if truth_prob is None:
+                prob_o, prob_u = get_probabilities(
+                    row['projected_mean'], row['line'], row['market'],
+                    alpha=ctx_data.get('alpha'),
+                    sigma=ctx_data.get('sigma'),
+                    pi0=ctx_data.get('pi0')
+                )
+                truth_prob = prob_o if side == 'over' else prob_u
+                
+            edge_result = rank_edge(projection, odds_val, side, truth_prob)
             if edge_result['is_playable']:
                 if best_edge is None or edge_result['edge_pct'] > best_edge['edge_pct']:
                     best_edge = edge_result
@@ -76,9 +127,27 @@ async def send_alerts():
             'side': best_side,
             'odds': best_odds,
             'edge': best_edge,
+            'ctx_data': ctx_data,
         })
 
     candidates.sort(key=lambda c: c['edge']['edge_pct'], reverse=True)
+
+    # ----------------------------------------------------------------
+    # Portfolio-level Kelly: re-size all candidates simultaneously
+    # using a covariance-aware solver so correlated same-game bets
+    # don't compound bankroll variance beyond safe limits.
+    # This replaces the per-bet recommended_stake in each candidate.
+    # ----------------------------------------------------------------
+    bankroll = get_current_bankroll()
+    candidates = apply_portfolio_kelly(candidates, bankroll)
+    if kelly_override != 1.0:
+        for c in candidates:
+            k = c['edge']['kelly']
+            k['recommended_stake'] = round(k['recommended_stake'] * kelly_override, 2)
+    logger.info(
+        "Portfolio Kelly applied to %d candidates (bankroll=$%.2f, override=%.2f).",
+        len(candidates), bankroll, kelly_override,
+    )
 
     seen_players: dict = {}
     game_counts: dict = {}
@@ -103,18 +172,13 @@ async def send_alerts():
 
         with get_db_connection() as conn:
             existing = conn.execute(
-                "SELECT 1 FROM alerts_sent WHERE player_name=? AND market=? AND line=? AND bookmaker=?",
-                (player_name, market, line, bookmaker)
+                "SELECT 1 FROM alerts_sent WHERE player_name=? AND market=? AND line=? AND bookmaker=? AND game_id=?",
+                (player_name, market, line, bookmaker, game_id)
             ).fetchone()
             if existing:
                 continue
 
-            model_context = {}
-            if row['context_json']:
-                try:
-                    model_context = json.loads(row['context_json'])
-                except json.JSONDecodeError:
-                    pass
+            model_context = cand['ctx_data']  # this candidate's parsed context_json
 
             display_stake = round_stake(cand['edge']['kelly']['recommended_stake'])
             cand['edge']['kelly']['recommended_stake'] = display_stake
@@ -134,7 +198,7 @@ async def send_alerts():
                 'model_context': model_context,
             }
 
-            timestamp = datetime.utcnow().isoformat()
+            timestamp = utcnow().isoformat()
             alert_id = None
             telegram_succeeded = False
             order_records: list[dict] = []
@@ -142,7 +206,7 @@ async def send_alerts():
             for venue in venues:
                 record = await venue.place_order(cand['edge'], execution_context)
                 order_records.append(record)
-                if venue.name == 'telegram' and record['status'] in ('sent', 'skipped'):
+                if venue.name == 'telegram' and record['status'] == 'sent':
                     telegram_succeeded = True
 
             should_record_alert = telegram_succeeded and BETTING_ENABLED and any(
@@ -155,7 +219,10 @@ async def send_alerts():
                      bookmaker, odds, opening_odds, model_prob_over, model_prob_under,
                      game_id, timestamp)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(player_name, market, line, bookmaker) DO NOTHING
+                    ON CONFLICT(player_name, market, line, bookmaker, game_id) DO UPDATE SET
+                        edge=excluded.edge,
+                        ev=excluded.ev,
+                        timestamp=excluded.timestamp
                 ''', (
                     player_name, market, line, cand['side'],
                     cand['edge']['edge_pct'], cand['edge']['ev'],

@@ -1,55 +1,7 @@
-import sqlite3
 from unittest.mock import patch, AsyncMock
 import pytest
 
-
-def _seed_schema(conn):
-    conn.executescript('''
-        CREATE TABLE games (
-            game_id TEXT PRIMARY KEY, home_team TEXT, away_team TEXT,
-            venue TEXT, status TEXT, date TEXT
-        );
-        CREATE TABLE projections (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            game_id TEXT, player_name TEXT, market TEXT,
-            projected_mean REAL, prob_over REAL, prob_under REAL,
-            context_json TEXT, timestamp TEXT,
-            UNIQUE(game_id, player_name, market)
-        );
-        CREATE TABLE prop_snapshots (
-            snapshot_id TEXT PRIMARY KEY, game_id TEXT, player_name TEXT,
-            market TEXT, line REAL, over_odds REAL, under_odds REAL,
-            bookmaker TEXT, timestamp TEXT, devigged_over REAL, devigged_under REAL
-        );
-        CREATE TABLE alerts_sent (
-            alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            player_name TEXT, market TEXT, line REAL, side TEXT,
-            edge REAL, ev REAL, kelly_stake REAL, bookmaker TEXT,
-            odds REAL, opening_odds REAL,
-            model_prob_over REAL, model_prob_under REAL,
-            game_id TEXT, timestamp TEXT,
-            UNIQUE(player_name, market, line, bookmaker)
-        );
-        CREATE TABLE orders (
-            order_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            venue TEXT NOT NULL,
-            alert_id INTEGER,
-            player_name TEXT NOT NULL,
-            market TEXT NOT NULL,
-            line REAL NOT NULL,
-            side TEXT NOT NULL,
-            game_id TEXT,
-            bookmaker TEXT,
-            offered_odds REAL NOT NULL,
-            fill_odds REAL,
-            stake REAL NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            venue_order_id TEXT,
-            placed_at TEXT NOT NULL,
-            filled_at TEXT,
-            notes TEXT
-        );
-    ''')
+from tests.fixtures.fixture_db import memory_conn
 
 
 def _build_telegram_registry():
@@ -63,13 +15,14 @@ def _add_candidate(conn, game_id, player, market, line, prob_over, snap_id, book
     """Insert a playable candidate. devigged_* holds the sharp-devigged truth —
     set equal to prob_* so the model/sharp agreement gate passes."""
     conn.execute(
-        "INSERT OR IGNORE INTO games VALUES (?, 'Yankees', 'Red Sox', 'Yankee Stadium', 'SCHEDULED', '2024-05-15')",
+        "INSERT OR IGNORE INTO games (game_id, home_team, away_team, venue, status, date) "
+        "VALUES (?, 'Yankees', 'Red Sox', 'Yankee Stadium', 'SCHEDULED', '2024-05-15')",
         (game_id,)
     )
     conn.execute('''
         INSERT INTO projections
         (game_id, player_name, market, projected_mean, prob_over, prob_under, context_json, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, '{}', '2024-05-15T12:00:00')
+        VALUES (?, ?, ?, ?, ?, ?, '{"sample_size": 20}', '2024-05-15T12:00:00')
     ''', (game_id, player, market, line, prob_over, 1.0 - prob_over))
     # odds=2.0 (implied 50%); sharp says prob_over → edge = (prob_over - 0.50)*100
     conn.execute('''
@@ -82,10 +35,7 @@ def _add_candidate(conn, game_id, player, market, line, prob_over, snap_id, book
 
 @pytest.fixture
 def memory_db():
-    conn = sqlite3.connect(':memory:')
-    conn.row_factory = sqlite3.Row
-    _seed_schema(conn)
-    return conn
+    return memory_conn()
 
 
 @patch('src.pipelines.send_alerts.BETTING_ENABLED', True)

@@ -1,71 +1,30 @@
 import pytest
-import sqlite3
 from unittest.mock import patch, AsyncMock
+
+from tests.fixtures.fixture_db import memory_conn
 
 
 @pytest.fixture
 def memory_db():
-    """In-memory DB seeded with a playable projection and matching prop snapshot."""
-    conn = sqlite3.connect(':memory:')
-    conn.row_factory = sqlite3.Row
-    conn.executescript('''
-        CREATE TABLE games (
-            game_id TEXT PRIMARY KEY, home_team TEXT, away_team TEXT,
-            venue TEXT, status TEXT, date TEXT
-        );
-        CREATE TABLE projections (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            game_id TEXT, player_name TEXT, market TEXT,
-            projected_mean REAL, prob_over REAL, prob_under REAL,
-            context_json TEXT, timestamp TEXT,
-            UNIQUE(game_id, player_name, market)
-        );
-        CREATE TABLE prop_snapshots (
-            snapshot_id TEXT PRIMARY KEY, game_id TEXT, player_name TEXT,
-            market TEXT, line REAL, over_odds REAL, under_odds REAL,
-            bookmaker TEXT, timestamp TEXT, devigged_over REAL, devigged_under REAL
-        );
-        CREATE TABLE alerts_sent (
-            alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            player_name TEXT, market TEXT, line REAL, side TEXT,
-            edge REAL, ev REAL, kelly_stake REAL, bookmaker TEXT,
-            odds REAL, opening_odds REAL,
-            model_prob_over REAL, model_prob_under REAL,
-            game_id TEXT, timestamp TEXT,
-            UNIQUE(player_name, market, line, bookmaker)
-        );
-        CREATE TABLE orders (
-            order_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            venue TEXT NOT NULL,
-            alert_id INTEGER,
-            player_name TEXT NOT NULL,
-            market TEXT NOT NULL,
-            line REAL NOT NULL,
-            side TEXT NOT NULL,
-            game_id TEXT,
-            bookmaker TEXT,
-            offered_odds REAL NOT NULL,
-            fill_odds REAL,
-            stake REAL NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            venue_order_id TEXT,
-            placed_at TEXT NOT NULL,
-            filled_at TEXT,
-            notes TEXT
-        );
-    ''')
+    """In-memory DB (full production schema) seeded with a playable projection
+    and matching prop snapshot. Built via memory_conn() so every table/column
+    send_alerts touches (orders, bankroll_snapshots, model_prob_*) is present."""
+    conn = memory_conn()
     conn.execute('''
-        INSERT INTO games VALUES
-        ('g1', 'Yankees', 'Red Sox', 'Yankee Stadium', 'SCHEDULED', '2024-05-15')
+        INSERT INTO games (game_id, home_team, away_team, venue, status, date)
+        VALUES ('g1', 'Yankees', 'Red Sox', 'Yankee Stadium', 'SCHEDULED', '2024-05-15')
     ''')
     conn.execute('''
         INSERT INTO projections
         (game_id, player_name, market, projected_mean, prob_over, prob_under, context_json, timestamp)
-        VALUES ('g1', 'Gerrit Cole', 'pitcher_strikeouts', 7.5, 0.62, 0.38, '{}', '2024-05-15T12:00:00')
+        VALUES ('g1', 'Gerrit Cole', 'pitcher_strikeouts', 7.5, 0.62, 0.38,
+                '{"sample_size": 20}', '2024-05-15T12:00:00')
     ''')
     conn.execute('''
-        INSERT INTO prop_snapshots VALUES
-        ('snap1', 'g1', 'Gerrit Cole', 'pitcher_strikeouts', 6.5, 2.0, 1.8,
+        INSERT INTO prop_snapshots
+        (snapshot_id, game_id, player_name, market, line, over_odds, under_odds,
+         bookmaker, timestamp, devigged_over, devigged_under)
+        VALUES ('snap1', 'g1', 'Gerrit Cole', 'pitcher_strikeouts', 6.5, 2.0, 1.8,
          'draftkings', '2024-05-15T12:00:00', 0.60, 0.40)
     ''')
     conn.commit()

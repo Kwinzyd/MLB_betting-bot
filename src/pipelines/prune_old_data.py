@@ -1,4 +1,5 @@
-from datetime import datetime, timedelta
+from datetime import timedelta
+from src.utils.time_utils import utcnow
 from src.data.db import get_db_connection
 from src.utils.logging_utils import get_logger
 
@@ -31,7 +32,7 @@ def prune_old_data(
     """
     logger.info("Executing pipeline: prune_old_data")
 
-    now = datetime.utcnow()
+    now = utcnow()
 
     hot_cutoff       = (now - timedelta(days=hot_data_days)).isoformat()
     logs_cutoff      = (now - timedelta(days=game_logs_days)).isoformat()

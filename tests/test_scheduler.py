@@ -65,7 +65,9 @@ class TestTick:
         dispatch = AsyncMock()
         last_fire: dict = {}
 
-        await _tick(_dt(14, 15), last_fire, dispatch)
+        # 14:07 hits no slot: run/trigger fire on :00/:15/:30/:45, nightly jobs
+        # are pre-noon. (14:15 is now a real `trigger` slot.)
+        await _tick(_dt(14, 7), last_fire, dispatch)
 
         dispatch.assert_not_called()
 

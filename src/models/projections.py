@@ -1,4 +1,7 @@
+import json
+import math
 import os
+import time
 from typing import List, Dict, Any, Optional
 from src.utils.logging_utils import get_logger
 from src.models.distributions import (
@@ -71,14 +74,17 @@ def _scale_pa_for_game_total(base_pa: float, game_total: float | None) -> float:
     return round(base_pa * scale_factor, 2)
 
 _dispersion_cache: Dict[tuple, Dict] | None = None
+_dispersion_cache_ts: float = 0.0
+_DISPERSION_CACHE_TTL = 3600.0  # reload at most once per hour
 
 
 def _load_dispersion() -> Dict[tuple, Dict]:
-    """Load dispersion_params table into an in-memory dict, cached across calls."""
-    global _dispersion_cache
-    if _dispersion_cache is not None:
+    """Load dispersion_params table into an in-memory dict, refreshed every hour."""
+    global _dispersion_cache, _dispersion_cache_ts
+    now = time.monotonic()
+    if _dispersion_cache is not None and (now - _dispersion_cache_ts) < _DISPERSION_CACHE_TTL:
         return _dispersion_cache
-    _dispersion_cache = {}
+    new_cache: Dict[tuple, Dict] = {}
     try:
         from src.data.db import get_db_connection
         with get_db_connection() as conn:
@@ -87,14 +93,16 @@ def _load_dispersion() -> Dict[tuple, Dict]:
                     "SELECT entity_id, market, alpha, sigma FROM dispersion_params"
                 ).fetchall()
             except Exception:
-                return _dispersion_cache
+                return _dispersion_cache if _dispersion_cache is not None else new_cache
             for r in rows:
-                _dispersion_cache[(r["entity_id"], r["market"])] = {
+                new_cache[(r["entity_id"], r["market"])] = {
                     "alpha": r["alpha"],
                     "sigma": r["sigma"],
                 }
     except Exception:
-        pass
+        return _dispersion_cache if _dispersion_cache is not None else new_cache
+    _dispersion_cache = new_cache
+    _dispersion_cache_ts = now
     return _dispersion_cache
 
 
@@ -105,6 +113,84 @@ def get_dispersion(entity_id: str, market: str) -> Dict:
     if hit:
         return hit
     return cache.get(("__pool__", market), {})
+
+_calib_cache: Dict | None = None
+_calib_cache_ts: float = 0.0
+_CALIB_CACHE_TTL = 3600.0
+
+
+def _load_calibration() -> Dict[str, Dict]:
+    """Load active calibration_params rows as {market: {method, params}} with 1h TTL."""
+    global _calib_cache, _calib_cache_ts
+    now = time.monotonic()
+    if _calib_cache is not None and (now - _calib_cache_ts) < _CALIB_CACHE_TTL:
+        return _calib_cache
+    new_cache: Dict[str, Dict] = {}
+    try:
+        from src.data.db import get_db_connection
+        with get_db_connection() as conn:
+            try:
+                rows = conn.execute(
+                    "SELECT market, method, params_json FROM calibration_params WHERE is_active=1"
+                ).fetchall()
+            except Exception:
+                return _calib_cache if _calib_cache is not None else new_cache
+            for r in rows:
+                try:
+                    new_cache[r["market"]] = {
+                        "method": r["method"],
+                        "params": json.loads(r["params_json"]),
+                    }
+                except Exception:
+                    pass
+    except Exception:
+        return _calib_cache if _calib_cache is not None else new_cache
+    _calib_cache = new_cache
+    _calib_cache_ts = now
+    return _calib_cache
+
+
+def _apply_calibration(prob: float, market: str) -> float:
+    """Apply the active calibration transform (Platt or isotonic) to a probability."""
+    entry = _load_calibration().get(market)
+    if not entry:
+        return prob
+    method = entry["method"]
+    params = entry["params"]
+    if method == "identity" or not params:
+        return prob
+    if method == "platt":
+        a = params.get("a", 1.0)
+        b = params.get("b", 0.0)
+        p = max(1e-6, min(1 - 1e-6, prob))
+        logit_p = math.log(p / (1.0 - p))
+        return 1.0 / (1.0 + math.exp(-(a * logit_p + b)))
+    if method == "isotonic":
+        x = params.get("x_thresholds", [])
+        y = params.get("y_thresholds", [])
+        if not x or not y:
+            return prob
+        if prob <= x[0]:
+            return float(y[0])
+        if prob >= x[-1]:
+            return float(y[-1])
+        import bisect
+        i = bisect.bisect_right(x, prob) - 1
+        x0, x1 = x[i], x[i + 1]
+        y0, y1 = y[i], y[i + 1]
+        return y0 if x1 == x0 else y0 + (y1 - y0) * (prob - x0) / (x1 - x0)
+    return prob
+
+
+def _calibrate_result(result: Dict | None) -> Dict | None:
+    """Apply calibration to prob_over / prob_under in a projection result dict."""
+    if result is None:
+        return None
+    market = result.get("market", "")
+    result["prob_over"] = _apply_calibration(result["prob_over"], market)
+    result["prob_under"] = _apply_calibration(result["prob_under"], market)
+    return result
+
 
 _GLM_MARKETS = (
     "pitcher_strikeouts",
@@ -173,7 +259,7 @@ class ProjectionModel:
             dispersion=disp,
         )
         if glm_result is not None:
-            return glm_result
+            return _calibrate_result(glm_result)
 
         # Sort by date descending
         logs = sorted(pitcher_logs, key=lambda x: x['date'], reverse=True)
@@ -210,13 +296,13 @@ class ProjectionModel:
 
         # Final projection — ump_k_factor multiplies the raw K projection directly.
         # A large-zone umpire (factor > 1) boosts Ks; a tight zone (factor < 1) suppresses.
-        projected_k = (blended_k_per_9 / 9.0) * proj_ip * opp_adj * park_adj * ump_k_factor
+        projected_k = max(0.0, (blended_k_per_9 / 9.0) * proj_ip * opp_adj * park_adj * ump_k_factor)
 
         prob_over, prob_under = get_probabilities(
             projected_k, line, "pitcher_strikeouts", alpha=disp.get("alpha"),
         )
 
-        return {
+        return _calibrate_result({
             "player_name": None,  # set by caller
             "market": "pitcher_strikeouts",
             "line": line,
@@ -240,14 +326,15 @@ class ProjectionModel:
                 "venue": venue,
                 "weather": weather,
             },
-        }
+        })
 
     def project_pitcher_earned_runs(self, pitcher_logs: List[Dict], opponent_runs_per_game: float,
                                     venue: str, line: float,
                                     weather: dict = None,
                                     ump_k_factor: float = 1.0,
                                     extra_features: dict = None,
-                                    player_id: int = None) -> Optional[Dict]:
+                                    player_id: int = None,
+                                    bp_weight: float = 0.10) -> Optional[Dict]:
         """Project pitcher earned runs for a game."""
         if not pitcher_logs or len(pitcher_logs) < 3:
             return None
@@ -266,7 +353,7 @@ class ProjectionModel:
             dispersion=disp,
         )
         if glm_result is not None:
-            return glm_result
+            return _calibrate_result(glm_result)
 
         logs = sorted(pitcher_logs, key=lambda x: x['date'], reverse=True)
 
@@ -306,15 +393,15 @@ class ProjectionModel:
         
         # Bullpen effect: a bad bullpen allows more of the starter's inherited runners to score
         pitcher_bullpen_era = extra_features.get('pitcher_bullpen_era', LEAGUE_AVG_RUNS_PER_GAME) if extra_features else LEAGUE_AVG_RUNS_PER_GAME
-        bp_adj = 1.0 + ((pitcher_bullpen_era / LEAGUE_AVG_RUNS_PER_GAME) - 1.0) * bp_weight if LEAGUE_AVG_RUNS_PER_GAME > 0 else 1.0
+        bp_adj = (1.0 + ((pitcher_bullpen_era / LEAGUE_AVG_RUNS_PER_GAME) - 1.0) * bp_weight) if LEAGUE_AVG_RUNS_PER_GAME > 0 else 1.0
         
-        projected_er = (blended_era / 9.0) * proj_ip * opp_adj * park_adj * ump_er_factor * bp_adj
+        projected_er = max(0.0, (blended_era / 9.0) * proj_ip * opp_adj * park_adj * ump_er_factor * bp_adj)
 
         prob_over, prob_under = get_probabilities(
             projected_er, line, "pitcher_earned_runs", alpha=disp.get("alpha"),
         )
 
-        return {
+        return _calibrate_result({
             "player_name": None,
             "market": "pitcher_earned_runs",
             "line": line,
@@ -340,7 +427,7 @@ class ProjectionModel:
                 "venue": venue,
                 "weather": weather,
             },
-        }
+        })
 
     def project_batter_stat(self, batter_logs: List[Dict], stat_type: str,
                             pitcher_hand: str, batter_hand: str,
@@ -386,7 +473,7 @@ class ProjectionModel:
             game_total=game_total,
         )
         if glm_result is not None:
-            return glm_result
+            return _calibrate_result(glm_result)
 
         # --- Per-PA rates (not per-game) ---
         # Season per-PA rate
@@ -429,10 +516,10 @@ class ProjectionModel:
 
         # Bullpen effect: bad opposing bullpen gives batters more late-inning opportunities
         opp_bullpen_era = extra_features.get('opp_bullpen_era', LEAGUE_AVG_RUNS_PER_GAME) if extra_features else LEAGUE_AVG_RUNS_PER_GAME
-        bp_adj = 1.0 + ((opp_bullpen_era / LEAGUE_AVG_RUNS_PER_GAME) - 1.0) * bp_weight if LEAGUE_AVG_RUNS_PER_GAME > 0 else 1.0
+        bp_adj = (1.0 + ((opp_bullpen_era / LEAGUE_AVG_RUNS_PER_GAME) - 1.0) * bp_weight) if LEAGUE_AVG_RUNS_PER_GAME > 0 else 1.0
 
         # Final projection: rate * opportunities * adjustments
-        projected = blended_per_pa * projected_pa * platoon_adj * park_adj * bp_adj
+        projected = max(0.0, blended_per_pa * projected_pa * platoon_adj * park_adj * bp_adj)
 
         market_key = self._stat_type_to_market(stat_type)
         pi0 = _compute_hr_pi0(market_key, logs, park_adj, extra_features, weather)
@@ -450,7 +537,7 @@ class ProjectionModel:
                 pi0=pi0,
             )
 
-        return {
+        return _calibrate_result({
             "player_name": None,
             "market": market_key,
             "line": line,
@@ -481,7 +568,7 @@ class ProjectionModel:
                 "venue": venue,
                 "weather": weather,
             },
-        }
+        })
 
     # ------------------------------------------------------------------
     # GLM branch: shared helpers for pitcher and batter markets

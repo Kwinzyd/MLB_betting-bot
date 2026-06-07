@@ -1,12 +1,14 @@
 import pytest
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import timedelta
 from unittest.mock import patch
+
+from src.utils.time_utils import utcnow
 
 
 def iso(days_ago: int) -> str:
     """Return an ISO timestamp string `days_ago` days in the past."""
-    return (datetime.utcnow() - timedelta(days=days_ago)).isoformat()
+    return (utcnow() - timedelta(days=days_ago)).isoformat()
 
 
 @pytest.fixture

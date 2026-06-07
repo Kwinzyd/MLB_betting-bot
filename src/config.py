@@ -83,6 +83,22 @@ ALT_LINE_MAX_DISTANCE = float(os.getenv("ALT_LINE_MAX_DISTANCE", "1.0"))
 # disable (e.g. for backtests where exact Kelly figures matter).
 STAKE_ROUNDING_INCREMENT = float(os.getenv("STAKE_ROUNDING_INCREMENT", "5.0"))
 
+# Portfolio-level Kelly: pairwise return correlations used in covariance matrix.
+# Tune these if you have empirical data; defaults are conservative estimates.
+# Same team, same side (e.g. two batter props for the same team):
+PORTFOLIO_CORR_SAME_TEAM = float(os.getenv("PORTFOLIO_CORR_SAME_TEAM", "0.55"))
+# Same game, pitcher prop vs batter prop on the same team (inverse relationship):
+PORTFOLIO_CORR_PITCHER_BATTER = float(os.getenv("PORTFOLIO_CORR_PITCHER_BATTER", "-0.25"))
+# Same game, opposite teams (run environment correlation):
+PORTFOLIO_CORR_SAME_GAME_OPP_TEAM = float(os.getenv("PORTFOLIO_CORR_SAME_GAME_OPP_TEAM", "0.10"))
+# Max total bankroll fraction deployed across all simultaneous bets.
+# At 20% of $1000 = $200 max in play at once. Prevents correlated wipeout.
+PORTFOLIO_TOTAL_EXPOSURE_CAP = float(os.getenv("PORTFOLIO_TOTAL_EXPOSURE_CAP", "0.20"))
+
+# Bookmaker bias detection. avg_bias above this threshold (in devigged prob units)
+# triggers a +0.5% edge credit in scan_props.
+BOOKMAKER_BIAS_THRESHOLD = float(os.getenv("BOOKMAKER_BIAS_THRESHOLD", "0.02"))
+
 # Dispersion fitting: per-entity NB alpha / Normal sigma with EB shrinkage.
 DISPERSION_MIN_OBS = int(os.getenv("DISPERSION_MIN_OBS", "10"))
 DISPERSION_PRIOR_K = int(os.getenv("DISPERSION_PRIOR_K", "30"))
@@ -115,6 +131,7 @@ ODDS_API_TEAM_ABBREV = {
     "New York Mets": "NYM",
     "New York Yankees": "NYY",
     "Oakland Athletics": "OAK",
+    "Athletics": "OAK",
     "Philadelphia Phillies": "PHI",
     "Pittsburgh Pirates": "PIT",
     "San Diego Padres": "SD",
@@ -211,3 +228,20 @@ HR_PI0_BETA_WIND = 0.04
 # same-team batter-under pairs. Cap is a model-error guardrail.
 JOINT_PA_ENABLED = os.getenv("JOINT_PA_ENABLED", "true").lower() in ("1", "true", "yes")
 JOINT_PA_BOOST_CAP = float(os.getenv("JOINT_PA_BOOST_CAP", "1.25"))
+
+# Live State Machine (in-game prop sniping)
+# Minimum EV to fire a live Telegram alert. Higher bar than singles because
+# live lines move quickly and model latency adds uncertainty.
+LIVE_MIN_EV = float(os.getenv("LIVE_MIN_EV", "0.08"))   # 8% EV default
+# Seconds between BDL live-game polls. 20s is safe for BDL free tier.
+LIVE_POLL_INTERVAL_SECONDS = int(os.getenv("LIVE_POLL_INTERVAL_SECONDS", "20"))
+
+# Fail fast at import time if critical keys are missing rather than crashing
+# deep inside an HTTP call with a confusing error.
+_REQUIRED_ENV_VARS = ["ODDS_API_KEY", "BDL_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
+_missing = [k for k in _REQUIRED_ENV_VARS if not globals().get(k)]
+if _missing:
+    raise RuntimeError(
+        f"Missing required environment variable(s): {', '.join(_missing)}. "
+        "Set them in your .env file or shell before running."
+    )

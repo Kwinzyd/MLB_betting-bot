@@ -57,11 +57,13 @@ def test_execution_venue_default_cancel_returns_false():
     from src.clients.execution.paper_exchange import PaperExchange
     import asyncio
     venue = PaperExchange()
-    assert asyncio.get_event_loop().run_until_complete(venue.cancel_order("x")) is False
+    # asyncio.run() spins up a fresh loop each call; get_event_loop() would reuse
+    # the loop pytest-asyncio already closed, breaking under suite ordering on 3.13.
+    assert asyncio.run(venue.cancel_order("x")) is False
 
 
 def test_execution_venue_default_open_orders_empty():
     from src.clients.execution.paper_exchange import PaperExchange
     import asyncio
     venue = PaperExchange()
-    assert asyncio.get_event_loop().run_until_complete(venue.get_open_orders()) == []
+    assert asyncio.run(venue.get_open_orders()) == []

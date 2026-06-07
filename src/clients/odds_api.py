@@ -122,6 +122,9 @@ class OddsAPIClient:
         await asyncio.sleep(delay)
         response = await self.client.get(url, params=params, timeout=10.0)
         self._log_quota(response)
+        if response.status_code == 404:
+            logger.warning(f"Event {event_id} not found (HTTP 404). It may have completed or been removed.")
+            return None
         if response.status_code == 429:
             msg = f"🚨 <b>Rate Limit Hit</b>\nOdds API rate limit (HTTP 429) reached on /odds endpoint for event {event_id}."
             logger.warning(msg)
