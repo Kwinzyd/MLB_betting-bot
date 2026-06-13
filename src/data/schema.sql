@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS players (
     throws TEXT,
     active BOOLEAN DEFAULT 1
 );
+CREATE INDEX IF NOT EXISTS idx_players_team ON players(team_id);
 
 CREATE TABLE IF NOT EXISTS injury_reports (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,6 +67,7 @@ CREATE TABLE IF NOT EXISTS pitcher_game_logs (
     pitches_thrown INTEGER,
     PRIMARY KEY (game_id, player_id)
 );
+CREATE INDEX IF NOT EXISTS idx_pgl_player_date ON pitcher_game_logs(player_id, date);
 
 CREATE TABLE IF NOT EXISTS batter_game_logs (
     game_id INTEGER,
@@ -84,6 +86,7 @@ CREATE TABLE IF NOT EXISTS batter_game_logs (
     plate_appearances INTEGER,
     PRIMARY KEY (game_id, player_id)
 );
+CREATE INDEX IF NOT EXISTS idx_bgl_player_date ON batter_game_logs(player_id, date);
 
 CREATE TABLE IF NOT EXISTS daily_lineups (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -136,14 +136,22 @@ def _insert_batter_log(conn, gid, player_id, game_date, player_stat, player_name
         hits = int(player_stat.get('hits', 0) or 0)
         doubles = int(player_stat.get('doubles', 0) or 0)
         triples = int(player_stat.get('triples', 0) or 0)
-        home_runs = int(player_stat.get('home_runs', 0) or 0)
+        # BDL MLB reports home runs under 'hr'; 'home_runs' was always absent,
+        # which silently zeroed every HR (and undercounted total_bases by 4 per
+        # HR). Keep 'home_runs' as a fallback for other payload shapes.
+        home_runs = int(player_stat.get('hr') or player_stat.get('home_runs') or 0)
         if hits < doubles + triples + home_runs:
             logger.warning(
                 "Inconsistent hit breakdown for %s game %s — clamping singles to 0",
                 player_name, player_stat.get('game_id', '?'),
             )
         singles = max(0, hits - doubles - triples - home_runs)
-        total_bases = singles + (2 * doubles) + (3 * triples) + (4 * home_runs)
+        # Prefer BDL's authoritative total_bases; fall back to computing it.
+        tb_provided = player_stat.get('total_bases')
+        if tb_provided not in (None, ''):
+            total_bases = int(tb_provided)
+        else:
+            total_bases = singles + (2 * doubles) + (3 * triples) + (4 * home_runs)
 
         conn.execute('''
             INSERT OR IGNORE INTO batter_game_logs

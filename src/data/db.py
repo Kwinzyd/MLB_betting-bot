@@ -213,6 +213,19 @@ def _migrate_missing_indexes(conn):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_games_date ON games(date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_games_status ON games(status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_placed_at ON orders(placed_at)")
+    # Game-log lookups by (player_id, date) drive every rolling-window query in
+    # projections and the training feature builder (h2h, bullpen, recency).
+    # Without these the queries full-SCAN the log tables once per training row.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pgl_player_date ON pitcher_game_logs(player_id, date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_bgl_player_date ON batter_game_logs(player_id, date)")
+    # Bullpen factor joins players by team_id.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_players_team ON players(team_id)")
+    # prop_snapshots hot path: steam/CLV/opening-line lookups filter on
+    # (game_id, player_name, market, line, bookmaker).
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prop_snapshots_lookup "
+        "ON prop_snapshots(game_id, player_name, market, line, bookmaker)"
+    )
 
 
 def _migrate_players_mlb_id(conn):

@@ -100,6 +100,38 @@ async def test_sync_stats_batter_log(mock_client_cls, mock_get_db, memory_db):
     assert row['total_bases'] == 6
 
 
+# Real BDL MLB batter shape: home runs under 'hr', total_bases provided directly.
+BATTER_STAT_BDL = {
+    'player': {'id': 21, 'first_name': 'Juan', 'last_name': 'Soto',
+               'position': 'OF', 'bats': 'L', 'throws': 'L'},
+    'team': {'id': 1},
+    'game': {'id': 999, 'date': '2024-05-01'},
+    'innings_pitched': None,
+    'at_bats': 4, 'hits': 3, 'doubles': 0, 'triples': 0, 'hr': 2,
+    'total_bases': 9, 'runs': 2, 'rbi': 4, 'bb': 1, 'k': 1, 'plate_appearances': 5,
+}
+
+
+@patch('src.pipelines.sync_stats.get_db_connection')
+@patch('src.pipelines.sync_stats.MLBStatsClient')
+async def test_sync_stats_batter_hr_from_bdl_fields(mock_client_cls, mock_get_db, memory_db):
+    """Home runs are read from BDL's 'hr' field (not 'home_runs') and total_bases
+    is taken from BDL's authoritative field — the bug that zeroed every HR and
+    undercounted total_bases."""
+    mock_client_cls.return_value = _make_bdl_client(PITCHER_STAT, BATTER_STAT_BDL)
+    mock_get_db.return_value.__enter__.return_value = memory_db
+    mock_get_db.return_value.__exit__.return_value = None
+
+    from src.pipelines.sync_stats import sync_stats
+    await sync_stats()
+
+    row = memory_db.execute("SELECT * FROM batter_game_logs WHERE player_id = 21").fetchone()
+    assert row is not None
+    assert row['home_runs'] == 2          # from 'hr'
+    assert row['total_bases'] == 9        # 3 hits, 2 HR -> 1 single(1) + 2 HR(8) = 9
+    assert row['hits'] == 3
+
+
 @patch('src.pipelines.sync_stats.get_db_connection')
 @patch('src.pipelines.sync_stats.MLBStatsClient')
 async def test_sync_stats_upserts_players(mock_client_cls, mock_get_db, memory_db):
