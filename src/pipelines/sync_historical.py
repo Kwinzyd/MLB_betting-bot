@@ -27,13 +27,18 @@ _COMPLETED_STATUSES = frozenset({
 _FINISHED_STATUSES = frozenset({'Final', 'final', 'COMPLETED', 'STATUS_FINAL'})
 
 
-async def _sync_historical_async(seasons: List[int], chunk_size: int) -> dict:
+async def _sync_historical_async(seasons: List[int], chunk_size: int,
+                                 requests_per_second: float = 2.0) -> dict:
     """
     All BDL I/O runs inside a single async context so the httpx.AsyncClient
     is created, used, and closed within one event loop — multiple asyncio.run()
     calls would close and re-open the loop, breaking the persistent httpx client.
+
+    Backfill is a bulk operation, so it uses a faster request rate than the
+    live `sync_stats` default (1 req / 14 s). The client's own 429 backoff still
+    protects against overshooting BDL's limit; 2 req/s ran clean on Goat tier.
     """
-    client = MLBStatsClient()
+    client = MLBStatsClient(requests_per_second=requests_per_second)
 
     # Seed teams table
     all_teams = await client.get_teams()
@@ -168,7 +173,8 @@ async def _sync_historical_async(seasons: List[int], chunk_size: int) -> dict:
     return totals
 
 
-def sync_historical(seasons: Iterable[int], chunk_size: int = 50) -> dict:
+def sync_historical(seasons: Iterable[int], chunk_size: int = 50,
+                    requests_per_second: float = 2.0) -> dict:
     """
     Backfill games + game logs for the given MLB seasons.
 
@@ -179,4 +185,4 @@ def sync_historical(seasons: Iterable[int], chunk_size: int = 50) -> dict:
     """
     seasons = list(seasons)
     logger.info(f"Executing pipeline: sync_historical for seasons={seasons}")
-    return asyncio.run(_sync_historical_async(seasons, chunk_size))
+    return asyncio.run(_sync_historical_async(seasons, chunk_size, requests_per_second))
