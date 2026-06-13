@@ -11,11 +11,28 @@ Key design constraints:
     integer bdl_game_id. _get_actual_result() always resolves via games table.
   - No historical weather is stored, so static park factors are used throughout.
     Live projections will differ slightly from backtested ones for outdoor parks.
+
+Truth source and look-ahead:
+  - Edges are scored ONLY against a sharp two-way devigged price at the line
+    (prop_snapshots.devigged_over/under, populated for sharp books). Snapshots
+    without a devig are kept for calibration/Brier but never become bets — we
+    never substitute a 0.5 "true probability", which would manufacture an edge
+    against every soft-book line.
+  - By default (`use_trained_models=False`) the engine runs the weighted-average
+    projection with calibration OFF, because the trained GLM and the calibration
+    params are fit on data that postdates the snapshots being replayed. Pass
+    `use_trained_models=True` only to inspect the *current* champion's behavior,
+    accepting that it is in-sample.
+  - Residual, un-removed look-ahead (documented, not yet fixed): dispersion
+    params (dispersion_params) and team offensive stats (team_stats) are global,
+    slowly-varying values read as of "now", not as of game_date. They shift
+    results slightly but do not manufacture edges the way the 0.5 substitution did.
 """
 
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -25,6 +42,10 @@ from src.models.projections import ProjectionModel
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
+# A models dir guaranteed empty so ProjectionModel loads no GLM — used by the
+# default out-of-sample backtest path to force the weighted-average algorithm.
+_NO_MODELS_DIR = os.path.join(os.path.dirname(__file__), "__no_models__")
 
 # Markets the engine knows how to project and resolve.
 SUPPORTED_MARKETS = frozenset({
@@ -94,13 +115,22 @@ class BacktestEngine:
         min_edge: float = 0.05,
         kelly_fraction: float = KELLY_FRACTION,
         markets: Optional[List[str]] = None,
+        use_trained_models: bool = False,
     ):
         self.start_date = start_date
         self.end_date = end_date
         self.min_edge = min_edge
         self.kelly_fraction = kelly_fraction
         self.markets = [m for m in (markets or SUPPORTED_MARKETS) if m in SUPPORTED_MARKETS]
-        self._proj = ProjectionModel()
+        self.use_trained_models = use_trained_models
+        if use_trained_models:
+            # In-sample: the current champion GLM + active calibration params.
+            self._proj = ProjectionModel()
+        else:
+            # Out-of-sample-safe: weighted-average algorithm, calibration off.
+            self._proj = ProjectionModel(
+                models_dir=_NO_MODELS_DIR, apply_calibration=False
+            )
 
     # ------------------------------------------------------------------
     # Public interface
@@ -113,10 +143,16 @@ class BacktestEngine:
         had enough historical data to project.
         """
         snapshots = self._load_snapshots()
+        mode = "TRAINED (in-sample)" if self.use_trained_models else "weighted-avg (calibration off)"
         logger.info(
             f"Backtesting {len(snapshots)} opening-line snapshots "
-            f"({self.start_date} → {self.end_date})."
+            f"({self.start_date} → {self.end_date}); model={mode}."
         )
+        if self.use_trained_models:
+            logger.warning(
+                "Backtest is running with TRAINED models: GLM + calibration are "
+                "fit on data inside this window — results are in-sample, not predictive."
+            )
 
         records: List[BacktestRecord] = []
         with get_db_connection() as conn:
@@ -195,18 +231,33 @@ class BacktestEngine:
 
         model_prob_over = projection['prob_over']
         model_prob_under = projection['prob_under']
-        devigged_over = snap['devigged_over'] or 0.5
-        devigged_under = snap['devigged_under'] or 0.5
 
-        edge_over = model_prob_over - devigged_over
-        edge_under = model_prob_under - devigged_under
-
-        if edge_over >= edge_under:
-            best_side, best_edge = 'over', edge_over
-            bet_odds, bet_prob = snap['over_odds'], model_prob_over
+        # Edge requires a sharp two-way devigged truth at this line. Without it
+        # there is no defensible "true probability" — substituting 0.5 would
+        # manufacture an edge against every soft-book line. Such rows are still
+        # kept for calibration/Brier (lean = higher model prob) but can never
+        # become bets: NaN edges never clear the min_edge gate below.
+        has_devig = snap['devigged_over'] is not None and snap['devigged_under'] is not None
+        if has_devig:
+            devigged_over = snap['devigged_over']
+            devigged_under = snap['devigged_under']
+            edge_over = model_prob_over - devigged_over
+            edge_under = model_prob_under - devigged_under
+            if edge_over >= edge_under:
+                best_side, best_edge = 'over', edge_over
+                bet_odds, bet_prob = snap['over_odds'], model_prob_over
+            else:
+                best_side, best_edge = 'under', edge_under
+                bet_odds, bet_prob = snap['under_odds'], model_prob_under
         else:
-            best_side, best_edge = 'under', edge_under
-            bet_odds, bet_prob = snap['under_odds'], model_prob_under
+            devigged_over = devigged_under = math.nan
+            edge_over = edge_under = math.nan
+            if model_prob_over >= model_prob_under:
+                best_side, best_edge = 'over', math.nan
+                bet_odds, bet_prob = snap['over_odds'], model_prob_over
+            else:
+                best_side, best_edge = 'under', math.nan
+                bet_odds, bet_prob = snap['under_odds'], model_prob_under
 
         # Actual result — requires translating to bdl_game_id
         actual_value = self._get_actual_result(

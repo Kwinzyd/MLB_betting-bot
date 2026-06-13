@@ -12,6 +12,7 @@ Each test pins one corrected behavior:
 """
 import asyncio
 import logging
+import math
 import sqlite3
 from unittest.mock import patch, AsyncMock
 
@@ -265,6 +266,58 @@ class TestBiasBoostGate:
         # sample_size=5 < MIN_SAMPLE_SIZE -> two kill reasons -> no rescue.
         text = self._run_scan(sample_size=5, caplog=caplog)
         assert "EDGE FOUND" not in text
+
+
+# ---------------------------------------------------------------------------
+# Backtest: no fabricated edges without a sharp devigged truth
+# ---------------------------------------------------------------------------
+
+class TestBacktestNoFabricatedEdge:
+    def _engine(self):
+        from src.backtesting.engine import BacktestEngine
+        return BacktestEngine('2025-04-01', '2025-04-30')
+
+    def _snap(self, devig_over=None, devig_under=None):
+        return {
+            'game_id': 'g1', 'player_name': 'Cole', 'market': 'pitcher_strikeouts',
+            'bookmaker': 'draftkings', 'line': 6.5,
+            'over_odds': 2.0, 'under_odds': 1.8,
+            'devigged_over': devig_over, 'devigged_under': devig_under,
+            'game_date': '2025-04-10', 'bdl_game_id': 1001,
+            'venue': 'x', 'home_team': 'Yankees', 'away_team': 'Red Sox',
+        }
+
+    def test_no_devig_snapshot_is_not_a_bet(self):
+        eng = self._engine()
+        with patch.object(eng, '_lookup_player', return_value={'player_id': 1, 'team_id': 1, 'name': 'Cole', 'bats': 'R'}), \
+             patch.object(eng, '_build_historical_projection',
+                          return_value={'prob_over': 0.99, 'prob_under': 0.01,
+                                        'projected_mean': 9.0, 'sample_size': 30}), \
+             patch.object(eng, '_get_actual_result', return_value=10.0):
+            rec = eng._process_snapshot(None, self._snap(devig_over=None, devig_under=None))
+        # Even a 99% model prob cannot become a bet without a sharp devigged truth.
+        assert rec is not None
+        assert rec.flat_pnl is None
+        assert math.isnan(rec.best_edge)
+
+    def test_devig_snapshot_can_be_a_bet(self):
+        eng = self._engine()
+        with patch.object(eng, '_lookup_player', return_value={'player_id': 1, 'team_id': 1, 'name': 'Cole', 'bats': 'R'}), \
+             patch.object(eng, '_build_historical_projection',
+                          return_value={'prob_over': 0.70, 'prob_under': 0.30,
+                                        'projected_mean': 8.0, 'sample_size': 30}), \
+             patch.object(eng, '_get_actual_result', return_value=10.0):
+            rec = eng._process_snapshot(None, self._snap(devig_over=0.55, devig_under=0.45))
+        # 0.70 - 0.55 = 0.15 edge >= min_edge(0.05) → a bet.
+        assert rec.best_side == 'over'
+        assert rec.best_edge == pytest.approx(0.15)
+        assert rec.flat_pnl is not None
+
+    def test_default_mode_loads_no_trained_models(self):
+        eng = self._engine()
+        assert eng.use_trained_models is False
+        assert eng._proj._apply_calibration is False
+        assert all(v is None for v in eng._proj._glm.values())
 
 
 # ---------------------------------------------------------------------------

@@ -76,6 +76,9 @@ def main():
     backtest_parser.add_argument('--market', action='append', dest='markets', metavar='MARKET',
                                  help="Restrict to specific market(s); repeatable. "
                                       "E.g. --market pitcher_strikeouts --market batter_hits")
+    backtest_parser.add_argument('--use-trained-models', action='store_true',
+                                 help="Use the current champion GLM + calibration (IN-SAMPLE; "
+                                      "default is the out-of-sample-safe weighted-average model)")
 
     # backfill + train flags
     backfill_parser = subparsers.add_parser('backfill', help="Backfill historical game logs")
@@ -268,6 +271,7 @@ def main():
                 end_date=args.end,
                 min_edge=min_edge,
                 markets=args.markets,
+                use_trained_models=args.use_trained_models,
             )
             records = engine.run()
             summary = compute_summary(records, args.start, args.end, min_edge)

@@ -53,6 +53,28 @@ def test_registry_all_disabled_is_empty():
     assert build_venue_registry() == []
 
 
+def test_polymarket_skips_cleanly_without_token_mapping():
+    """A real edge (stake nested under kelly) reaches the token check — proving
+    the stake key path is correct — and skips cleanly when no token is mapped,
+    instead of erroring or faking a fill."""
+    import asyncio
+    from src.clients.execution.polymarket_exchange import PolymarketExchangeVenue
+    venue = PolymarketExchangeVenue()
+    record = asyncio.run(venue.place_order(_make_edge(stake=12.0), _make_context()))
+    assert record["venue"] == "polymarket"
+    assert record["status"] == "skipped"
+    assert "token" in (record["notes"] or "").lower()
+
+
+def test_polymarket_zero_stake_skips_before_token_check():
+    import asyncio
+    from src.clients.execution.polymarket_exchange import PolymarketExchangeVenue
+    venue = PolymarketExchangeVenue()
+    record = asyncio.run(venue.place_order(_make_edge(stake=0.0), _make_context()))
+    assert record["status"] == "skipped"
+    assert "stake" in (record["notes"] or "").lower()
+
+
 def test_execution_venue_default_cancel_returns_false():
     from src.clients.execution.paper_exchange import PaperExchange
     import asyncio

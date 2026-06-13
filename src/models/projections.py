@@ -182,15 +182,21 @@ def _apply_calibration(prob: float, market: str) -> float:
     return prob
 
 
-def _calibrate_result(result: Dict | None) -> Dict | None:
+def _calibrate_result(result: Dict | None, enabled: bool = True) -> Dict | None:
     """Apply calibration to the over probability and derive the under.
 
     Calibrating both sides through the same monotone map breaks
     P(over) + P(under) = 1 (both sides of a market could clear the edge bar
     at once). Calibrate one side, take the complement for the other.
+
+    `enabled=False` skips calibration entirely — used by the backtest, where
+    calibration params are fit on settled bets that postdate every snapshot
+    (applying them would be lookahead).
     """
     if result is None:
         return None
+    if not enabled:
+        return result
     market = result.get("market", "")
     calibrated_over = _apply_calibration(result["prob_over"], market)
     calibrated_over = max(0.0, min(1.0, calibrated_over))
@@ -211,10 +217,15 @@ _MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__fil
 
 
 class ProjectionModel:
-    def __init__(self, models_dir: str = None):
+    def __init__(self, models_dir: str = None, apply_calibration: bool = True):
         self._models_dir = models_dir or _MODELS_DIR
+        self._apply_calibration = apply_calibration
         self._glm: Dict[str, Any] = {m: None for m in _GLM_MARKETS}
         self._load_glm_models()
+
+    def _finalize(self, result: Dict | None) -> Dict | None:
+        """Apply (or skip) probability calibration per this model's config."""
+        return _calibrate_result(result, enabled=self._apply_calibration)
 
     def _load_glm_models(self):
         """Load any serialized PoissonGLM models from disk; silently skip missing ones."""
@@ -266,7 +277,7 @@ class ProjectionModel:
             dispersion=disp,
         )
         if glm_result is not None:
-            return _calibrate_result(glm_result)
+            return self._finalize(glm_result)
 
         # Sort by date descending
         logs = sorted(pitcher_logs, key=lambda x: x['date'], reverse=True)
@@ -309,7 +320,7 @@ class ProjectionModel:
             projected_k, line, "pitcher_strikeouts", alpha=disp.get("alpha"),
         )
 
-        return _calibrate_result({
+        return self._finalize({
             "player_name": None,  # set by caller
             "market": "pitcher_strikeouts",
             "line": line,
@@ -361,7 +372,7 @@ class ProjectionModel:
             dispersion=disp,
         )
         if glm_result is not None:
-            return _calibrate_result(glm_result)
+            return self._finalize(glm_result)
 
         logs = sorted(pitcher_logs, key=lambda x: x['date'], reverse=True)
 
@@ -409,7 +420,7 @@ class ProjectionModel:
             projected_er, line, "pitcher_earned_runs", alpha=disp.get("alpha"),
         )
 
-        return _calibrate_result({
+        return self._finalize({
             "player_name": None,
             "market": "pitcher_earned_runs",
             "line": line,
@@ -482,7 +493,7 @@ class ProjectionModel:
             game_total=game_total,
         )
         if glm_result is not None:
-            return _calibrate_result(glm_result)
+            return self._finalize(glm_result)
 
         # --- Per-PA rates (not per-game) ---
         # Season per-PA rate
@@ -546,7 +557,7 @@ class ProjectionModel:
                 pi0=pi0,
             )
 
-        return _calibrate_result({
+        return self._finalize({
             "player_name": None,
             "market": market_key,
             "line": line,

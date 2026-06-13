@@ -136,19 +136,36 @@ class PolymarketExchangeVenue(ExecutionVenue):
 
     async def place_order(self, edge: dict, context: dict) -> dict:
         """
-        Executes Polymarket trades natively natively resolving VWAP and routing IOC/Maker.
-        Expects context['token_id'] representing the target Polymarket YES token.
+        Execute a Polymarket trade: resolve VWAP, route FOK/Maker.
+
+        Requires context['token_id'] to be the Polymarket YES token for the
+        bet's SIDE (context['side']). Mapping an MLB player prop to a Polymarket
+        token is not yet implemented — most MLB props have no Polymarket market —
+        so absent a token this returns a clean 'skipped' (a no-op), never a fake
+        fill. The edge contract matches the other venues: stake lives at
+        edge['kelly']['recommended_stake']; the model/sharp probability at
+        edge['sharp_prob'] (falling back to edge['model_prob']).
         """
-        target_stake = edge.get('recommended_stake', 0.0)
+        kelly = edge.get('kelly') or {}
+        target_stake = kelly.get('recommended_stake', edge.get('recommended_stake', 0.0)) or 0.0
         if target_stake <= 0:
             return empty_record(self.name, status="skipped", notes="Stake is zero")
 
         token_id = context.get('token_id')
         if not token_id:
-            logger.error("No token_id provided for Polymarket execution.")
-            return empty_record(self.name, status="failed", notes="Missing token_id")
+            # Expected common case (no Polymarket market for this prop): skip
+            # quietly-but-visibly rather than erroring or faking a fill.
+            logger.warning(
+                "Polymarket: no token mapped for %s %s %s — skipping (token "
+                "resolution not yet implemented).",
+                context.get('player_name'), context.get('market'), context.get('side'),
+            )
+            return empty_record(self.name, status="skipped", notes="no Polymarket token mapped")
 
-        model_prob = edge.get('prob', 0.5)
+        # Probability of the side we're backing — Polymarket price ≈ probability.
+        model_prob = edge.get('sharp_prob')
+        if model_prob is None:
+            model_prob = edge.get('model_prob', 0.5)
         min_edge = float(context.get('SGP_MIN_EDGE', 0.05))
 
         # 1. Fetch live CLOB book

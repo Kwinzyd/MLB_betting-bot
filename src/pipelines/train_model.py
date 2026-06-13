@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import os
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -39,7 +39,13 @@ _PITCHER_MARKETS = ("pitcher_strikeouts", "pitcher_earned_runs")
 _BATTER_MARKETS = ("batter_hits", "batter_total_bases", "batter_home_runs")
 _ALL_MARKETS = _PITCHER_MARKETS + _BATTER_MARKETS
 
-_VAL_SPLIT_DATE = "2025-01-01"
+# Rolling validation: the most recent _VAL_WINDOW_DAYS of available data are
+# held out for promotion. A static cutoff ("2025-01-01") silently grew the val
+# set to >1.5 seasons and made champion-vs-challenger MAE incomparable across
+# runs as new data landed. _INNER_VAL_WINDOW_DAYS carves a SEPARATE early-stop /
+# Optuna slice from the training rows so tuning never touches the promotion set.
+_VAL_WINDOW_DAYS = 45
+_INNER_VAL_FRACTION = 0.15
 
 _MARKET_TO_TARGET = {
     "pitcher_strikeouts": ("pitcher_game_logs", "strikeouts", "innings_pitched"),
@@ -52,6 +58,33 @@ _MARKET_TO_TARGET = {
 _MODELS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "models"
 )
+
+
+def _rolling_split_date(dates: List[str], window_days: int) -> str | None:
+    """Date D such that rows with date >= D are the most recent window_days
+    of available data (the promotion holdout). None if no valid dates."""
+    valid = [d for d in dates if d]
+    if not valid:
+        return None
+    max_d = datetime.strptime(max(valid)[:10], "%Y-%m-%d")
+    return (max_d - timedelta(days=window_days)).strftime("%Y-%m-%d")
+
+
+def _season_from_date(game_date) -> int | None:
+    """Year of a YYYY-MM-DD game date, used to key season-level Statcast.
+
+    Returning the row's own season (not the current year) is what stops the
+    feature builder from stamping the current season's Statcast leaderboard
+    onto a years-old game — pure future leakage. When no Statcast row exists
+    for that season the builder falls back to neutral defaults, so historical
+    rows simply carry zeros rather than future stats.
+    """
+    if not game_date:
+        return None
+    try:
+        return int(str(game_date)[:4])
+    except (ValueError, TypeError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -93,15 +126,25 @@ def _build_pitcher_dataset(market: str) -> Tuple[np.ndarray, np.ndarray, np.ndar
                     continue  # need some history
                 prior = list(reversed(logs[:i]))  # most recent first
                 target = row.get(target_col) or 0
+                # Exposure = the ACTUAL innings/PAs the count was generated over.
+                # This is the statistically correct Poisson offset: the model
+                # fits a RATE (count / exposure) and we multiply by *projected*
+                # exposure at serve time. It is NOT leakage — exposure is never a
+                # feature (build_*_features ignores projected_ip/pa), so the
+                # target can't leak into X. Do not "fix" this to projected
+                # exposure; that mis-specifies the likelihood.
                 exposure = row.get(exposure_col) or 0
                 if not exposure or exposure <= 0:
                     continue
 
                 game_ctx = games_by_bdl.get(row["game_id"], {}) or {}
+                # NOTE: historical player→team isn't reliably stored, so the
+                # opponent-rate feature can't be built leak-free at train time
+                # (it stays at a league-average constant here while it varies at
+                # inference). Fixing it needs a historical team-assignment table;
+                # tracked as a known train/serve-skew limitation.
                 opp_team_id = None
                 if game_ctx:
-                    # We don't have player→team pinned historically, so we skip
-                    # opp-specific lookups. Use league-average opponent rate.
                     opp_team_id = game_ctx.get("home_team_id")
 
                 extra = {
@@ -109,6 +152,7 @@ def _build_pitcher_dataset(market: str) -> Tuple[np.ndarray, np.ndarray, np.ndar
                     "game_time": game_ctx.get("game_time"),
                     "is_home": 0,  # unknown historically without team of pitcher
                     "month_of_season": None,
+                    "season": _season_from_date(row.get("date")),
                     "rest_days": compute_rest_days(prior, row.get("date")),
                     "opp_bullpen_era": compute_bullpen_factor(opp_team_id, row.get("date"), conn),
                     "db": conn,
@@ -163,6 +207,9 @@ def _build_batter_dataset(market: str) -> Tuple[np.ndarray, np.ndarray, np.ndarr
                     "game_date": row.get("date"),
                     "game_time": game_ctx.get("game_time"),
                     "is_home": 0,
+                    "season": _season_from_date(row.get("date")),
+                    "batter_id": player_id,
+                    "db": conn,
                     "rest_days": compute_rest_days(prior, row.get("date")),
                     "opp_starter_k_per_9": 8.5,
                     "opp_bullpen_era": 4.5,
@@ -369,10 +416,24 @@ def train_market(market: str, compare_sklearn: bool = False) -> Dict:
         logger.warning("  %s: no training data — skipping.", market)
         return {"market": market, "trained": False}
 
-    train_mask = dates < _VAL_SPLIT_DATE
+    # Drop rows without a usable date — the rolling split and any time-ordered
+    # holdout are undefined for them.
+    date_ok = dates != ''
+    X, y, exp_, dates = X[date_ok], y[date_ok], exp_[date_ok], dates[date_ok]
+    if X.size == 0:
+        logger.warning("  %s: no dated training rows — skipping.", market)
+        return {"market": market, "trained": False}
+
+    split_date = _rolling_split_date(dates.tolist(), _VAL_WINDOW_DAYS)
+    if split_date is None:
+        logger.warning("  %s: cannot compute rolling split — skipping.", market)
+        return {"market": market, "trained": False}
+
+    train_mask = dates < split_date
     val_mask = ~train_mask
     n_train, n_val = int(train_mask.sum()), int(val_mask.sum())
-    logger.info("  %s: %d train rows, %d val rows", market, n_train, n_val)
+    logger.info("  %s: %d train rows, %d val rows (val >= %s)",
+                market, n_train, n_val, split_date)
 
     if n_train < 100:
         logger.warning("  %s: too few training rows (%d) — skipping.", market, n_train)
@@ -384,22 +445,35 @@ def train_market(market: str, compare_sklearn: bool = False) -> Dict:
     y_val = y[val_mask] if n_val else y_tr[:1]
     exp_val = exp_[val_mask] if n_val else exp_tr[:1]
 
+    # Inner early-stop / Optuna slice carved from the TAIL of the training rows
+    # (most recent dates), kept strictly separate from the promotion holdout so
+    # tuning and early stopping never see val_mask.
+    train_idx = np.where(train_mask)[0]
+    order = np.argsort(dates[train_idx], kind="stable")
+    train_idx = train_idx[order]
+    n_es = max(1, int(len(train_idx) * _INNER_VAL_FRACTION))
+    fit_idx, es_idx = train_idx[:-n_es], train_idx[-n_es:]
+    if len(fit_idx) < 50:   # degenerate slice — fall back to fitting on all train
+        fit_idx, es_idx = train_idx, train_idx
+    X_fit, y_fit, exp_fit = X[fit_idx], y[fit_idx], exp_[fit_idx]
+    X_es, y_es, exp_es = X[es_idx], y[es_idx], exp_[es_idx]
+
     # ---- Try LightGBM (champion path) ----
     model = None
     model_type = "glm"
     if LGBMPoissonModel.available():
         try:
-            best_params = _tune_lgbm(X_tr, y_tr, exp_tr, X_val, y_val, exp_val,
+            best_params = _tune_lgbm(X_fit, y_fit, exp_fit, X_es, y_es, exp_es,
                                      list(names), n_trials=50)
             lgbm = LGBMPoissonModel(feature_names=list(names), **best_params)
-            lgbm.fit(X_tr, y_tr, exp_tr, X_val, y_val, exp_val)
+            lgbm.fit(X_fit, y_fit, exp_fit, X_es, y_es, exp_es)
             model = lgbm
             model_type = "lgbm"
             logger.info("  %s: LightGBM trained (%d trees)", market, lgbm.n_iter_)
         except Exception as e:
             logger.warning("  %s: LightGBM training failed (%s) — falling back to GLM", market, e)
 
-    # ---- Fallback: GLM ----
+    # ---- Fallback: GLM (no early stopping → fit on all training rows) ----
     if model is None:
         glm = PoissonGLM(feature_names=list(names), l2=0.01)
         glm.fit(X_tr, y_tr, exposure=exp_tr)

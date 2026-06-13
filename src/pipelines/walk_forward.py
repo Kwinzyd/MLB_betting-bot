@@ -173,10 +173,18 @@ def walk_forward_market(
         try:
             if model_type == "lgbm" and LGBMPoissonModel.available():
                 mdl = LGBMPoissonModel(feature_names=list(names))
-                X_v = X[test_mask] if n_test else X[train_mask][:1]
-                y_v = y[test_mask] if n_test else y[train_mask][:1]
-                e_v = exp_[test_mask] if n_test else exp_[train_mask][:1]
-                mdl.fit(X[train_mask], y[train_mask], exp_[train_mask], X_v, y_v, e_v)
+                # Early stopping must NOT use the test fold — that selects the
+                # number of trees on the very set we then score, leaking it.
+                # Carve an early-stop slice from the TAIL of the training window
+                # (its most recent dates) instead.
+                tr_idx = np.where(train_mask)[0]
+                tr_idx = tr_idx[np.argsort(dates[tr_idx], kind="stable")]
+                n_es = max(1, int(len(tr_idx) * 0.15))
+                fit_idx, es_idx = tr_idx[:-n_es], tr_idx[-n_es:]
+                if len(fit_idx) < 50:
+                    fit_idx, es_idx = tr_idx, tr_idx
+                mdl.fit(X[fit_idx], y[fit_idx], exp_[fit_idx],
+                        X[es_idx], y[es_idx], exp_[es_idx])
             else:
                 mdl = PoissonGLM(feature_names=list(names), l2=0.01)
                 mdl.fit(X[train_mask], y[train_mask], exposure=exp_[train_mask])
