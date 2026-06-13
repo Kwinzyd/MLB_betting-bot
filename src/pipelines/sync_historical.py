@@ -121,6 +121,14 @@ async def _sync_historical_async(seasons: List[int], chunk_size: int) -> dict:
         stats = await client.get_stats_batch(game_ids, chunk_size=200, max_concurrency=3)
         logger.info(f"  season={season}: received {len(stats)} player-game stat rows")
 
+        # Authoritative gid -> date map from the season /games payload; the
+        # stat payload's own date fields are unreliable (observed empty).
+        game_dates = {
+            g['id']: str(g.get('date') or '')[:10]
+            for g in completed
+            if g.get('id') is not None
+        }
+
         # Write to DB in chunks of 500 so we don't hold one giant transaction
         for i in range(0, len(stats), 500):
             batch = stats[i:i + 500]
@@ -129,6 +137,8 @@ async def _sync_historical_async(seasons: List[int], chunk_size: int) -> dict:
                     player_id, player_name, position, gid, game_date = _upsert_player(conn, player_stat)
                     if player_id is None:
                         continue
+                    if not game_date:
+                        game_date = game_dates.get(gid, '')
                     ip = player_stat.get('ip') or player_stat.get('innings_pitched')
                     is_pitcher = ip is not None and str(ip) not in ('0', '0.0', '')
                     if is_pitcher:

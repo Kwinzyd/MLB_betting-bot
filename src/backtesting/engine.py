@@ -281,11 +281,15 @@ class BacktestEngine:
                 ).fetchall()
             ]
 
+            # The opponent is the team the pitcher faces: away_team for home
+            # starters, home_team for away starters.
+            opp_team = self._resolve_opposing_team(conn, player, home_team, away_team)
+
             if market == 'pitcher_strikeouts':
-                opp_k_rate = self._historical_opp_k_rate(conn, away_team, game_date)
+                opp_k_rate = self._historical_opp_k_rate(conn, opp_team, game_date)
                 return self._proj.project_pitcher_strikeouts(logs, opp_k_rate, venue, line)
             else:
-                opp_runs_pg = self._historical_opp_runs_pg(conn, away_team, game_date)
+                opp_runs_pg = self._historical_opp_runs_pg(conn, opp_team, game_date)
                 return self._proj.project_pitcher_earned_runs(logs, opp_runs_pg, venue, line)
 
         if market in ('batter_hits', 'batter_total_bases', 'batter_home_runs'):
@@ -408,6 +412,17 @@ class BacktestEngine:
     # ------------------------------------------------------------------
     # Pitcher hand + lineup position helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_opposing_team(conn, player: dict, home_team: str, away_team: str) -> str:
+        """Name of the team the player faces, based on their team_id."""
+        home = conn.execute(
+            "SELECT team_id FROM teams WHERE name LIKE ? COLLATE NOCASE",
+            (f"%{home_team}%",),
+        ).fetchone()
+        if home and player.get('team_id') == home['team_id']:
+            return away_team
+        return home_team
 
     def _historical_pitcher_hand(
         self, conn, game_id: str, home_team: str, away_team: str, batter: dict

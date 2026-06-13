@@ -222,6 +222,21 @@ def _seed(conn: sqlite3.Connection) -> None:
          7.5, 0.66, 0.34, '{"sample_size": 20}', f'{SCHEDULED_GAME_DATE}T14:00:00')
     )
 
+    # Fresh bet candidate for g2 — the scan->alert handoff row send_alerts
+    # consumes. created_at must be NOW (not the seed game date) to clear the
+    # freshness gate.
+    now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    conn.execute(
+        "INSERT INTO bet_candidates "
+        "(game_id,player_id,player_name,market,line,side,bookmaker,odds,"
+        " sharp_book,anchor_line,truth_prob,model_prob,open_devig_prob,"
+        " edge_pct,ev,kelly_fraction,recommended_stake,steam_detected,created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (SCHEDULED_GAME_ID, 101, 'Gerrit Cole', 'pitcher_strikeouts', 6.5,
+         'over', 'draftkings', 2.20, 'pinnacle', 6.5, 0.66, 0.66, 0.52,
+         14.0, 0.452, 0.05, 50.0, 0, now_iso)
+    )
+
     # Alerts on g1 — needed by settle_results and calibration tests
     conn.executemany(
         "INSERT INTO alerts_sent "

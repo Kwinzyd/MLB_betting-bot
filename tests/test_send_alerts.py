@@ -1,32 +1,47 @@
 import pytest
+from datetime import timedelta
 from unittest.mock import patch, AsyncMock
 
+from src.utils.time_utils import utcnow
 from tests.fixtures.fixture_db import memory_conn
+
+
+def seed_candidate(conn, game_id='g1', player='Gerrit Cole', player_id=101,
+                   market='pitcher_strikeouts', line=6.5, side='over',
+                   bookmaker='draftkings', odds=2.0, truth_prob=0.60,
+                   edge_pct=10.0, created_at=None, stake=25.0):
+    """Insert a game + projection-context + bet_candidates row the way
+    scan_props persists winners."""
+    conn.execute(
+        "INSERT OR IGNORE INTO games (game_id, home_team, away_team, venue, status, date) "
+        "VALUES (?, 'Yankees', 'Red Sox', 'Yankee Stadium', 'SCHEDULED', '2024-05-15')",
+        (game_id,)
+    )
+    conn.execute('''
+        INSERT OR IGNORE INTO projections
+        (game_id, player_name, market, projected_mean, prob_over, prob_under, context_json, timestamp)
+        VALUES (?, ?, ?, 7.5, ?, ?, '{"sample_size": 20}', '2024-05-15T12:00:00')
+    ''', (game_id, player, market, truth_prob, 1.0 - truth_prob))
+    conn.execute('''
+        INSERT INTO bet_candidates
+        (game_id, player_id, player_name, market, line, side, bookmaker, odds,
+         sharp_book, anchor_line, truth_prob, model_prob, open_devig_prob,
+         edge_pct, ev, kelly_fraction, recommended_stake, steam_detected, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pinnacle', ?, ?, ?, ?, ?, ?, 0.02, ?, 0, ?)
+    ''', (
+        game_id, player_id, player, market, line, side, bookmaker, odds,
+        line, truth_prob, truth_prob, truth_prob, edge_pct,
+        truth_prob * odds - 1.0, stake,
+        created_at or utcnow().isoformat(),
+    ))
 
 
 @pytest.fixture
 def memory_db():
-    """In-memory DB (full production schema) seeded with a playable projection
-    and matching prop snapshot. Built via memory_conn() so every table/column
-    send_alerts touches (orders, bankroll_snapshots, model_prob_*) is present."""
+    """In-memory DB (full production schema) seeded with one fresh playable
+    bet candidate, as persisted by scan_props."""
     conn = memory_conn()
-    conn.execute('''
-        INSERT INTO games (game_id, home_team, away_team, venue, status, date)
-        VALUES ('g1', 'Yankees', 'Red Sox', 'Yankee Stadium', 'SCHEDULED', '2024-05-15')
-    ''')
-    conn.execute('''
-        INSERT INTO projections
-        (game_id, player_name, market, projected_mean, prob_over, prob_under, context_json, timestamp)
-        VALUES ('g1', 'Gerrit Cole', 'pitcher_strikeouts', 7.5, 0.62, 0.38,
-                '{"sample_size": 20}', '2024-05-15T12:00:00')
-    ''')
-    conn.execute('''
-        INSERT INTO prop_snapshots
-        (snapshot_id, game_id, player_name, market, line, over_odds, under_odds,
-         bookmaker, timestamp, devigged_over, devigged_under)
-        VALUES ('snap1', 'g1', 'Gerrit Cole', 'pitcher_strikeouts', 6.5, 2.0, 1.8,
-         'draftkings', '2024-05-15T12:00:00', 0.60, 0.40)
-    ''')
+    seed_candidate(conn)
     conn.commit()
     return conn
 
@@ -51,7 +66,7 @@ def _build_telegram_and_paper_registry():
 @patch('src.pipelines.send_alerts.get_db_connection')
 @patch('src.pipelines.send_alerts.build_venue_registry')
 async def test_send_alerts_new_alert_inserted(mock_registry, mock_get_db, memory_db):
-    """A playable edge dispatches to Telegram and is recorded in alerts_sent + orders."""
+    """A fresh candidate dispatches to Telegram and is recorded delivered=1."""
     venues, tg = _build_telegram_only_registry()
     mock_registry.return_value = venues
     mock_get_db.return_value.__enter__.return_value = memory_db
@@ -67,11 +82,42 @@ async def test_send_alerts_new_alert_inserted(mock_registry, mock_get_db, memory
     assert alert['player_name'] == 'Gerrit Cole'
     assert alert['side'] == 'over'
     assert alert['bookmaker'] == 'draftkings'
+    assert alert['delivered'] == 1
+    assert alert['player_id'] == 101
+    assert alert['open_devig_prob'] == pytest.approx(0.60)
 
     orders = memory_db.execute("SELECT * FROM orders").fetchall()
     assert len(orders) == 1
     assert orders[0]['venue'] == 'telegram'
     assert orders[0]['status'] == 'sent'
+    assert orders[0]['alert_id'] == alert['alert_id']
+
+
+@patch('src.pipelines.send_alerts.BETTING_ENABLED', False)
+@patch('src.clients.execution.telegram_venue.BETTING_ENABLED', False)
+@patch('src.pipelines.send_alerts.get_db_connection')
+@patch('src.pipelines.send_alerts.build_venue_registry')
+async def test_send_alerts_shadow_mode_records_undelivered(mock_registry, mock_get_db, memory_db):
+    """BETTING_ENABLED=false still records the bet (delivered=0) and persists
+    the skipped order — the paper-trading window must produce settle/CLV data."""
+    venues, tg = _build_telegram_only_registry()
+    mock_registry.return_value = venues
+    mock_get_db.return_value.__enter__.return_value = memory_db
+    mock_get_db.return_value.__exit__.return_value = None
+
+    from src.pipelines.send_alerts import send_alerts
+    await send_alerts()
+
+    tg._client.send_message.assert_not_called()  # shadow: no delivery
+
+    alert = memory_db.execute("SELECT * FROM alerts_sent").fetchone()
+    assert alert is not None
+    assert alert['delivered'] == 0
+    assert alert['kelly_stake'] is not None
+
+    orders = memory_db.execute("SELECT * FROM orders").fetchall()
+    assert len(orders) == 1
+    assert orders[0]['status'] == 'skipped'
     assert orders[0]['alert_id'] == alert['alert_id']
 
 
@@ -103,24 +149,24 @@ async def test_send_alerts_deduplication(mock_registry, mock_get_db, memory_db):
 
 @patch('src.pipelines.send_alerts.get_db_connection')
 @patch('src.pipelines.send_alerts.build_venue_registry')
-async def test_send_alerts_no_edge_no_alert(mock_registry, mock_get_db, memory_db):
-    """A projection below the edge threshold produces no alert."""
-    memory_db.execute(
-        "UPDATE projections SET prob_over = 0.51, prob_under = 0.49 WHERE player_name = 'Gerrit Cole'"
-    )
-    memory_db.commit()
+async def test_send_alerts_stale_candidate_ignored(mock_registry, mock_get_db):
+    """Candidates older than the freshness window are never alerted — the
+    odds they reference have likely moved."""
+    conn = memory_conn()
+    stale_ts = (utcnow() - timedelta(hours=2)).isoformat()
+    seed_candidate(conn, created_at=stale_ts)
+    conn.commit()
 
     venues, tg = _build_telegram_only_registry()
     mock_registry.return_value = venues
-    mock_get_db.return_value.__enter__.return_value = memory_db
+    mock_get_db.return_value.__enter__.return_value = conn
     mock_get_db.return_value.__exit__.return_value = None
 
     from src.pipelines.send_alerts import send_alerts
     await send_alerts()
 
     tg._client.send_message.assert_not_called()
-    alert = memory_db.execute("SELECT * FROM alerts_sent").fetchone()
-    assert alert is None
+    assert conn.execute("SELECT COUNT(*) FROM alerts_sent").fetchone()[0] == 0
 
 
 @patch('src.pipelines.send_alerts.BETTING_ENABLED', True)

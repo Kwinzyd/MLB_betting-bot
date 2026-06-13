@@ -38,6 +38,12 @@ def main():
     # settle, prune, sgp, trigger, fit-dispersion
     subparsers.add_parser('settle', help="Sync stats and settle completed bets")
     subparsers.add_parser('prune', help="Prune old database records")
+    repair_parser = subparsers.add_parser(
+        'repair-logs',
+        help="One-off repair: IP baseball-notation + empty game-log dates")
+    repair_parser.add_argument('--seasons', metavar='YYYY[,YYYY,...]', default=None,
+                               help="Also restore missing historical games rows from BDL "
+                                    "/games (no stats calls) before the date backfill")
     subparsers.add_parser('sgp', help="Find and alert Same Game Parlays (SGPs)")
     subparsers.add_parser('trigger', help="Run trigger watch for weather and umpires")
     subparsers.add_parser('fit-dispersion', help="Fit dispersion models for projections")
@@ -204,6 +210,13 @@ def main():
         elif args.command == 'prune':
             logger.info("Running PRUNE mode...")
             prune_old_data()
+
+        elif args.command == 'repair-logs':
+            from src.pipelines.repair_game_logs import repair_game_logs
+            logger.info("Running REPAIR-LOGS mode...")
+            seasons = ([int(s.strip()) for s in args.seasons.split(',') if s.strip()]
+                       if args.seasons else None)
+            repair_game_logs(seasons=seasons)
 
         elif args.command == 'backfill':
             from src.pipelines.sync_historical import sync_historical

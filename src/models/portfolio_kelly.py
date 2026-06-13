@@ -196,7 +196,7 @@ def portfolio_kelly(
     List of dollar stakes, one per bet, in the same order as `bets`.
     Returns zeros for all bets if the problem is trivially empty or ill-conditioned.
     """
-    fraction = fraction or KELLY_FRACTION
+    fraction = KELLY_FRACTION if fraction is None else fraction
     n = len(bets)
 
     if n == 0:

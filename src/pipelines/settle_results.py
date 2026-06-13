@@ -27,7 +27,8 @@ def settle_results():
             SELECT
                 a.alert_id, a.player_name, a.market, a.line, a.side,
                 a.odds, a.opening_odds, a.kelly_stake, a.game_id,
-                a.model_prob_over, a.model_prob_under
+                a.model_prob_over, a.model_prob_under,
+                a.player_id, a.open_devig_prob
             FROM alerts_sent a
             JOIN games g ON a.game_id = g.game_id
             WHERE g.status = 'COMPLETED'
@@ -49,16 +50,21 @@ def settle_results():
         side = alert['side']
         odds = alert['odds']
         stake = alert['kelly_stake']
+        player_id = alert['player_id']
+        open_devig_prob = alert['open_devig_prob']
 
-        # Get actual stat value
-        actual = _get_actual_stat(player_name, market, alert['game_id'])
+        # Get actual stat value — graded by player_id when the alert carries
+        # one (name lookups can hit the wrong player on duplicate MLB names).
+        actual = _get_actual_stat(player_name, market, alert['game_id'],
+                                  player_id=player_id)
         if actual is None:
             # Distinguish "BDL hasn't synced this game's box score yet" (skip)
             # from "the box score is in but this player has no row" (DNP void).
-            if _player_dnp(player_name, market, alert['game_id']):
+            if _player_dnp(player_name, market, alert['game_id'],
+                           player_id=player_id):
                 clv = _calculate_clv(
                     alert['game_id'], player_name, market, line, side,
-                    alert['opening_odds']
+                    alert['opening_odds'], opening_prob=open_devig_prob
                 )
                 with get_db_connection() as conn:
                     conn.execute('''
@@ -102,8 +108,9 @@ def settle_results():
                 result = 'LOSS'
                 profit = -stake
 
-        # Calculate CLV (simplified: compare opening odds to closing snapshot)
-        clv = _calculate_clv(alert['game_id'], player_name, market, line, side, alert['opening_odds'])
+        # Calculate CLV: devigged close vs devigged open when available.
+        clv = _calculate_clv(alert['game_id'], player_name, market, line, side,
+                             alert['opening_odds'], opening_prob=open_devig_prob)
 
         with get_db_connection() as conn:
             conn.execute('''
@@ -137,7 +144,8 @@ def settle_results():
     logger.info(f"Settlement complete. Settled {settled_count} bets. Session P&L: ${total_profit:+.2f}")
 
 
-def _player_dnp(player_name: str, market: str, game_id: str) -> bool:
+def _player_dnp(player_name: str, market: str, game_id: str,
+                player_id: int = None) -> bool:
     """
     True iff the box score for this game has been synced but the player has
     no row in the relevant log table. That's our late-scratch / DNP signal.
@@ -169,24 +177,43 @@ def _player_dnp(player_name: str, market: str, game_id: str) -> bool:
         if not any_rows:
             return False
 
-        player = conn.execute(
-            "SELECT player_id FROM players WHERE name = ? COLLATE NOCASE",
-            (player_name,)
-        ).fetchone()
-        if not player:
-            player = conn.execute(
-                "SELECT player_id FROM players WHERE name LIKE ? COLLATE NOCASE",
-                (f"%{player_name}%",)
-            ).fetchone()
-        if not player:
+        if player_id is None:
+            player_id = _lookup_player_id(conn, player_name)
+        if player_id is None:
             # Unknown player — can't confirm DNP, fall through to skip.
             return False
 
         player_row = conn.execute(
             f"SELECT 1 FROM {log_table} WHERE game_id = ? AND player_id = ? LIMIT 1",
-            (bdl_game_id, player['player_id'])
+            (bdl_game_id, player_id)
         ).fetchone()
         return player_row is None
+
+
+def _lookup_player_id(conn, player_name: str):
+    """Resolve a player_id from a name — exact match first, LIKE fallback.
+
+    Name resolution is a last resort for legacy alerts that predate the
+    player_id column; it can mis-grade duplicate MLB names, so log when the
+    fuzzy path fires.
+    """
+    player = conn.execute(
+        "SELECT player_id FROM players WHERE name = ? COLLATE NOCASE",
+        (player_name,)
+    ).fetchone()
+    if player:
+        return player['player_id']
+    player = conn.execute(
+        "SELECT player_id FROM players WHERE name LIKE ? COLLATE NOCASE",
+        (f"%{player_name}%",)
+    ).fetchone()
+    if player:
+        logger.warning(
+            "Settlement resolved '%s' via fuzzy name match — verify identity.",
+            player_name,
+        )
+        return player['player_id']
+    return None
 
 
 def _settle_sgps():
@@ -306,25 +333,18 @@ def _grade_leg(leg: dict, game_id: str) -> str:
     return 'WIN' if actual < line else 'LOSS'
 
 
-def _get_actual_stat(player_name: str, market: str, game_id: str) -> float:
-    """Look up the actual stat value from game logs."""
+def _get_actual_stat(player_name: str, market: str, game_id: str,
+                     player_id: int = None) -> float:
+    """Look up the actual stat value from game logs.
+
+    Grades by player_id when provided (captured at scan time); name lookup is
+    a legacy fallback only.
+    """
     with get_db_connection() as conn:
-        # Find player
-        player = conn.execute(
-            "SELECT player_id FROM players WHERE name = ? COLLATE NOCASE",
-            (player_name,)
-        ).fetchone()
-
-        if not player:
-            player = conn.execute(
-                "SELECT player_id FROM players WHERE name LIKE ? COLLATE NOCASE",
-                (f"%{player_name}%",)
-            ).fetchone()
-
-        if not player:
+        if player_id is None:
+            player_id = _lookup_player_id(conn, player_name)
+        if player_id is None:
             return None
-
-        player_id = player['player_id']
 
         # Find the BDL game ID for this Odds API game
         game = conn.execute(
@@ -375,7 +395,8 @@ def _get_actual_stat(player_name: str, market: str, game_id: str) -> float:
 
 
 def _calculate_clv(game_id: str, player_name: str, market: str,
-                   line: float, side: str, opening_odds: float) -> float:
+                   line: float, side: str, opening_odds: float,
+                   opening_prob: float = None) -> float:
     """
     Calculate Closing Line Value against a sharp book's devigged closing line.
 
@@ -383,8 +404,10 @@ def _calculate_clv(game_id: str, player_name: str, market: str,
     SHARP_BOOKMAKERS (walked in priority order). Soft books (DK/FD/etc.) carry
     liability-adjusted closes and are only used when no sharp snapshot exists.
 
-    CLV = devigged_closing_implied(sharp) - opening_implied
-    Positive = we beat the sharp close.
+    CLV = devigged_closing - devigged_opening. Both ends must be vig-free:
+    `opening_prob` is the devigged open stored on the alert. The raw
+    1/opening_odds fallback (vig included) only fires for legacy alerts and
+    biases CLV negative by ~half the hold.
     """
     with get_db_connection() as conn:
         closing = None
@@ -421,7 +444,12 @@ def _calculate_clv(game_id: str, player_name: str, market: str,
         if closing_over is None:
             # Closing line failed sanity checks; CLV is undefined.
             return 0.0
-        opening_implied = 1.0 / opening_odds
+        if opening_prob is not None and 0.0 < opening_prob < 1.0:
+            opening_implied = opening_prob
+        else:
+            # Legacy fallback (vig included) — biased low, kept only so old
+            # alerts without open_devig_prob still settle.
+            opening_implied = 1.0 / opening_odds
         closing_implied = closing_over if side == 'over' else closing_under
         return round(closing_implied - opening_implied, 4)
 
@@ -546,6 +574,15 @@ def _update_bankroll_snapshot(session_profit: float) -> None:
                 (today,),
             ).fetchone()
             daily_pnl = float(daily_row['daily_pnl']) if daily_row else 0.0
+            # SGP P&L counts toward the same daily-loss breaker.
+            sgp_daily = conn.execute(
+                """SELECT COALESCE(SUM(sr.profit), 0.0) AS pnl
+                   FROM sgp_results sr
+                   JOIN sgp_candidates sc ON sr.sgp_candidate_id = sc.id
+                   WHERE date(sc.timestamp) = ?""",
+                (today,),
+            ).fetchone()
+            daily_pnl += float(sgp_daily['pnl'] or 0.0) if sgp_daily else 0.0
         except Exception:
             daily_pnl = session_profit
 
@@ -559,6 +596,16 @@ def _update_bankroll_snapshot(session_profit: float) -> None:
             ).fetchone()
             rolling_7d_pnl = float(roll_row['pnl'] or 0.0)
             staked_7d = float(roll_row['staked'] or 0.0)
+            sgp_roll = conn.execute(
+                """SELECT COALESCE(SUM(sr.profit), 0.0) AS pnl,
+                          COALESCE(SUM(sc.kelly_stake), 0.0) AS staked
+                   FROM sgp_results sr
+                   JOIN sgp_candidates sc ON sr.sgp_candidate_id = sc.id
+                   WHERE date(sc.timestamp) >= date('now', '-7 days')""",
+            ).fetchone()
+            if sgp_roll:
+                rolling_7d_pnl += float(sgp_roll['pnl'] or 0.0)
+                staked_7d += float(sgp_roll['staked'] or 0.0)
             rolling_7d_roi = rolling_7d_pnl / staked_7d if staked_7d > 0 else 0.0
         except Exception:
             rolling_7d_pnl = 0.0

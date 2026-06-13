@@ -155,9 +155,47 @@ CREATE TABLE IF NOT EXISTS alerts_sent (
     model_prob_under REAL,
     game_id TEXT,
     timestamp TEXT,
+    -- delivered=1 means the alert actually reached Telegram with betting
+    -- enabled; 0 = shadow-mode (paper) record. Both settle, so the paper
+    -- window produces real CLV/calibration data.
+    delivered INTEGER DEFAULT 1,
+    -- BDL player id captured at scan time; settlement grades by id, not name.
+    player_id INTEGER,
+    -- Devigged probability of our side at placement (same basis as the
+    -- devigged close) so CLV is computed vig-free on both ends.
+    open_devig_prob REAL,
     UNIQUE(player_name, market, line, bookmaker, game_id)
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_sent_timestamp ON alerts_sent(timestamp);
+
+-- Winning candidates persisted by scan_props. send_alerts consumes only
+-- fresh rows from here — it never re-derives bets from raw snapshots, so the
+-- sharp-anchored edge decision made at scan time is exactly what gets sized,
+-- alerted, and settled.
+CREATE TABLE IF NOT EXISTS bet_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_id TEXT NOT NULL,
+    player_id INTEGER,
+    player_name TEXT NOT NULL,
+    market TEXT NOT NULL,
+    line REAL NOT NULL,
+    side TEXT NOT NULL,
+    bookmaker TEXT NOT NULL,
+    odds REAL NOT NULL,
+    sharp_book TEXT,
+    anchor_line REAL,
+    truth_prob REAL,        -- edge basis: sharp devig at anchor, model at alt-lines
+    model_prob REAL,        -- model probability for this side at this line
+    open_devig_prob REAL,   -- devigged prob of our side at placement (CLV open)
+    edge_pct REAL,
+    ev REAL,
+    kelly_fraction REAL,
+    recommended_stake REAL,
+    steam_detected INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL,
+    UNIQUE(game_id, player_name, market, line, side, bookmaker)
+);
+CREATE INDEX IF NOT EXISTS idx_bet_candidates_created ON bet_candidates(created_at);
 
 CREATE TABLE IF NOT EXISTS orders (
     order_id INTEGER PRIMARY KEY AUTOINCREMENT,

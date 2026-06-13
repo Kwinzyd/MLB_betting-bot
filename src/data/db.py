@@ -24,6 +24,8 @@ def init_db():
         _migrate_live_state_columns(conn)
         _migrate_live_batter_stats(conn)
         _migrate_alerts_sent_unique(conn)
+        _migrate_alerts_delivery_cols(conn)
+        _migrate_bet_candidates(conn)
         _migrate_missing_indexes(conn)
         _migrate_players_mlb_id(conn)
         _migrate_games_last_synced_at(conn)
@@ -152,6 +154,57 @@ def _migrate_alerts_sent_unique(conn):
         ALTER TABLE alerts_sent_new RENAME TO alerts_sent;
     """)
     logger.info("alerts_sent constraint migration complete.")
+
+
+def _migrate_alerts_delivery_cols(conn):
+    """Add shadow-mode / identity / CLV columns to alerts_sent.
+
+    delivered       — 1 = alert reached Telegram with betting enabled;
+                      0 = shadow (paper) record. Legacy rows default to 1
+                      because the old code only inserted on delivery.
+    player_id       — BDL id captured at scan time; settlement grades by id.
+    open_devig_prob — devigged prob of our side at placement, so CLV compares
+                      vig-free open vs vig-free close.
+    """
+    existing = {row['name'] for row in conn.execute("PRAGMA table_info(alerts_sent)").fetchall()}
+    if 'delivered' not in existing:
+        conn.execute("ALTER TABLE alerts_sent ADD COLUMN delivered INTEGER DEFAULT 1")
+    if 'player_id' not in existing:
+        conn.execute("ALTER TABLE alerts_sent ADD COLUMN player_id INTEGER")
+    if 'open_devig_prob' not in existing:
+        conn.execute("ALTER TABLE alerts_sent ADD COLUMN open_devig_prob REAL")
+
+
+def _migrate_bet_candidates(conn):
+    """Create bet_candidates on DBs that predate the scan->alert handoff table."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bet_candidates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            game_id TEXT NOT NULL,
+            player_id INTEGER,
+            player_name TEXT NOT NULL,
+            market TEXT NOT NULL,
+            line REAL NOT NULL,
+            side TEXT NOT NULL,
+            bookmaker TEXT NOT NULL,
+            odds REAL NOT NULL,
+            sharp_book TEXT,
+            anchor_line REAL,
+            truth_prob REAL,
+            model_prob REAL,
+            open_devig_prob REAL,
+            edge_pct REAL,
+            ev REAL,
+            kelly_fraction REAL,
+            recommended_stake REAL,
+            steam_detected INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            UNIQUE(game_id, player_name, market, line, side, bookmaker)
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_bet_candidates_created ON bet_candidates(created_at)"
+    )
 
 
 def _migrate_missing_indexes(conn):

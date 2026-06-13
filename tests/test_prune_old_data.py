@@ -56,6 +56,9 @@ def memory_db():
             alert_id INTEGER,
             FOREIGN KEY(alert_id) REFERENCES alerts_sent(alert_id)
         );
+        CREATE TABLE bet_candidates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT
+        );
         CREATE TABLE teams   (team_id INTEGER PRIMARY KEY);
         CREATE TABLE players (player_id INTEGER PRIMARY KEY);
         CREATE TABLE park_factors (venue TEXT PRIMARY KEY);
@@ -150,8 +153,10 @@ def test_prune_retains_recent_alerts(mock_get_db, memory_db):
 
 @patch('src.pipelines.prune_old_data.get_db_connection')
 def test_prune_hot_data(mock_get_db, memory_db):
-    """prop_snapshots, projections, daily_lineups, probable_pitchers, injury_reports
-    are pruned at the hot_data_days threshold."""
+    """daily_lineups, probable_pitchers, injury_reports, bet_candidates are
+    pruned at the hot_data_days threshold; prop_snapshots and projections are
+    NOT hot data — they keep the long snapshot_days retention (backtests, CLV
+    on late-settling bets, steam baselines)."""
     memory_db.execute("INSERT INTO prop_snapshots   VALUES ('s1', ?)", (iso(5),))
     memory_db.execute("INSERT INTO prop_snapshots   VALUES ('s2', ?)", (iso(1),))
     memory_db.execute("INSERT INTO projections (timestamp) VALUES (?)",  (iso(5),))
@@ -159,6 +164,7 @@ def test_prune_hot_data(mock_get_db, memory_db):
     memory_db.execute("INSERT INTO daily_lineups    (date) VALUES (?)",  (iso(5),))
     memory_db.execute("INSERT INTO probable_pitchers(date) VALUES (?)",  (iso(5),))
     memory_db.execute("INSERT INTO injury_reports   (date, player_name) VALUES (?, 'X')", (iso(5),))
+    memory_db.execute("INSERT INTO bet_candidates (created_at) VALUES (?)", (iso(5),))
     memory_db.commit()
 
     mock_get_db.return_value.__enter__.return_value = memory_db
@@ -167,12 +173,35 @@ def test_prune_hot_data(mock_get_db, memory_db):
     from src.pipelines.prune_old_data import prune_old_data
     deleted = prune_old_data(hot_data_days=3)
 
-    assert deleted["prop_snapshots"] == 1      # s2 (1 day ago) survives
-    assert deleted["projections"] == 1
     assert deleted["daily_lineups"] == 1
     assert deleted["probable_pitchers"] == 1
     assert deleted["injury_reports"] == 1
-    assert memory_db.execute("SELECT COUNT(*) FROM prop_snapshots").fetchone()[0] == 1
+    assert deleted["bet_candidates"] == 1
+    # 5-day-old snapshots survive the default 90-day retention
+    assert deleted["prop_snapshots"] == 0
+    assert deleted["projections"] == 0
+    assert memory_db.execute("SELECT COUNT(*) FROM prop_snapshots").fetchone()[0] == 2
+
+
+@patch('src.pipelines.prune_old_data.get_db_connection')
+def test_prune_snapshots_long_retention(mock_get_db, memory_db):
+    """prop_snapshots / projections prune at snapshot_days, not hot_data_days."""
+    memory_db.execute("INSERT INTO prop_snapshots   VALUES ('s_old', ?)", (iso(100),))
+    memory_db.execute("INSERT INTO prop_snapshots   VALUES ('s_new', ?)", (iso(30),))
+    memory_db.execute("INSERT INTO projections (timestamp) VALUES (?)",  (iso(100),))
+    memory_db.commit()
+
+    mock_get_db.return_value.__enter__.return_value = memory_db
+    mock_get_db.return_value.__exit__.return_value = None
+
+    from src.pipelines.prune_old_data import prune_old_data
+    deleted = prune_old_data(snapshot_days=90)
+
+    assert deleted["prop_snapshots"] == 1
+    assert deleted["projections"] == 1
+    remaining = {r["snapshot_id"] for r in memory_db.execute(
+        "SELECT snapshot_id FROM prop_snapshots").fetchall()}
+    assert remaining == {"s_new"}
 
 
 @patch('src.pipelines.prune_old_data.get_db_connection')

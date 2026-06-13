@@ -57,9 +57,13 @@ def rank_edge(projection: Dict[str, Any], odds: float, side: str,
     edge_pct = (sharp_prob - book_implied) * 100
     ev = (sharp_prob * odds) - 1.0
     lm_signal = line_movement_signal(sharp_prob, opening_prob)
-    adjusted_fraction = KELLY_FRACTION * lm_signal["multiplier"]
-    if steam_detected:
-        adjusted_fraction *= 1.5
+    # Steam and favorable line movement are two views of the same price
+    # signal — don't let them stack to 2.25x. Combined boost caps at 1.5x.
+    combined_multiplier = lm_signal["multiplier"]
+    if steam_detected and combined_multiplier > 0:
+        combined_multiplier = max(combined_multiplier, 1.5)
+    combined_multiplier = min(combined_multiplier, 1.5)
+    adjusted_fraction = KELLY_FRACTION * combined_multiplier
     kelly = fractional_kelly(sharp_prob, odds, fraction=adjusted_fraction)
 
     is_playable = True

@@ -178,9 +178,15 @@ class TestOpposingLegEnrichment:
         conn.execute("INSERT INTO projections (game_id, player_name, market, projected_mean, "
                      "prob_over, prob_under, context_json, timestamp) "
                      "VALUES ('g1','Aaron Judge','batter_hits',1.25,0.45,0.55,'{}','2024-05-15T12:00:00')")
+        # Sharp row carries the devigged truth; soft row carries the odds we'd
+        # actually bet. find_sgp joins the two on (player, line) — scan_props
+        # never writes devigged_* for soft books.
+        conn.execute("INSERT INTO prop_snapshots VALUES "
+                     "('s0','g1','Aaron Judge','batter_hits',1.5,2.05,1.85,"
+                     "'pinnacle','2024-05-15T12:00:00',0.45,0.55)")
         conn.execute("INSERT INTO prop_snapshots VALUES "
                      "('s1','g1','Aaron Judge','batter_hits',1.5,2.1,1.8,"
-                     "'draftkings','2024-05-15T12:00:00',0.45,0.55)")
+                     "'draftkings','2024-05-15T12:00:00',NULL,NULL)")
         conn.execute("INSERT INTO game_totals_history (game_id, total, source, timestamp) "
                      "VALUES ('g1', 9.5, 'pinnacle', '2024-05-15T12:00:00')")
         conn.commit()

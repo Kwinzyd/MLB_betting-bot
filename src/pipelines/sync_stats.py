@@ -3,6 +3,7 @@ from datetime import date, datetime, timedelta, timezone
 from src.clients.mlb_stats import MLBStatsClient
 from src.data.db import get_db_connection
 from src.utils.logging_utils import get_logger
+from src.utils.validators import parse_baseball_ip
 
 logger = get_logger(__name__)
 
@@ -81,7 +82,11 @@ def _upsert_player(conn, player_stat):
     if gid is None:
         game_data = player_stat.get('game') or {}
         gid = game_data.get('id')
+    # The stat payload's date fields are unreliable (observed empty across the
+    # entire feed) — callers override with the /games payload date when the
+    # value comes back blank. Normalize to YYYY-MM-DD either way.
     game_date = player_stat.get('game_date') or (player_stat.get('game') or {}).get('date', '')
+    game_date = str(game_date or '')[:10]
 
     return player_id, player_name, position, gid, game_date
 
@@ -102,7 +107,8 @@ def _insert_pitcher_log(conn, gid, player_id, game_date, player_stat, player_nam
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             gid, player_id, game_date,
-            float(ip) if ip else 0.0,
+            # Baseball notation: "5.2" = 5 innings + 2 OUTS = 5.667 innings.
+            parse_baseball_ip(ip),
             # BDL MLB uses p_hits; fallback to hits_allowed
             int(player_stat.get('p_hits') or player_stat.get('hits_allowed') or 0),
             # BDL MLB uses p_runs; fallback to runs_allowed
@@ -170,15 +176,13 @@ async def sync_stats():
     logger.info("Executing pipeline: sync_stats")
     bdl_client = MLBStatsClient()
 
-    # 1. Resolve which team IDs appear in upcoming games.
+    # 1. Resolve which team IDs appear in upcoming games. Even when there are
+    #    none, keep going: the completed-game status sweep below is what lets
+    #    settle_results find finished games, and it must run regardless.
     with get_db_connection() as conn:
         rows = conn.execute(
             "SELECT home_team_id, away_team_id FROM games WHERE status != 'COMPLETED'"
         ).fetchall()
-
-    if not rows:
-        logger.info("No upcoming games found for stats sync.")
-        return
 
     teams_to_sync = {
         tid
@@ -199,6 +203,25 @@ async def sync_stats():
     today = date.today()
     date_window = [(today - timedelta(days=d)).isoformat() for d in range(_LOOKBACK_DAYS)]
     all_recent_games = await bdl_client.get_games(dates=date_window)
+
+    # Mark finished games COMPLETED. This is the only live-pipeline status
+    # transition to COMPLETED, and settle_results depends on it — without it
+    # bets never settle and the bankroll ledger never moves.
+    completed_bdl_ids = [
+        g['id'] for g in all_recent_games
+        if g.get('id') is not None and g.get('status') in _COMPLETED_STATUSES
+    ]
+    if completed_bdl_ids:
+        with get_db_connection() as conn:
+            placeholders = ",".join("?" for _ in completed_bdl_ids)
+            cur = conn.execute(
+                f"UPDATE games SET status='COMPLETED' "
+                f"WHERE bdl_game_id IN ({placeholders}) AND status != 'COMPLETED'",
+                completed_bdl_ids,
+            )
+            conn.commit()
+        if cur.rowcount:
+            logger.info(f"Marked {cur.rowcount} finished games COMPLETED.")
 
     recent_game_ids = {
         g['id']
@@ -239,11 +262,22 @@ async def sync_stats():
     total_batter_logs = 0
     synced_gids: set = set()
 
+    # Authoritative gid -> date map from the /games payload. Game-log rows must
+    # carry a real date: every recency window, rest-day calc, and as-of filter
+    # in the model stack keys on it.
+    game_dates = {
+        g['id']: str(g.get('date') or '')[:10]
+        for g in all_recent_games
+        if g.get('id') is not None
+    }
+
     with get_db_connection() as conn:
         for player_stat in all_stats:
             player_id, player_name, position, gid, game_date = _upsert_player(conn, player_stat)
             if player_id is None:
                 continue
+            if not game_date:
+                game_date = game_dates.get(gid, '')
 
             ip = player_stat.get('ip') or player_stat.get('innings_pitched')
             is_pitcher = ip is not None and str(ip) not in ('0', '0.0', '')

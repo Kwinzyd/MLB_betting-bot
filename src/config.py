@@ -77,6 +77,10 @@ TRIGGER_TOTAL_MIN_HISTORY_MINUTES = int(os.getenv("TRIGGER_TOTAL_MIN_HISTORY_MIN
 # tails are well-behaved.
 ALT_LINE_MAX_DISTANCE = float(os.getenv("ALT_LINE_MAX_DISTANCE", "1.0"))
 
+# send_alerts only consumes bet_candidates younger than this. Candidates are
+# written by scan_props; anything older reflects odds that have likely moved.
+ALERT_CANDIDATE_MAX_AGE_MINUTES = int(os.getenv("ALERT_CANDIDATE_MAX_AGE_MINUTES", "15"))
+
 # Camouflage stake rounding. Soft books fingerprint accounts that bet exact
 # fractional-Kelly amounts ($18.42, $7.31). Snap persisted/displayed stakes
 # to a round increment so they look like rec-style $15/$20 wagers. Set 0 to

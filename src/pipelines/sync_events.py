@@ -135,7 +135,12 @@ async def sync_events():
                     away_team=excluded.away_team,
                     home_team_id=COALESCE(excluded.home_team_id, games.home_team_id),
                     away_team_id=COALESCE(excluded.away_team_id, games.away_team_id),
-                    status=excluded.status
+                    -- Never demote a live or finished game back to SCHEDULED:
+                    -- bdl_live owns IN_PROGRESS and sync_stats owns COMPLETED.
+                    status=CASE
+                        WHEN games.status IN ('IN_PROGRESS', 'COMPLETED') THEN games.status
+                        ELSE excluded.status
+                    END
             ''', (game_id, bdl_game_id, commence_time, commence_time, home_team, away_team,
                   home_team_id, away_team_id, 'SCHEDULED'))
             saved_count += 1
@@ -152,8 +157,11 @@ async def sync_events():
 
 def _cleanup_stale_data(retention_days: int = 3):
     """
-    Delete prop_snapshots, projections, daily_lineups, probable_pitchers,
-    and injury_reports older than retention_days to keep SQLite fast.
+    Delete short-lived operational rows older than retention_days.
+
+    prop_snapshots and projections are deliberately NOT touched here — they
+    are the raw material for backtests, CLV on late-settling bets, and steam
+    baselines. Their (90-day) retention lives in prune_old_data.
     """
     from datetime import timedelta
     from src.utils.time_utils import utcnow
@@ -161,11 +169,10 @@ def _cleanup_stale_data(retention_days: int = 3):
 
     with get_db_connection() as conn:
         tables = {
-            "prop_snapshots": "timestamp",
-            "projections": "timestamp",
             "daily_lineups": "date",
             "probable_pitchers": "date",
             "injury_reports": "date",
+            "bet_candidates": "created_at",
         }
         total = 0
         for table, col in tables.items():

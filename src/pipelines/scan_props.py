@@ -200,13 +200,15 @@ async def scan_props(force: bool = False, game_ids: list = None):
                     over_odds, over_book = soft_best['over']
                     under_odds, under_book = soft_best['under']
 
-                    # Re-price model at this line. The projection mean and
-                    # dispersion are line-independent, so we just recompute
-                    # over/under probabilities at the alt-line.
+                    # Re-price model at this line. The projection mean,
+                    # dispersion, and zero-inflation are line-independent, so
+                    # we just recompute over/under probabilities at the
+                    # alt-line with the same distribution family as the anchor.
                     prob_over_line, prob_under_line = get_probabilities(
                         projection['projected_mean'], line, market_key,
                         alpha=projection.get('alpha'),
                         sigma=projection.get('sigma'),
+                        pi0=projection.get('pi0'),
                     )
                     line_proj = dict(projection)
                     line_proj['line'] = line
@@ -279,7 +281,15 @@ async def scan_props(force: bool = False, game_ids: list = None):
                                 edge_result['edge_pct'] + 0.5, 4
                             )
                             edge_result['bias_boosted'] = True
-                            if not edge_result['is_playable']:
+                            # The boost may only rescue a bet whose SOLE kill
+                            # reason was the edge bar. Injury, sample-size,
+                            # steam-against, or negative-Kelly kills stand.
+                            reasons = edge_result.get('reasons', [])
+                            edge_killed_only = (
+                                len(reasons) == 1
+                                and reasons[0].startswith('Edge too small')
+                            )
+                            if not edge_result['is_playable'] and edge_killed_only:
                                 edge_result['is_playable'] = edge_result['edge_pct'] >= EDGE_MIN
                                 if edge_result['is_playable']:
                                     logger.debug(
@@ -292,7 +302,9 @@ async def scan_props(force: bool = False, game_ids: list = None):
                                 odds_val, edge_result, sharp_book,
                             ))
 
-                # Pick top MAX_BETS_PER_PLAYER by EV; log the winners.
+                # Pick top MAX_BETS_PER_PLAYER by EV; persist the winners so
+                # send_alerts consumes exactly this decision instead of
+                # re-deriving bets from raw snapshots.
                 candidates.sort(key=lambda c: c[0], reverse=True)
                 winners = candidates[:MAX_BETS_PER_PLAYER]
                 for ev, line, side, side_book, odds_val, edge_result, sharp_book_used in winners:
@@ -303,6 +315,51 @@ async def scan_props(force: bool = False, game_ids: list = None):
                         f"Edge: {edge_result['edge_pct']:.1f}% | EV: {ev:.3f} | "
                         f"Kelly: ${edge_result['kelly']['recommended_stake']}"
                     )
+
+                    # CLV opening basis: devig the chosen book's own two-sided
+                    # quote at this line; fall back to the truth prob when the
+                    # book is one-sided.
+                    open_devig = None
+                    book_pair = lines_for_market.get(line, {}).get(side_book) or {}
+                    dev_o, dev_u = devig_multiplicative(
+                        book_pair.get('over'), book_pair.get('under')
+                    )
+                    if dev_o is not None:
+                        open_devig = dev_o if side == 'over' else dev_u
+                    if open_devig is None:
+                        open_devig = edge_result['sharp_prob']
+
+                    conn.execute('''
+                        INSERT INTO bet_candidates
+                        (game_id, player_id, player_name, market, line, side,
+                         bookmaker, odds, sharp_book, anchor_line, truth_prob,
+                         model_prob, open_devig_prob, edge_pct, ev,
+                         kelly_fraction, recommended_stake, steam_detected,
+                         created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(game_id, player_name, market, line, side, bookmaker)
+                        DO UPDATE SET
+                            odds=excluded.odds,
+                            truth_prob=excluded.truth_prob,
+                            model_prob=excluded.model_prob,
+                            open_devig_prob=excluded.open_devig_prob,
+                            edge_pct=excluded.edge_pct,
+                            ev=excluded.ev,
+                            kelly_fraction=excluded.kelly_fraction,
+                            recommended_stake=excluded.recommended_stake,
+                            steam_detected=excluded.steam_detected,
+                            created_at=excluded.created_at
+                    ''', (
+                        game_id, projection.get('player_id'), player_name,
+                        market_key, line, side, side_book, odds_val,
+                        sharp_book_used, anchor_line,
+                        edge_result['sharp_prob'], edge_result['model_prob'],
+                        open_devig, edge_result['edge_pct'], ev,
+                        edge_result['kelly']['kelly_fraction'],
+                        edge_result['kelly']['recommended_stake'],
+                        int(edge_result.get('steam_detected', False)),
+                        timestamp,
+                    ))
 
                 if winners:
                     ctx = dict(projection.get('context', {}))
@@ -649,13 +706,11 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
             ).fetchall()
             logs = [dict(l) for l in logs]
 
-            # Get opponent team K rate.
-            # NOTE: _get_team_stats performs a heavy aggregation. For better performance,
-            # this value should be pre-calculated by a separate pipeline and stored in a
-            # `team_stats` table. The call would then be a simple lookup.
+            # Opponent = the team the pitcher faces (opp_team_id), NOT always
+            # the away team — for away starters that would be their own club.
             from src.config import LEAGUE_AVG_K_RATE
-            opp_team_stats = _get_team_stats(conn, away_team)
-            opp_k_rate = opp_team_stats.get('k_rate', LEAGUE_AVG_K_RATE)
+            opp_team_stats = _get_team_stats_by_id(conn, opp_team_id)
+            opp_k_rate = opp_team_stats.get('k_rate') or LEAGUE_AVG_K_RATE
 
             proj = proj_model.project_pitcher_strikeouts(
                 logs, opp_k_rate, venue, line, weather=weather, ump_k_factor=ump_k_factor,
@@ -663,6 +718,7 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
             )
             if proj:
                 proj['injury_status'] = injury_status
+                proj['player_id'] = player_id
             return proj
 
         elif market_key == 'pitcher_earned_runs':
@@ -673,8 +729,8 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
             logs = [dict(l) for l in logs]
 
             from src.config import LEAGUE_AVG_RUNS_PER_GAME
-            opp_team_stats = _get_team_stats(conn, away_team)
-            opp_runs_pg = opp_team_stats.get('runs_per_game', LEAGUE_AVG_RUNS_PER_GAME)
+            opp_team_stats = _get_team_stats_by_id(conn, opp_team_id)
+            opp_runs_pg = opp_team_stats.get('runs_per_game') or LEAGUE_AVG_RUNS_PER_GAME
 
             proj = proj_model.project_pitcher_earned_runs(
                 logs, opp_runs_pg, venue, line, weather=weather, ump_k_factor=ump_k_factor,
@@ -682,6 +738,7 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
             )
             if proj:
                 proj['injury_status'] = injury_status
+                proj['player_id'] = player_id
             return proj
 
         elif market_key in ('batter_hits', 'batter_total_bases', 'batter_home_runs'):
@@ -722,9 +779,28 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
             )
             if proj:
                 proj['injury_status'] = injury_status
+                proj['player_id'] = player_id
             return proj
 
     return None
+
+
+def _get_team_stats_by_id(conn, team_id) -> dict:
+    """Pre-calculated team offensive stats (calculate_team_stats pipeline),
+    looked up directly by BDL team_id. Returns {} when unknown so callers
+    fall back to league averages."""
+    if not team_id:
+        return {}
+
+    stats = conn.execute(
+        "SELECT k_rate, runs_per_game FROM team_stats WHERE team_id = ?",
+        (team_id,)
+    ).fetchone()
+
+    if not stats:
+        return {}
+
+    return {'k_rate': stats['k_rate'], 'runs_per_game': stats['runs_per_game']}
 
 
 def _get_team_stats(conn, team_name: str) -> dict:
@@ -737,20 +813,11 @@ def _get_team_stats(conn, team_name: str) -> dict:
         "SELECT team_id FROM teams WHERE name LIKE ? COLLATE NOCASE",
         (f"%{team_name}%",)
     ).fetchone()
- 
+
     if not team:
         return {}
- 
-    # Look up stats from the pre-calculated table
-    stats = conn.execute(
-        "SELECT k_rate, runs_per_game FROM team_stats WHERE team_id = ?",
-        (team['team_id'],)
-    ).fetchone()
- 
-    if not stats:
-        return {}
- 
-    return {'k_rate': stats['k_rate'], 'runs_per_game': stats['runs_per_game']}
+
+    return _get_team_stats_by_id(conn, team['team_id'])
 
 
 def _get_opposing_pitcher_hand(conn, game_id: str, home_team: str, away_team: str, batter_player) -> str:

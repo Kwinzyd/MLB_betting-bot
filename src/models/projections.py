@@ -183,12 +183,19 @@ def _apply_calibration(prob: float, market: str) -> float:
 
 
 def _calibrate_result(result: Dict | None) -> Dict | None:
-    """Apply calibration to prob_over / prob_under in a projection result dict."""
+    """Apply calibration to the over probability and derive the under.
+
+    Calibrating both sides through the same monotone map breaks
+    P(over) + P(under) = 1 (both sides of a market could clear the edge bar
+    at once). Calibrate one side, take the complement for the other.
+    """
     if result is None:
         return None
     market = result.get("market", "")
-    result["prob_over"] = _apply_calibration(result["prob_over"], market)
-    result["prob_under"] = _apply_calibration(result["prob_under"], market)
+    calibrated_over = _apply_calibration(result["prob_over"], market)
+    calibrated_over = max(0.0, min(1.0, calibrated_over))
+    result["prob_over"] = calibrated_over
+    result["prob_under"] = 1.0 - calibrated_over
     return result
 
 
@@ -311,6 +318,7 @@ class ProjectionModel:
             "prob_under": prob_under,
             "alpha": disp.get("alpha"),
             "sigma": disp.get("sigma"),
+            "pi0": None,
             "injury_status": "Healthy",
             "sample_size": len(logs),
             "context": {
@@ -410,6 +418,7 @@ class ProjectionModel:
             "prob_under": prob_under,
             "alpha": disp.get("alpha"),
             "sigma": disp.get("sigma"),
+            "pi0": None,
             "injury_status": "Healthy",
             "sample_size": len(logs),
             "context": {
@@ -546,6 +555,7 @@ class ProjectionModel:
             "prob_under": prob_under,
             "alpha": disp.get("alpha"),
             "sigma": disp.get("sigma"),
+            "pi0": pi0,
             "injury_status": "Healthy",
             "sample_size": len(logs),
             "context": {
@@ -581,7 +591,6 @@ class ProjectionModel:
         if glm is None:
             return None
         from src.data.feature_builder import build_pitcher_features
-        from src.models.monte_carlo import mc_prob_over
         disp = dispersion or {}
 
         ip_result = self._project_innings(
@@ -608,9 +617,11 @@ class ProjectionModel:
             logger.warning(f"GLM predict failed for {market}: {e}; falling back.")
             return None
 
-        prob_over, prob_under = mc_prob_over(
-            projected_mean, line, market,
-            nb_alpha=disp.get("alpha"),
+        # Analytic NB/Poisson CDF — Monte Carlo at n=1000 carries ~1.6pp of
+        # sampling noise, the same order as the edge threshold and the
+        # sharp-agreement gate, and makes decisions irreproducible.
+        prob_over, prob_under = get_probabilities(
+            projected_mean, line, market, alpha=disp.get("alpha"),
         )
 
         return {
@@ -622,6 +633,7 @@ class ProjectionModel:
             "prob_under": prob_under,
             "alpha": disp.get("alpha"),
             "sigma": disp.get("sigma"),
+            "pi0": None,
             "injury_status": "Healthy",
             "sample_size": len(pitcher_logs),
             "context": {
@@ -643,7 +655,6 @@ class ProjectionModel:
         if glm is None:
             return None
         from src.data.feature_builder import build_batter_features
-        from src.models.monte_carlo import mc_prob_over
         disp = dispersion or {}
 
         base_pa = LINEUP_PA_MAP.get(lineup_position, DEFAULT_PROJECTED_PA)
@@ -681,6 +692,9 @@ class ProjectionModel:
         park_hr_factor = get_park_factor(venue, weather=weather).get("hr", 1.0)
         pi0 = _compute_hr_pi0(market, batter_logs, park_hr_factor, extra_features, weather)
 
+        # Analytic CDFs throughout — mixing exact NB/ZINB/Normal probabilities
+        # across the PA distribution is exact and reproducible, unlike the
+        # previous n=1000 Monte Carlo draws (~1.6pp sampling noise per call).
         if pa_dist is not None:
             prob_over = 0.0
             prob_under = 0.0
@@ -691,27 +705,24 @@ class ProjectionModel:
                     mean_k = glm.predict_mean(features, exposure=k)
                 except Exception as e:
                     logger.warning(f"GLM predict failed for {market} at PA={k}: {e}; falling back.")
-                    prob_over, prob_under = mc_prob_over(
+                    prob_over, prob_under = get_probabilities(
                         projected_mean, line, market,
-                        nb_alpha=disp.get("alpha"),
-                        tb_std=disp.get("sigma"),
-                        zinb_pi0=pi0,
+                        alpha=disp.get("alpha"), sigma=disp.get("sigma"),
+                        pi0=pi0,
                     )
                     break
-                over_k, under_k = mc_prob_over(
+                over_k, under_k = get_probabilities(
                     mean_k, line, market,
-                    nb_alpha=disp.get("alpha"),
-                    tb_std=disp.get("sigma"),
-                    zinb_pi0=pi0,
+                    alpha=disp.get("alpha"), sigma=disp.get("sigma"),
+                    pi0=pi0,
                 )
                 prob_over += p_k * over_k
                 prob_under += p_k * under_k
         else:
-            prob_over, prob_under = mc_prob_over(
+            prob_over, prob_under = get_probabilities(
                 projected_mean, line, market,
-                nb_alpha=disp.get("alpha"),
-                tb_std=disp.get("sigma"),
-                zinb_pi0=pi0,
+                alpha=disp.get("alpha"), sigma=disp.get("sigma"),
+                pi0=pi0,
             )
 
         return {
@@ -723,6 +734,7 @@ class ProjectionModel:
             "prob_under": prob_under,
             "alpha": disp.get("alpha"),
             "sigma": disp.get("sigma"),
+            "pi0": pi0,
             "injury_status": "Healthy",
             "sample_size": len(batter_logs),
             "context": {

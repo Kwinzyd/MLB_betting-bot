@@ -38,34 +38,25 @@ class TestRoundStake:
 
 @pytest.fixture
 def alerts_db():
+    """Seed a fresh bet candidate with a known raw Kelly stake of $18.42."""
+    from tests.test_send_alerts import seed_candidate
     conn = memory_conn()
-    conn.execute('''INSERT INTO games (game_id, home_team, away_team, venue, status, date)
-        VALUES ('g1','Yankees','Red Sox','Yankee Stadium','SCHEDULED','2024-05-15')''')
-    conn.execute('''INSERT INTO projections
-        (game_id, player_name, market, projected_mean, prob_over, prob_under, context_json, timestamp)
-        VALUES ('g1','Gerrit Cole','pitcher_strikeouts',7.5,0.62,0.38,
-                '{"sample_size": 20}','2024-05-15T12:00:00')''')
-    conn.execute('''INSERT INTO prop_snapshots
-        (snapshot_id, game_id, player_name, market, line, over_odds, under_odds,
-         bookmaker, timestamp, devigged_over, devigged_under)
-        VALUES ('snap1','g1','Gerrit Cole','pitcher_strikeouts',6.5,2.0,1.8,
-         'draftkings','2024-05-15T12:00:00',0.60,0.40)''')
+    seed_candidate(conn, stake=18.42)
     conn.commit()
     return conn
 
 
-# Neutralize portfolio Kelly so the per-bet stake from mocked rank_edge survives
-# to the rounding step — this test isolates stake rounding, not portfolio sizing.
+# Neutralize portfolio Kelly so the candidate's persisted stake survives to
+# the rounding step — this test isolates stake rounding, not portfolio sizing.
 @patch('src.pipelines.send_alerts.apply_portfolio_kelly',
        new=lambda candidates, bankroll: candidates)
 @patch('src.pipelines.send_alerts.BETTING_ENABLED', True)
 @patch('src.clients.execution.telegram_venue.BETTING_ENABLED', True)
 @patch('src.utils.stake_rounding.STAKE_ROUNDING_INCREMENT', 5.0)
-@patch('src.pipelines.send_alerts.rank_edge')
 @patch('src.pipelines.send_alerts.get_db_connection')
 @patch('src.pipelines.send_alerts.build_venue_registry')
 async def test_send_alerts_persists_rounded_stake(
-    mock_registry, mock_get_db, mock_rank, alerts_db
+    mock_registry, mock_get_db, alerts_db
 ):
     from src.clients.execution.telegram_venue import TelegramVenue
     tg = TelegramVenue()
@@ -74,18 +65,6 @@ async def test_send_alerts_persists_rounded_stake(
     mock_bot = tg._client
     mock_get_db.return_value.__enter__.return_value = alerts_db
     mock_get_db.return_value.__exit__.return_value = None
-
-    # Force a known raw Kelly that should snap up to 20.0.
-    def fake_rank(projection, odds_val, side, dev_prob):
-        return {
-            'is_playable': side == 'over',
-            'edge_pct': 10.0,
-            'ev': 0.20,
-            'model_prob': 0.60,
-            'book_implied': 0.50,
-            'kelly': {'recommended_stake': 18.42, 'kelly_fraction': 0.025},
-        }
-    mock_rank.side_effect = fake_rank
 
     from src.pipelines.send_alerts import send_alerts
     await send_alerts()
@@ -103,11 +82,10 @@ async def test_send_alerts_persists_rounded_stake(
 @patch('src.pipelines.send_alerts.BETTING_ENABLED', True)
 @patch('src.clients.execution.telegram_venue.BETTING_ENABLED', True)
 @patch('src.utils.stake_rounding.STAKE_ROUNDING_INCREMENT', 0.0)
-@patch('src.pipelines.send_alerts.rank_edge')
 @patch('src.pipelines.send_alerts.get_db_connection')
 @patch('src.pipelines.send_alerts.build_venue_registry')
 async def test_send_alerts_rounding_disabled_passes_through(
-    mock_registry, mock_get_db, mock_rank, alerts_db
+    mock_registry, mock_get_db, alerts_db
 ):
     from src.clients.execution.telegram_venue import TelegramVenue
     tg = TelegramVenue()
@@ -115,17 +93,6 @@ async def test_send_alerts_rounding_disabled_passes_through(
     mock_registry.return_value = [tg]
     mock_get_db.return_value.__enter__.return_value = alerts_db
     mock_get_db.return_value.__exit__.return_value = None
-
-    def fake_rank(projection, odds_val, side, dev_prob):
-        return {
-            'is_playable': side == 'over',
-            'edge_pct': 10.0,
-            'ev': 0.20,
-            'model_prob': 0.60,
-            'book_implied': 0.50,
-            'kelly': {'recommended_stake': 18.42, 'kelly_fraction': 0.025},
-        }
-    mock_rank.side_effect = fake_rank
 
     from src.pipelines.send_alerts import send_alerts
     await send_alerts()

@@ -98,6 +98,17 @@ def _seed_schema(conn):
             game_id TEXT NOT NULL, total REAL NOT NULL,
             source TEXT NOT NULL, timestamp TEXT NOT NULL
         );
+        CREATE TABLE bet_candidates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            game_id TEXT NOT NULL, player_id INTEGER, player_name TEXT NOT NULL,
+            market TEXT NOT NULL, line REAL NOT NULL, side TEXT NOT NULL,
+            bookmaker TEXT NOT NULL, odds REAL NOT NULL,
+            sharp_book TEXT, anchor_line REAL, truth_prob REAL, model_prob REAL,
+            open_devig_prob REAL, edge_pct REAL, ev REAL, kelly_fraction REAL,
+            recommended_stake REAL, steam_detected INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            UNIQUE(game_id, player_name, market, line, side, bookmaker)
+        );
     ''')
 
 

@@ -107,32 +107,71 @@ def _build_candidates():
     return out
 
 
+def _sharp_and_soft_quotes(conn, game_id, market, side):
+    """Pair each (player, line) with its sharp-devigged probability and the
+    best soft-book price for `side`.
+
+    scan_props only writes devigged_* for sharp books, so the leg probability
+    MUST come from a sharp snapshot while the leg odds come from a soft book —
+    two different rows joined on (player, line). Only the latest snapshot per
+    (player, line, bookmaker) counts; stale quotes are exactly what an SGP
+    built minutes later would no longer get.
+
+    Returns {(player_name, line): {'prob': float, 'odds': float, 'book': str}}.
+    """
+    odds_col = f"{side}_odds"
+    devig_col = f"devigged_{side}"
+    rows = conn.execute(f'''
+        SELECT ps.player_name, ps.line, ps.bookmaker, ps.{odds_col} AS odds,
+               ps.{devig_col} AS devig
+        FROM prop_snapshots ps
+        WHERE ps.game_id = ? AND ps.market = ?
+          AND ps.timestamp = (
+              SELECT MAX(s2.timestamp) FROM prop_snapshots s2
+              WHERE s2.game_id = ps.game_id AND s2.player_name = ps.player_name
+                AND s2.market = ps.market AND s2.line = ps.line
+                AND s2.bookmaker = ps.bookmaker
+          )
+    ''', (game_id, market)).fetchall()
+
+    sharp_rank = {b: i for i, b in enumerate(SHARP_BOOKMAKERS)}
+    sharp_best: dict = {}   # key -> (rank, prob)
+    soft_best: dict = {}    # key -> (odds, book)
+    for r in rows:
+        key = (r['player_name'], r['line'])
+        if r['bookmaker'] in sharp_rank:
+            if r['devig'] is not None:
+                rank = sharp_rank[r['bookmaker']]
+                if key not in sharp_best or rank < sharp_best[key][0]:
+                    sharp_best[key] = (rank, float(r['devig']))
+        else:
+            odds = r['odds']
+            if odds and odds > 1.0:
+                if key not in soft_best or odds > soft_best[key][0]:
+                    soft_best[key] = (float(odds), r['bookmaker'])
+
+    out = {}
+    for key, (_, prob) in sharp_best.items():
+        if key in soft_best:
+            odds, book = soft_best[key]
+            out[key] = {'prob': prob, 'odds': odds, 'book': book}
+    return out
+
+
 def _find_pitcher_anchors(conn, game_id, home_team, away_team):
     """Yield (anchor_leg, opposing_team_name) for each playable pitcher K-over
-    candidate on this game."""
-    sharp_set = set(SHARP_BOOKMAKERS)
-    placeholders = ','.join('?' for _ in sharp_set) or "''"
-    rows = conn.execute(f'''
-        SELECT p.player_name, pl.player_id,
-               ps.line, ps.over_odds, ps.bookmaker, ps.devigged_over
-        FROM projections p
-        JOIN players pl ON p.player_name = pl.name COLLATE NOCASE
-        JOIN prop_snapshots ps
-          ON p.game_id = ps.game_id
-         AND p.player_name = ps.player_name
-         AND p.market = ps.market
-        WHERE p.game_id = ?
-          AND p.market = 'pitcher_strikeouts'
-          AND ps.bookmaker NOT IN ({placeholders})
-          AND ps.over_odds > 1.0
-          AND ps.devigged_over IS NOT NULL
-    ''', (game_id, *sharp_set)).fetchall()
+    candidate on this game. Leg prob = sharp devig; leg odds = best soft book."""
+    quotes = _sharp_and_soft_quotes(conn, game_id, 'pitcher_strikeouts', 'over')
 
-    for row in rows:
+    for (player_name, line), q in quotes.items():
+        player = conn.execute(
+            "SELECT player_id FROM players WHERE name = ? COLLATE NOCASE",
+            (player_name,)
+        ).fetchone()
         pp = conn.execute(
             "SELECT team FROM probable_pitchers "
             "WHERE game_id = ? AND player_name = ? COLLATE NOCASE",
-            (game_id, row['player_name'])
+            (game_id, player_name)
         ).fetchone()
         if not pp:
             continue
@@ -142,40 +181,44 @@ def _find_pitcher_anchors(conn, game_id, home_team, away_team):
             else home_team
         )
         yield ({
-            'player_name': row['player_name'],
-            'player_id': row['player_id'],
+            'player_name': player_name,
+            'player_id': player['player_id'] if player else None,
             'market': 'pitcher_strikeouts',
             'side': 'over',
-            'line': row['line'],
-            'odds': row['over_odds'],
-            'prob': row['devigged_over'],
-            'bookmaker': row['bookmaker'],
+            'line': line,
+            'odds': q['odds'],
+            'prob': q['prob'],
+            'bookmaker': q['book'],
         }, opposing)
 
 
 def _find_opposing_under_legs(conn, game_id, opposing_team):
-    """Playable hits-under / total_bases-under legs for batters on opposing_team."""
-    sharp_set = set(SHARP_BOOKMAKERS)
-    placeholders = ','.join('?' for _ in sharp_set) or "''"
-    rows = conn.execute(f'''
-        SELECT p.player_name, p.market, p.projected_mean,
-               ps.line, ps.under_odds, ps.bookmaker, ps.devigged_under,
-               dl.lineup_position
-        FROM projections p
-        JOIN prop_snapshots ps
-          ON p.game_id = ps.game_id
-         AND p.player_name = ps.player_name
-         AND p.market = ps.market
-        JOIN daily_lineups dl
-          ON dl.game_id = p.game_id
-         AND dl.player_name = p.player_name COLLATE NOCASE
-        WHERE p.game_id = ?
-          AND dl.team LIKE ? COLLATE NOCASE
-          AND p.market IN ('batter_hits', 'batter_total_bases')
-          AND ps.bookmaker NOT IN ({placeholders})
-          AND ps.under_odds > 1.0
-          AND ps.devigged_under IS NOT NULL
-    ''', (game_id, f"%{opposing_team}%", *sharp_set)).fetchall()
+    """Playable hits-under / total_bases-under legs for batters on opposing_team.
+    Leg prob = sharp devig; leg odds = best soft book at the same line."""
+    rows = []
+    for market in ('batter_hits', 'batter_total_bases'):
+        quotes = _sharp_and_soft_quotes(conn, game_id, market, 'under')
+        for (player_name, line), q in quotes.items():
+            dl = conn.execute(
+                "SELECT lineup_position FROM daily_lineups "
+                "WHERE game_id = ? AND player_name = ? COLLATE NOCASE "
+                "AND team LIKE ? COLLATE NOCASE",
+                (game_id, player_name, f"%{opposing_team}%")
+            ).fetchone()
+            if not dl:
+                continue
+            proj = conn.execute(
+                "SELECT projected_mean FROM projections "
+                "WHERE game_id = ? AND player_name = ? AND market = ?",
+                (game_id, player_name, market)
+            ).fetchone()
+            rows.append({
+                'player_name': player_name, 'market': market,
+                'projected_mean': proj['projected_mean'] if proj else None,
+                'line': line, 'under_odds': q['odds'], 'bookmaker': q['book'],
+                'devigged_under': q['prob'],
+                'lineup_position': dl['lineup_position'],
+            })
 
     # Latest sharp-book total for the opposing team's implied run total.
     total_row = conn.execute(
