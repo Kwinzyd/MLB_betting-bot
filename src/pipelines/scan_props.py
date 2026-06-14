@@ -695,6 +695,27 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
 
         if injury_status in ('IL', 'Out'):
             return None
+
+        # LLM injury signal (optional): a tightening-only gate. When the player
+        # already carries a non-clear status AND the model estimates a low
+        # probability of appearing, skip the prop. The LLM never loosens a
+        # decision and never changes a projection number; its impact_summary is
+        # carried into the projection context for the alert rationale.
+        injury_summary = None
+        if injury_status != 'Healthy':
+            from src.pipelines.enrich_injuries import get_injury_signal
+            from src.config import LLM_INJURY_SKIP_PROBABILITY
+            sig = get_injury_signal(conn, player_id, today)
+            if sig:
+                injury_summary = sig.get('impact_summary')
+                prob = sig.get('play_probability')
+                if (sig.get('play_status') == 'out'
+                        or (prob is not None and prob < LLM_INJURY_SKIP_PROBABILITY)):
+                    logger.info(
+                        "LLM injury gate skipped %s (%s, p_play=%s): %s",
+                        player_name, injury_status, prob, injury_summary,
+                    )
+                    return None
             
         pitcher_bullpen_era = compute_bullpen_factor(team_id, today, db=conn)
         opp_bullpen_era = compute_bullpen_factor(opp_team_id, today, db=conn)
@@ -732,6 +753,8 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
             if proj:
                 proj['injury_status'] = injury_status
                 proj['player_id'] = player_id
+                if injury_summary:
+                    proj.setdefault('context', {})['llm_injury_summary'] = injury_summary
             return proj
 
         elif market_key == 'pitcher_earned_runs':
@@ -752,6 +775,8 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
             if proj:
                 proj['injury_status'] = injury_status
                 proj['player_id'] = player_id
+                if injury_summary:
+                    proj.setdefault('context', {})['llm_injury_summary'] = injury_summary
             return proj
 
         elif market_key in ('batter_hits', 'batter_total_bases', 'batter_home_runs'):
@@ -793,6 +818,8 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
             if proj:
                 proj['injury_status'] = injury_status
                 proj['player_id'] = player_id
+                if injury_summary:
+                    proj.setdefault('context', {})['llm_injury_summary'] = injury_summary
             return proj
 
     return None

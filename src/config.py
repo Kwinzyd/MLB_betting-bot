@@ -27,6 +27,11 @@ LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "30"))
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1024"))
 # Cache identical prompts this long to bound cost (enrichment re-runs on a slate).
 LLM_CACHE_TTL_SECONDS = int(os.getenv("LLM_CACHE_TTL_SECONDS", "21600"))  # 6h
+# Conservative skip gate: only when a fresh LLM signal estimates a player's
+# probability of appearing below this AND the raw status already flagged a
+# problem do we skip the prop. The LLM can tighten (skip more) but never
+# loosens a bet decision, and it never alters a projection number.
+LLM_INJURY_SKIP_PROBABILITY = float(os.getenv("LLM_INJURY_SKIP_PROBABILITY", "0.25"))
 
 # Polymarket L2 / CLOB API Auth
 POLYMARKET_HOST = os.getenv("POLYMARKET_HOST", "https://clob.polymarket.com")

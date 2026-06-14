@@ -39,6 +39,7 @@ class TelegramVenue(ExecutionVenue):
             home_team=context["home_team"],
             away_team=context["away_team"],
             venue=context.get("game_venue"),
+            rationale=context.get("llm_rationale"),
         )
 
         placed_at = utc_now_iso()
@@ -83,7 +84,8 @@ class TelegramVenue(ExecutionVenue):
 
 
 def format_alert_message(player_name, market, side, line, odds, bookmaker,
-                         edge, projection, context, home_team, away_team, venue):
+                         edge, projection, context, home_team, away_team, venue,
+                         rationale=None):
     """Format a rich Telegram alert message. Moved from send_alerts.py."""
     if odds >= 2.0:
         american = f"+{int((odds - 1) * 100)}"
@@ -115,4 +117,6 @@ def format_alert_message(player_name, market, side, line, odds, bookmaker,
             msg += f"Platoon Adj: {context['platoon_adj']:.3f}\n"
 
     msg += f"\nProjected: {projection['projected_mean']:.2f}"
+    if rationale:
+        msg += f"\n\n<i>\U0001F9E0 {rationale}</i>"
     return msg

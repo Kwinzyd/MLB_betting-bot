@@ -43,6 +43,16 @@ CREATE TABLE IF NOT EXISTS players (
 );
 CREATE INDEX IF NOT EXISTS idx_players_team ON players(team_id);
 
+-- Resolved player-name -> player_id cache (deterministic + LLM reconciliation).
+-- Lets the money path resolve messy names (diacritics, "J. Soto", source
+-- variants) to one id without re-asking the LLM each time.
+CREATE TABLE IF NOT EXISTS player_name_resolutions (
+    query       TEXT PRIMARY KEY,
+    player_id   INTEGER,
+    method      TEXT,
+    created_at  TEXT
+);
+
 CREATE TABLE IF NOT EXISTS injury_reports (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     date TEXT,
@@ -51,6 +61,23 @@ CREATE TABLE IF NOT EXISTS injury_reports (
     status TEXT,
     injury_type TEXT,
     UNIQUE(date, player_name)
+);
+
+-- LLM-normalized availability signal derived from injury_reports. The model
+-- classifies the messy status/type text into a structured play call; the
+-- deterministic money path reads play_probability to (conservatively) skip
+-- likely-scratched players and surfaces impact_summary in alerts. The LLM
+-- never sets a projection number — only this categorical availability signal.
+CREATE TABLE IF NOT EXISTS player_injury_signals (
+    player_id        INTEGER,
+    player_name      TEXT,
+    date             TEXT,
+    play_status      TEXT,    -- 'active' | 'questionable' | 'out'
+    play_probability REAL,    -- 0..1, LLM estimate the player appears
+    impact_summary   TEXT,    -- one-line context for the alert
+    source_status    TEXT,    -- raw injury status it was derived from
+    created_at       TEXT,
+    PRIMARY KEY (player_id, date)
 );
 
 CREATE TABLE IF NOT EXISTS pitcher_game_logs (

@@ -191,18 +191,21 @@ def _player_dnp(player_name: str, market: str, game_id: str,
 
 
 def _lookup_player_id(conn, player_name: str):
-    """Resolve a player_id from a name — exact match first, LIKE fallback.
+    """Resolve a player_id from a name for settlement.
 
-    Name resolution is a last resort for legacy alerts that predate the
-    player_id column; it can mis-grade duplicate MLB names, so log when the
-    fuzzy path fires.
+    Uses the deterministic resolver (cache -> exact -> accent/suffix-normalized),
+    which also surfaces any LLM-reconciled mapping. Only when that fails does it
+    fall back to a logged fuzzy LIKE — the path that can mis-grade duplicate
+    names — so the fallback firing is a visible signal, not a silent risk.
     """
-    player = conn.execute(
-        "SELECT player_id FROM players WHERE name = ? COLLATE NOCASE",
-        (player_name,)
-    ).fetchone()
-    if player:
-        return player['player_id']
+    from src.data.player_resolver import resolve_player_id
+    pid, method = resolve_player_id(conn, player_name)
+    if pid is not None:
+        return pid
+    if method == "ambiguous":
+        logger.warning("Settlement: '%s' is ambiguous (multiple players) — not grading by guess.",
+                       player_name)
+        return None
     player = conn.execute(
         "SELECT player_id FROM players WHERE name LIKE ? COLLATE NOCASE",
         (f"%{player_name}%",)

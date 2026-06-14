@@ -207,6 +207,11 @@ async def send_alerts():
                 'model_context': cand['ctx_data'],
             }
 
+            # Optional LLM one-line rationale (fail-safe; None when LLM is off).
+            from src.pipelines.alert_rationale import generate_alert_rationale
+            execution_context['llm_rationale'] = await generate_alert_rationale(
+                cand['edge'], execution_context)
+
             timestamp = utcnow().isoformat()
             order_records: list[dict] = []
             telegram_delivered = False

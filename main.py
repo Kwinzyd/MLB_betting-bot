@@ -47,6 +47,8 @@ def main():
     subparsers.add_parser('sgp', help="Find and alert Same Game Parlays (SGPs)")
     subparsers.add_parser('trigger', help="Run trigger watch for weather and umpires")
     subparsers.add_parser('fit-dispersion', help="Fit dispersion models for projections")
+    subparsers.add_parser('enrich', help="LLM-normalize today's injury reports into availability signals")
+    subparsers.add_parser('reconcile', help="LLM-resolve unmatched prop player names into the resolution cache")
     subparsers.add_parser('live', help="Run the continuous Live State Machine daemon for in-game prop sniping")
 
     # schedule
@@ -134,8 +136,10 @@ def main():
     try:
         if args.command == 'sync':
             logger.info("Running SYNC mode...")
+            from src.pipelines.enrich_injuries import enrich_injuries
             asyncio.run(sync_events())
             asyncio.run(sync_injuries())
+            asyncio.run(enrich_injuries())  # LLM injury signals (no-op if LLM off)
             asyncio.run(sync_stats())
             asyncio.run(sync_lineups())
             sync_umpires()
@@ -148,8 +152,10 @@ def main():
 
         elif args.command == 'run':
             logger.info("Running FULL pipeline (sync -> scan -> alerts)...")
+            from src.pipelines.enrich_injuries import enrich_injuries
             asyncio.run(sync_events())
             asyncio.run(sync_injuries())
+            asyncio.run(enrich_injuries())  # LLM injury signals (no-op if LLM off)
             asyncio.run(sync_lineups())
             sync_umpires()
             # asyncio.run(sync_stats()) omitted by default (slow, run separately)
@@ -254,6 +260,16 @@ def main():
             question = ' '.join(args.question)
             answer = asyncio.run(ask(question))
             print(f"\n{answer}\n")
+
+        elif args.command == 'enrich':
+            from src.pipelines.enrich_injuries import enrich_injuries
+            logger.info("Running ENRICH (LLM injury signals)...")
+            asyncio.run(enrich_injuries())
+
+        elif args.command == 'reconcile':
+            from src.pipelines.reconcile_names import reconcile_names
+            logger.info("Running RECONCILE (LLM name resolution)...")
+            asyncio.run(reconcile_names())
 
         elif args.command == 'calibrate':
             from src.pipelines.calibrate_model import calibrate_all

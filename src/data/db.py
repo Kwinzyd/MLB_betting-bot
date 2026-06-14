@@ -26,6 +26,8 @@ def init_db():
         _migrate_alerts_sent_unique(conn)
         _migrate_alerts_delivery_cols(conn)
         _migrate_bet_candidates(conn)
+        _migrate_player_injury_signals(conn)
+        _migrate_player_name_resolutions(conn)
         _migrate_missing_indexes(conn)
         _migrate_players_mlb_id(conn)
         _migrate_games_last_synced_at(conn)
@@ -205,6 +207,35 @@ def _migrate_bet_candidates(conn):
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_bet_candidates_created ON bet_candidates(created_at)"
     )
+
+
+def _migrate_player_injury_signals(conn):
+    """Create the LLM injury-signal table on DBs that predate it."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS player_injury_signals (
+            player_id        INTEGER,
+            player_name      TEXT,
+            date             TEXT,
+            play_status      TEXT,
+            play_probability REAL,
+            impact_summary   TEXT,
+            source_status    TEXT,
+            created_at       TEXT,
+            PRIMARY KEY (player_id, date)
+        )
+    """)
+
+
+def _migrate_player_name_resolutions(conn):
+    """Cache of resolved player-name -> player_id mappings (deterministic + LLM)."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS player_name_resolutions (
+            query       TEXT PRIMARY KEY,
+            player_id   INTEGER,
+            method      TEXT,
+            created_at  TEXT
+        )
+    """)
 
 
 def _migrate_missing_indexes(conn):

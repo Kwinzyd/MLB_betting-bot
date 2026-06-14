@@ -143,8 +143,10 @@ async def _dispatch(command: str) -> None:
     from src.pipelines.settle_results import settle_results
 
     if command == "run":
+        from src.pipelines.enrich_injuries import enrich_injuries
         await sync_events()
         await sync_injuries()
+        await enrich_injuries()  # LLM injury signals (no-op if LLM off)
         await sync_lineups()
         sync_umpires()
         from src.pipelines.calculate_team_stats import calculate_team_stats
