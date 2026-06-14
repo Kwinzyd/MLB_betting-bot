@@ -6,6 +6,7 @@ from collections import Counter
 from datetime import datetime, timezone, timedelta
 from src.config import (
     MARKETS_MAPPING, UMP_MIN_GAMES, UMP_K_WEIGHT, PREGAME_WINDOW_MINUTES,
+    PREGAME_RESCAN_MINUTES,
     SHARP_BOOKMAKERS, ALT_LINE_MAX_DISTANCE, MAX_BETS_PER_PLAYER,
     SHARP_MODEL_AGREEMENT_TOL, BOOKMAKER_BIAS_THRESHOLD, EDGE_MIN,
 )
@@ -445,18 +446,27 @@ def _should_scan_game(game, now_utc: datetime) -> tuple[str, str | None]:
     """
     Eligibility gate. Returns ("scan", None) if the game should be scanned,
     else ("skip", reason). Reasons:
+      - "already_started":   first pitch has passed — pregame pipeline never
+                             produces in-play alerts (the live daemon does)
       - "no_lineup_confirm": lineups not yet stamped, and outside pregame window
       - "already_scanned":   lineups stamped but already scanned since
-      - "outside_window":    lineups stamped+already scanned (or absent) and
-                             first pitch is not within PREGAME_WINDOW_MINUTES
+      - "recently_scanned":  in the window but scanned within PREGAME_RESCAN_MINUTES
+      - "outside_window":    first pitch is not within PREGAME_WINDOW_MINUTES
 
     Scan when either:
       (a) lineups were confirmed after the last scan (new info → re-price), or
-      (b) first pitch is within PREGAME_WINDOW_MINUTES (high-volatility window).
+      (b) first pitch is within PREGAME_WINDOW_MINUTES (high-volatility window),
+          throttled to one scan per PREGAME_RESCAN_MINUTES to bound quota.
     """
     confirmed_at = _parse_iso(game['lineups_confirmed_at'])
     last_scanned = _parse_iso(game['last_scanned_at'])
     game_time = _parse_iso(game['game_time'])
+
+    # Hard guard: a game whose first pitch has passed is never scanned by the
+    # pregame pipeline — this is what keeps a late lineup confirmation (or a
+    # forced run) from firing an in-play alert.
+    if game_time is not None and game_time <= now_utc:
+        return ("skip", "already_started")
 
     # (a) Lineup drop triggers one re-scan.
     if confirmed_at is not None:
@@ -467,7 +477,10 @@ def _should_scan_game(game, now_utc: datetime) -> tuple[str, str | None]:
     if game_time is not None:
         minutes_until = (game_time - now_utc).total_seconds() / 60.0
         if 0 <= minutes_until <= PREGAME_WINDOW_MINUTES:
-            return ("scan", None)
+            if (last_scanned is None
+                    or (now_utc - last_scanned).total_seconds() >= PREGAME_RESCAN_MINUTES * 60):
+                return ("scan", None)
+            return ("skip", "recently_scanned")
 
     if confirmed_at is None:
         return ("skip", "no_lineup_confirm")

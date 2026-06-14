@@ -1,6 +1,8 @@
 from src.clients.mlb_stats import MLBStatsClient
 from src.data.db import get_db_connection
-from src.utils.time_utils import get_eastern_local_date, get_utc_now_iso
+from src.utils.time_utils import (
+    get_eastern_local_date, get_utc_now_iso, eastern_date_utc_window,
+)
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -41,13 +43,19 @@ async def sync_lineups():
     """
     logger.info("Executing pipeline: sync_lineups")
     bdl_client = MLBStatsClient()
-    today = str(get_eastern_local_date())
+    today_date = get_eastern_local_date()
+    today = str(today_date)
 
-    # Get today's games from DB
+    # Get today's games by the Eastern-day UTC window. Filtering on the UTC
+    # `date` string with the Eastern date dropped late games (UTC rolls to the
+    # next day), so their lineups never confirmed pregame and the scan only
+    # fired in-play. The window captures every game on the Eastern slate.
+    start_utc, end_utc = eastern_date_utc_window(today_date)
     with get_db_connection() as conn:
         games = [dict(r) for r in conn.execute(
-            "SELECT game_id, bdl_game_id, home_team, away_team FROM games WHERE status != 'COMPLETED' AND date LIKE ?",
-            (f"{today}%",)
+            "SELECT game_id, bdl_game_id, home_team, away_team FROM games "
+            "WHERE status != 'COMPLETED' AND date >= ? AND date < ?",
+            (start_utc, end_utc)
         ).fetchall()]
 
     if not games:

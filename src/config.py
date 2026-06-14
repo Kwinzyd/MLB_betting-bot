@@ -30,7 +30,15 @@ MIN_MODEL_PROB = float(os.getenv("MIN_MODEL_PROB", "0.55"))
 MIN_SAMPLE_SIZE = int(os.getenv("MIN_SAMPLE_SIZE", "10"))
 MAX_BETS_PER_GAME = int(os.getenv("MAX_BETS_PER_GAME", "3"))
 MAX_BETS_PER_PLAYER = int(os.getenv("MAX_BETS_PER_PLAYER", "1"))
-PREGAME_WINDOW_MINUTES = int(os.getenv("PREGAME_WINDOW_MINUTES", "45"))
+# How far before first pitch a game becomes scan-eligible. 120 min gives a few
+# hours of pregame coverage so picks land well before the game starts (player
+# props usually post 2-4h out). Raise for earlier picks at the cost of more
+# Odds API calls; the re-scan throttle below bounds that cost.
+PREGAME_WINDOW_MINUTES = int(os.getenv("PREGAME_WINDOW_MINUTES", "120"))
+# Inside the pregame window, re-scan a game at most once per this many minutes.
+# Stops a wide window from burning quota by re-pulling odds on every scheduler
+# tick; a lineup change still forces an immediate re-scan via its own trigger.
+PREGAME_RESCAN_MINUTES = int(os.getenv("PREGAME_RESCAN_MINUTES", "60"))
 MLB_SEASON = int(os.getenv("MLB_SEASON", "2026"))
 ODDS_REGION = os.getenv("ODDS_REGION", "us")
 BOOKMAKERS = os.getenv("BOOKMAKERS", "draftkings,fanduel,betmgm,caesars,pointsbetus,betrivers").split(",")

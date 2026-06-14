@@ -64,3 +64,47 @@ def test_scans_on_new_lineup_drop_after_prior_scan():
         last_scanned_at='2026-04-13T18:00:00+00:00',
     )
     assert _should_scan_game(g, now)[0] == "scan"
+
+
+def test_in_play_lineup_confirmation_never_scans():
+    """A lineup confirmed AFTER first pitch must not trigger an in-play scan —
+    this is the guard that keeps the pregame pipeline pregame-only."""
+    now = datetime(2026, 4, 13, 23, 30, tzinfo=timezone.utc)  # 30 min into the game
+    g = _game(
+        game_time='2026-04-13T23:00:00+00:00',
+        lineups_confirmed_at='2026-04-13T23:25:00+00:00',  # confirmed in-play
+        last_scanned_at=None,
+    )
+    decision, reason = _should_scan_game(g, now)
+    assert decision == "skip"
+    assert reason == "already_started"
+
+
+def test_rescan_throttled_inside_window():
+    """Inside the window, a game scanned a few minutes ago is not re-scanned —
+    bounds Odds API quota when the window is wide."""
+    now = datetime(2026, 4, 13, 22, 0, tzinfo=timezone.utc)  # 60 min to pitch (in 120 window)
+    g = _game(
+        game_time='2026-04-13T23:00:00+00:00',
+        last_scanned_at='2026-04-13T21:50:00+00:00',  # 10 min ago < 60 min throttle
+    )
+    decision, reason = _should_scan_game(g, now)
+    assert decision == "skip"
+    assert reason == "recently_scanned"
+
+
+def test_rescans_after_throttle_interval_inside_window():
+    now = datetime(2026, 4, 13, 22, 0, tzinfo=timezone.utc)
+    g = _game(
+        game_time='2026-04-13T23:00:00+00:00',
+        last_scanned_at='2026-04-13T20:30:00+00:00',  # 90 min ago > 60 min throttle
+    )
+    assert _should_scan_game(g, now)[0] == "scan"
+
+
+def test_scans_two_hours_out_with_wider_window():
+    """With the 120-min default, a game ~110 min away is now eligible (was not
+    under the old 45-min window)."""
+    now = datetime(2026, 4, 13, 21, 10, tzinfo=timezone.utc)  # 110 min to pitch
+    g = _game(game_time='2026-04-13T23:00:00+00:00', last_scanned_at=None)
+    assert _should_scan_game(g, now)[0] == "scan"
