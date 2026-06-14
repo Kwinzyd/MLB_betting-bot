@@ -17,7 +17,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 # Cheap + fast default for high-volume extraction/tool-use; override per taste.
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemini-2.0-flash-001")
+# Must be a current OpenRouter model id (the catalog changes — verify with
+# GET https://openrouter.ai/api/v1/models if calls 404).
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemini-3.5-flash")
 # Optional stronger model for the research agent's reasoning; defaults to the
 # cheap model so a single key/model works out of the box.
 OPENROUTER_RESEARCH_MODEL = os.getenv("OPENROUTER_RESEARCH_MODEL", OPENROUTER_MODEL)
