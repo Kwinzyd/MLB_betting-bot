@@ -9,6 +9,25 @@ BDL_API_KEY = os.getenv("BDL_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# --- OpenRouter LLM layer (qualitative enrichment, research agent, alert
+# rationale, name reconciliation). The LLM never produces projections,
+# probabilities, or stake sizes — only structured context the quant core reads.
+# The whole layer is OPTIONAL and fail-safe: with no key or LLM_ENABLED=false,
+# every call no-ops and the bot falls back to its non-LLM behavior. ---
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+# Cheap + fast default for high-volume extraction/tool-use; override per taste.
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemini-2.0-flash-001")
+# Optional stronger model for the research agent's reasoning; defaults to the
+# cheap model so a single key/model works out of the box.
+OPENROUTER_RESEARCH_MODEL = os.getenv("OPENROUTER_RESEARCH_MODEL", OPENROUTER_MODEL)
+# Master switch. Defaults to enabled only when a key is present.
+LLM_ENABLED = os.getenv("LLM_ENABLED", "true").lower() in ("1", "true", "yes") and bool(OPENROUTER_API_KEY)
+LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "30"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1024"))
+# Cache identical prompts this long to bound cost (enrichment re-runs on a slate).
+LLM_CACHE_TTL_SECONDS = int(os.getenv("LLM_CACHE_TTL_SECONDS", "21600"))  # 6h
+
 # Polymarket L2 / CLOB API Auth
 POLYMARKET_HOST = os.getenv("POLYMARKET_HOST", "https://clob.polymarket.com")
 POLYMARKET_API_KEY = os.getenv("POLYMARKET_API_KEY")

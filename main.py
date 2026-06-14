@@ -116,6 +116,10 @@ def main():
         '--season', type=int, default=None,
         help="Season year to sync (default: current year)"
     )
+    ask_parser = subparsers.add_parser(
+        'ask', help="Ask the LLM research agent a natural-language question over the BDL data")
+    ask_parser.add_argument('question', nargs='+', help="The question, e.g. ask how has Cole trended")
+
     subparsers.add_parser('calibrate', help="Fit Platt/isotonic calibration params per market")
     subparsers.add_parser('fit-correlations',
                           help="Fit empirical portfolio correlations from settled bets")
@@ -244,6 +248,12 @@ def main():
             season = args.season or datetime.now().year
             logger.info(f"Running STATCAST sync for season {season}...")
             asyncio.run(sync_statcast(season=season))
+
+        elif args.command == 'ask':
+            from src.pipelines.research_agent import ask
+            question = ' '.join(args.question)
+            answer = asyncio.run(ask(question))
+            print(f"\n{answer}\n")
 
         elif args.command == 'calibrate':
             from src.pipelines.calibrate_model import calibrate_all
