@@ -16,6 +16,7 @@ from src.config import (
     PA_ELASTICITY_TO_TOTAL,
     PA_DIST_SUPPORT,
     PA_DIST_ANCHOR,
+    PA_MONEYLINE_TILT_K,
 )
 
 
@@ -88,18 +89,42 @@ def expected_pa(dist: Dict[int, float]) -> float:
     return sum(k * p for k, p in dist.items())
 
 
+def _american_to_prob(ml) -> Optional[float]:
+    """American odds -> implied probability (with vig). None on bad input."""
+    if ml in (None, ""):
+        return None
+    try:
+        ml = float(ml)
+    except (TypeError, ValueError):
+        return None
+    if ml < 0:
+        return (-ml) / ((-ml) + 100.0)
+    return 100.0 / (ml + 100.0)
+
+
 def implied_team_total(game_total: Optional[float],
                        moneyline_home: Optional[int] = None,
                        moneyline_away: Optional[int] = None,
                        side: str = "home") -> float:
-    """Translate a game total into a per-team implied run total.
+    """Translate a game total into the per-team implied run total for `side`.
 
-    v1: symmetric split. Moneyline arguments are accepted for forward
-    compatibility but ignored — favorite-tilt is deferred to a later phase.
+    Without moneylines, splits the total evenly (the historical behavior, kept
+    for callers that don't have prices). With both moneylines, tilts the split
+    toward the favorite: the no-vig win probability nudges the team's share of
+    the total around 0.5, bounded so a heavy favorite can't run away with it.
     """
-    if game_total is None:
-        return LEAGUE_AVG_GAME_TOTAL / 2.0
-    return game_total / 2.0
+    gt = LEAGUE_AVG_GAME_TOTAL if game_total is None else game_total
+
+    ph = _american_to_prob(moneyline_home)
+    pa = _american_to_prob(moneyline_away)
+    if ph is None or pa is None or (ph + pa) <= 0:
+        return gt / 2.0
+
+    p_home = ph / (ph + pa)                       # no-vig home win prob
+    p_side = p_home if side == "home" else (1.0 - p_home)
+    share = 0.5 + PA_MONEYLINE_TILT_K * (p_side - 0.5)
+    share = max(0.40, min(0.60, share))           # guardrail on extreme favorites
+    return gt * share
 
 
 def estimate_remaining_pa_distribution(

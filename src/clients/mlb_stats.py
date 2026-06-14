@@ -228,6 +228,24 @@ class MLBStatsClient:
         cache_key = f"bdl_mlb_injuries_{team_ids}_{player_ids}"
         return await self._get("player_injuries", params=params, cache_key=cache_key, cache_ttl=3600)
 
+    async def get_odds(self, game_ids=None, dates=None):
+        """Fetch BDL game-level betting odds (moneyline / run line / total).
+
+        BDL provides GAME odds only (no player props), across several books.
+        Used as a free, unlimited backup/supplement for the game total and as
+        the moneyline source for implied-team-total tilting. One of game_ids or
+        dates is required by the API.
+        """
+        params = {}
+        if game_ids is not None:
+            params["game_ids[]"] = game_ids
+        if dates is not None:
+            params["dates[]"] = dates
+        if not params:
+            return []
+        cache_key = f"bdl_mlb_odds_{game_ids}_{dates}"
+        return await self._get("odds", params=params, cache_key=cache_key, cache_ttl=300)
+
     async def get_season_averages(self, player_ids, season=None):
         """Fetch season averages for one or more players."""
         season = season or MLB_SEASON

@@ -457,7 +457,8 @@ class ProjectionModel:
                             extra_features: dict = None,
                             player_id: int = None,
                             game_total: float = None,
-                            bp_weight: float = 0.10) -> Optional[Dict]:
+                            bp_weight: float = 0.10,
+                            implied_team_total_override: float = None) -> Optional[Dict]:
         """
         Project a batter stat (hits, total_bases, home_runs).
 
@@ -491,6 +492,7 @@ class ProjectionModel:
             extra_features=extra_features,
             dispersion=disp,
             game_total=game_total,
+            implied_team_total_override=implied_team_total_override,
         )
         if glm_result is not None:
             return self._finalize(glm_result)
@@ -518,7 +520,8 @@ class ProjectionModel:
         # --- Projected plate appearances from lineup position, scaled by game total ---
         base_pa = LINEUP_PA_MAP.get(lineup_position, DEFAULT_PROJECTED_PA)
         if PA_ESTIMATOR_ENABLED:
-            itt = implied_team_total(game_total)
+            itt = (implied_team_total_override if implied_team_total_override is not None
+                   else implied_team_total(game_total))
             pa_dist = estimate_pa_distribution(lineup_position, itt)
             projected_pa = expected_pa(pa_dist)
         else:
@@ -660,7 +663,8 @@ class ProjectionModel:
 
     def _try_glm_batter(self, market, batter_logs, pitcher_hand, batter_hand,
                         venue, line, lineup_position, weather, extra_features,
-                        dispersion=None, game_total=None):
+                        dispersion=None, game_total=None,
+                        implied_team_total_override=None):
         """Run the Poisson GLM path for a batter market. Returns None if unavailable."""
         glm = self._glm.get(market)
         if glm is None:
@@ -670,7 +674,8 @@ class ProjectionModel:
 
         base_pa = LINEUP_PA_MAP.get(lineup_position, DEFAULT_PROJECTED_PA)
         if PA_ESTIMATOR_ENABLED:
-            itt = implied_team_total(game_total)
+            itt = (implied_team_total_override if implied_team_total_override is not None
+                   else implied_team_total(game_total))
             pa_dist = estimate_pa_distribution(lineup_position, itt)
             projected_pa = expected_pa(pa_dist)
         else:

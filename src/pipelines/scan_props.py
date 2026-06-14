@@ -12,6 +12,7 @@ from src.config import (
 )
 from src.models.distributions import get_probabilities
 from src.clients.odds_api import OddsAPIClient
+from src.clients.bdl_odds import get_game_market
 from src.clients.weather import WeatherClient
 from src.data.db import get_db_connection
 from src.data.park_factors import get_stadium_meta
@@ -151,7 +152,17 @@ async def scan_props(force: bool = False, game_ids: list = None):
         player_lines = _parse_odds_by_player(event_odds)
         player_market_groups = _group_by_player_market(player_lines)
         game_total = _parse_game_total(event_odds)
-        if game_total is not None:
+
+        # BDL game-level odds (free, unlimited): back up a missing Odds API
+        # total and supply moneylines for moneyline-tilted implied team totals.
+        # BDL has no player props, so this only touches the game-total feature.
+        bdl_market = await get_game_market(dict(game).get('bdl_game_id'))
+        if game_total is None and bdl_market and bdl_market.get('total') is not None:
+            game_total = bdl_market['total']
+            logger.info("Using BDL game total %.1f for %s (Odds API total unavailable).",
+                        game_total, game_id)
+            _record_total_snapshot(game_id, game_total, source='bdl_fallback')
+        elif game_total is not None:
             _record_total_snapshot(game_id, game_total, source='scan')
 
         # 3. For each (player, market):
@@ -176,7 +187,7 @@ async def scan_props(force: bool = False, game_ids: list = None):
                 proj_model, player_name, market_key, anchor_line,
                 game_id, home_team, away_team, venue,
                 weather=weather, ump_k_factor=ump_k_factor,
-                game_total=game_total,
+                game_total=game_total, bdl_market=bdl_market,
             )
             if not projection:
                 continue
@@ -653,7 +664,8 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
                       game_id: str, home_team: str, away_team: str,
                       venue: str, weather: dict = None,
                       ump_k_factor: float = 1.0,
-                      game_total: float = None) -> dict:
+                      game_total: float = None,
+                      bdl_market: dict = None) -> dict:
     """Build a projection for a player+market by looking up their stats in the DB."""
     with get_db_connection() as conn:
         # Find the player
@@ -807,6 +819,18 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
                 db=conn, batter_id=player_id,
             )
 
+            # Moneyline-tilted implied team total when BDL supplied moneylines:
+            # the batter's club's share of the game total leans to the favorite.
+            itt_override = None
+            if (bdl_market and bdl_market.get('ml_home') is not None
+                    and bdl_market.get('ml_away') is not None):
+                from src.models.pa_estimator import implied_team_total
+                batter_side = 'home' if team_id == home_id else 'away'
+                itt_override = implied_team_total(
+                    game_total, bdl_market['ml_home'], bdl_market['ml_away'],
+                    side=batter_side,
+                )
+
             proj = proj_model.project_batter_stat(
                 logs, stat_type, pitcher_hand, bats, venue, line,
                 lineup_position=lineup_position,
@@ -814,6 +838,7 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
                 extra_features=batter_extra,
                 player_id=player_id,
                 game_total=game_total,
+                implied_team_total_override=itt_override,
             )
             if proj:
                 proj['injury_status'] = injury_status

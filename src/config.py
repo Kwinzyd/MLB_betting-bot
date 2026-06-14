@@ -250,6 +250,10 @@ PA_ELASTICITY_TO_TOTAL = 0.35  # 10% more expected runs -> ~3.5% more PAs
 PA_ESTIMATOR_ENABLED = True
 PA_DIST_SUPPORT = (3, 4, 5, 6, 7)
 PA_DIST_ANCHOR = 3
+# Strength of moneyline favorite-tilt on the implied team total. The team's
+# share of the game total = 0.5 + K*(win_prob - 0.5), bounded to [0.40, 0.60].
+# 0.5 keeps it mild (a 65% favorite gets ~57.5% of runs). 0 = symmetric split.
+PA_MONEYLINE_TILT_K = float(os.getenv("PA_MONEYLINE_TILT_K", "0.5"))
 
 HR_ZINB_ENABLED = True
 LEAGUE_AVG_HR9 = 1.30
