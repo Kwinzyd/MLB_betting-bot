@@ -1,4 +1,5 @@
-from datetime import datetime, timedelta
+from datetime import timedelta
+from src.utils.time_utils import utcnow
 from src.data.db import get_db_connection
 from src.utils.logging_utils import get_logger
 
@@ -14,13 +15,18 @@ def prune_old_data(
     completed_games_days: int = 90,
     alerts_days: int = 90,
     hot_data_days: int = 3,
+    snapshot_days: int = 90,
 ) -> dict:
     """
     Remove old rows from every time-bounded table.
 
     Retention windows (all configurable):
-      hot_data_days       — prop_snapshots, projections, daily_lineups,
-                            probable_pitchers, injury_reports  (default 3)
+      hot_data_days       — daily_lineups, probable_pitchers,
+                            injury_reports, bet_candidates              (default 3)
+      snapshot_days       — prop_snapshots, projections                 (default 90)
+                            Long retention on purpose: these are the raw
+                            material for backtests, CLV on late-settling
+                            bets, and steam baselines.
       game_logs_days      — pitcher_game_logs, batter_game_logs         (default 90)
       completed_games_days — games with status='COMPLETED'               (default 90)
       alerts_days         — alerts_sent + cascaded bet_results           (default 90)
@@ -31,9 +37,10 @@ def prune_old_data(
     """
     logger.info("Executing pipeline: prune_old_data")
 
-    now = datetime.utcnow()
+    now = utcnow()
 
     hot_cutoff       = (now - timedelta(days=hot_data_days)).isoformat()
+    snapshot_cutoff  = (now - timedelta(days=snapshot_days)).isoformat()
     logs_cutoff      = (now - timedelta(days=game_logs_days)).isoformat()
     games_cutoff     = (now - timedelta(days=completed_games_days)).isoformat()
     alerts_cutoff    = (now - timedelta(days=alerts_days)).isoformat()
@@ -41,16 +48,22 @@ def prune_old_data(
     deleted: dict = {}
 
     with get_db_connection() as conn:
-        # 1. Hot / transient data (same tables as _cleanup_stale_data in sync_events)
+        # 1a. Hot / transient data
         hot_tables = {
-            "prop_snapshots":   "timestamp",
-            "projections":      "timestamp",
             "daily_lineups":    "date",
             "probable_pitchers":"date",
             "injury_reports":   "date",
+            "bet_candidates":   "created_at",
         }
         for table, col in hot_tables.items():
             cur = conn.execute(f"DELETE FROM {table} WHERE {col} < ?", (hot_cutoff,))
+            deleted[table] = cur.rowcount
+
+        # 1b. Odds history — long retention (backtests / CLV / steam baselines)
+        for table in ("prop_snapshots", "projections"):
+            cur = conn.execute(
+                f"DELETE FROM {table} WHERE timestamp < ?", (snapshot_cutoff,)
+            )
             deleted[table] = cur.rowcount
 
         # 2. Game logs — keep enough history for the 20-game projection lookback.

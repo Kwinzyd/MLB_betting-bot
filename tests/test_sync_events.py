@@ -1,9 +1,10 @@
 import pytest
 import sqlite3
-import datetime
 import asyncio
 from unittest.mock import patch, MagicMock, AsyncMock
 from freezegun import freeze_time
+
+from src.utils.time_utils import utcnow
 from src.pipelines.sync_events import sync_events
 
 
@@ -41,6 +42,7 @@ def memory_db():
         CREATE TABLE daily_lineups (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT);
         CREATE TABLE probable_pitchers (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT);
         CREATE TABLE injury_reports (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT);
+        CREATE TABLE bet_candidates (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT);
     ''')
     # Seed teams so sync_events skips the BDL team-sync branch
     conn.executemany(
@@ -54,6 +56,46 @@ def memory_db():
     )
     conn.commit()
     return conn
+
+
+@patch('src.pipelines.sync_events.MLBStatsClient')
+@patch('src.pipelines.sync_events.get_db_connection')
+@patch('src.clients.odds_api.httpx.AsyncClient.get', new_callable=AsyncMock)
+def test_sync_events_preserves_live_and_final_status(
+    mock_session_get, mock_get_db, mock_bdl_cls, memory_db
+):
+    """The upsert must never demote IN_PROGRESS / COMPLETED back to SCHEDULED —
+    settle_results depends on COMPLETED surviving subsequent event syncs."""
+    memory_db.execute(
+        "INSERT INTO games (game_id, home_team, away_team, status) "
+        "VALUES ('mock_game_123', 'New York Yankees', 'Boston Red Sox', 'COMPLETED')")
+    memory_db.execute(
+        "INSERT INTO games (game_id, home_team, away_team, status) "
+        "VALUES ('mock_game_456', 'Chicago Cubs', 'Philadelphia Phillies', 'IN_PROGRESS')")
+    memory_db.commit()
+
+    mock_get_db.return_value.__enter__.return_value = memory_db
+    mock_get_db.return_value.__exit__.return_value = None
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.raise_for_status = MagicMock()
+    mock_response.json.return_value = [
+        {"id": "mock_game_123", "commence_time": "2024-05-15T23:05:00Z",
+         "home_team": "New York Yankees", "away_team": "Boston Red Sox"},
+        {"id": "mock_game_456", "commence_time": "2024-05-15T23:05:00Z",
+         "home_team": "Chicago Cubs", "away_team": "Philadelphia Phillies"},
+    ]
+    mock_session_get.return_value = mock_response
+    mock_bdl_cls.return_value.get_teams = AsyncMock(return_value=[])
+    mock_bdl_cls.return_value.get_games = AsyncMock(return_value=[])
+
+    asyncio.run(sync_events())
+
+    statuses = {r['game_id']: r['status'] for r in
+                memory_db.execute("SELECT game_id, status FROM games").fetchall()}
+    assert statuses['mock_game_123'] == 'COMPLETED'
+    assert statuses['mock_game_456'] == 'IN_PROGRESS'
 
 
 @patch('src.pipelines.sync_events.MLBStatsClient')
@@ -105,7 +147,7 @@ def test_sync_events_with_dynamic_frozen_date(mock_session_get, mock_get_db, moc
     mock_get_db.return_value.__enter__.return_value = memory_db
     mock_get_db.return_value.__exit__.return_value = None
 
-    frozen_now = datetime.datetime.utcnow()
+    frozen_now = utcnow()
     mock_commence_time = frozen_now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     mock_response = MagicMock()

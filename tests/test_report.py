@@ -1,35 +1,16 @@
-import sqlite3
 from unittest.mock import patch
 
 import pytest
 
+from tests.fixtures.fixture_db import memory_conn
+
 
 @pytest.fixture
 def memory_db():
-    """In-memory DB with three settled bets: WIN (+CLV), LOSS (-CLV), PUSH (0 CLV)."""
-    conn = sqlite3.connect(':memory:')
-    conn.row_factory = sqlite3.Row
-    conn.executescript('''
-        CREATE TABLE alerts_sent (
-            alert_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            player_name TEXT, market TEXT, line REAL, side TEXT,
-            edge REAL, ev REAL, kelly_stake REAL, bookmaker TEXT,
-            odds REAL, opening_odds REAL,
-            model_prob_over REAL, model_prob_under REAL,
-            game_id TEXT, timestamp TEXT
-        );
-        CREATE TABLE bet_results (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            alert_id INTEGER, actual_value REAL, result TEXT,
-            profit REAL, closing_odds REAL, clv REAL
-        );
-        CREATE TABLE projections (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            game_id TEXT, player_name TEXT, market TEXT,
-            projected_mean REAL, prob_over REAL, prob_under REAL,
-            context_json TEXT, timestamp TEXT
-        );
-    ''')
+    """In-memory DB (full production schema) with three settled bets:
+    WIN (+CLV), LOSS (-CLV), PUSH (0 CLV). Built via memory_conn() so the
+    report's bankroll_snapshots query and every column it selects exist."""
+    conn = memory_conn()
     # WIN bet: over 6.5, actual=8, prob_over=0.60, clv=+0.02
     conn.execute('''INSERT INTO alerts_sent
         (player_name, market, line, side, edge, ev, kelly_stake, bookmaker,

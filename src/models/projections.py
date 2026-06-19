@@ -1,7 +1,16 @@
+import json
+import math
 import os
+import time
+from collections import Counter
 from typing import List, Dict, Any, Optional
 from src.utils.logging_utils import get_logger
-from src.models.distributions import get_probabilities
+from src.models.distributions import (
+    get_probabilities, get_probabilities_mixture, compute_hr_pi0,
+)
+from src.models.pa_estimator import (
+    estimate_pa_distribution, expected_pa, implied_team_total,
+)
 from src.data.park_factors import get_park_factor
 from src.config import (
     LEAGUE_AVG_K_RATE, LEAGUE_AVG_RUNS_PER_GAME,
@@ -11,10 +20,56 @@ from src.config import (
     BATTER_RECENT_WEIGHT, BATTER_SEASON_WEIGHT,
     LINEUP_PA_MAP, DEFAULT_PROJECTED_PA,
     LEAGUE_AVG_GAME_TOTAL, PA_ELASTICITY_TO_TOTAL,
+    PA_ESTIMATOR_ENABLED,
+    HR_ZINB_ENABLED,
     UMP_ER_K_DAMPENING,
 )
 
+
+def _batter_iso_from_logs(logs):
+    """Recent + season blended ISO (slugging - avg) from batter game logs."""
+    if not logs:
+        return None
+    total_2b = sum(l.get('doubles', 0) or 0 for l in logs)
+    total_3b = sum(l.get('triples', 0) or 0 for l in logs)
+    total_hr = sum(l.get('home_runs', 0) or 0 for l in logs)
+    total_h = sum(l.get('hits', 0) or 0 for l in logs)
+    total_ab = sum(l.get('at_bats', 0) or 0 for l in logs)
+    if total_ab <= 0:
+        return None
+    slg = (total_h + total_2b + 2 * total_3b + 3 * total_hr) / total_ab
+    avg = total_h / total_ab
+    return max(0.0, slg - avg)
+
+
+def _compute_hr_pi0(market, batter_logs, park_hr_factor, extra_features, weather):
+    """Compute structural-zero probability for batter_home_runs; None for other markets."""
+    if not HR_ZINB_ENABLED or market != "batter_home_runs":
+        return None
+    pitcher_hr9 = (extra_features or {}).get('opp_pitcher_hr9')
+    wind_in_mph = (weather or {}).get('wind_in_mph')
+    batter_iso = _batter_iso_from_logs(batter_logs)
+    return compute_hr_pi0(
+        pitcher_hr9=pitcher_hr9,
+        batter_iso=batter_iso,
+        park_hr_factor=park_hr_factor,
+        wind_in_mph=wind_in_mph,
+    )
+
 logger = get_logger(__name__)
+
+# Per-market count of GLM->heuristic fallbacks caused by a feature-build/predict
+# FAILURE (not by an absent model). Lets scan_props surface silent degradation
+# instead of quietly serving the crude ERA/K9 heuristic with no Statcast.
+_glm_degradations: Counter = Counter()
+
+
+def pop_glm_degradations() -> dict:
+    """Return and clear the GLM-degradation counts since the last call."""
+    global _glm_degradations
+    snapshot = dict(_glm_degradations)
+    _glm_degradations = Counter()
+    return snapshot
 
 
 def _scale_pa_for_game_total(base_pa: float, game_total: float | None) -> float:
@@ -33,14 +88,17 @@ def _scale_pa_for_game_total(base_pa: float, game_total: float | None) -> float:
     return round(base_pa * scale_factor, 2)
 
 _dispersion_cache: Dict[tuple, Dict] | None = None
+_dispersion_cache_ts: float = 0.0
+_DISPERSION_CACHE_TTL = 3600.0  # reload at most once per hour
 
 
 def _load_dispersion() -> Dict[tuple, Dict]:
-    """Load dispersion_params table into an in-memory dict, cached across calls."""
-    global _dispersion_cache
-    if _dispersion_cache is not None:
+    """Load dispersion_params table into an in-memory dict, refreshed every hour."""
+    global _dispersion_cache, _dispersion_cache_ts
+    now = time.monotonic()
+    if _dispersion_cache is not None and (now - _dispersion_cache_ts) < _DISPERSION_CACHE_TTL:
         return _dispersion_cache
-    _dispersion_cache = {}
+    new_cache: Dict[tuple, Dict] = {}
     try:
         from src.data.db import get_db_connection
         with get_db_connection() as conn:
@@ -49,14 +107,16 @@ def _load_dispersion() -> Dict[tuple, Dict]:
                     "SELECT entity_id, market, alpha, sigma FROM dispersion_params"
                 ).fetchall()
             except Exception:
-                return _dispersion_cache
+                return _dispersion_cache if _dispersion_cache is not None else new_cache
             for r in rows:
-                _dispersion_cache[(r["entity_id"], r["market"])] = {
+                new_cache[(r["entity_id"], r["market"])] = {
                     "alpha": r["alpha"],
                     "sigma": r["sigma"],
                 }
     except Exception:
-        pass
+        return _dispersion_cache if _dispersion_cache is not None else new_cache
+    _dispersion_cache = new_cache
+    _dispersion_cache_ts = now
     return _dispersion_cache
 
 
@@ -67,6 +127,97 @@ def get_dispersion(entity_id: str, market: str) -> Dict:
     if hit:
         return hit
     return cache.get(("__pool__", market), {})
+
+_calib_cache: Dict | None = None
+_calib_cache_ts: float = 0.0
+_CALIB_CACHE_TTL = 3600.0
+
+
+def _load_calibration() -> Dict[str, Dict]:
+    """Load active calibration_params rows as {market: {method, params}} with 1h TTL."""
+    global _calib_cache, _calib_cache_ts
+    now = time.monotonic()
+    if _calib_cache is not None and (now - _calib_cache_ts) < _CALIB_CACHE_TTL:
+        return _calib_cache
+    new_cache: Dict[str, Dict] = {}
+    try:
+        from src.data.db import get_db_connection
+        with get_db_connection() as conn:
+            try:
+                rows = conn.execute(
+                    "SELECT market, method, params_json FROM calibration_params WHERE is_active=1"
+                ).fetchall()
+            except Exception:
+                return _calib_cache if _calib_cache is not None else new_cache
+            for r in rows:
+                try:
+                    new_cache[r["market"]] = {
+                        "method": r["method"],
+                        "params": json.loads(r["params_json"]),
+                    }
+                except Exception:
+                    pass
+    except Exception:
+        return _calib_cache if _calib_cache is not None else new_cache
+    _calib_cache = new_cache
+    _calib_cache_ts = now
+    return _calib_cache
+
+
+def _apply_calibration(prob: float, market: str) -> float:
+    """Apply the active calibration transform (Platt or isotonic) to a probability."""
+    entry = _load_calibration().get(market)
+    if not entry:
+        return prob
+    method = entry["method"]
+    params = entry["params"]
+    if method == "identity" or not params:
+        return prob
+    if method == "platt":
+        a = params.get("a", 1.0)
+        b = params.get("b", 0.0)
+        p = max(1e-6, min(1 - 1e-6, prob))
+        logit_p = math.log(p / (1.0 - p))
+        return 1.0 / (1.0 + math.exp(-(a * logit_p + b)))
+    if method == "isotonic":
+        x = params.get("x_thresholds", [])
+        y = params.get("y_thresholds", [])
+        if not x or not y:
+            return prob
+        if prob <= x[0]:
+            return float(y[0])
+        if prob >= x[-1]:
+            return float(y[-1])
+        import bisect
+        i = bisect.bisect_right(x, prob) - 1
+        x0, x1 = x[i], x[i + 1]
+        y0, y1 = y[i], y[i + 1]
+        return y0 if x1 == x0 else y0 + (y1 - y0) * (prob - x0) / (x1 - x0)
+    return prob
+
+
+def _calibrate_result(result: Dict | None, enabled: bool = True) -> Dict | None:
+    """Apply calibration to the over probability and derive the under.
+
+    Calibrating both sides through the same monotone map breaks
+    P(over) + P(under) = 1 (both sides of a market could clear the edge bar
+    at once). Calibrate one side, take the complement for the other.
+
+    `enabled=False` skips calibration entirely — used by the backtest, where
+    calibration params are fit on settled bets that postdate every snapshot
+    (applying them would be lookahead).
+    """
+    if result is None:
+        return None
+    if not enabled:
+        return result
+    market = result.get("market", "")
+    calibrated_over = _apply_calibration(result["prob_over"], market)
+    calibrated_over = max(0.0, min(1.0, calibrated_over))
+    result["prob_over"] = calibrated_over
+    result["prob_under"] = 1.0 - calibrated_over
+    return result
+
 
 _GLM_MARKETS = (
     "pitcher_strikeouts",
@@ -80,10 +231,28 @@ _MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__fil
 
 
 class ProjectionModel:
-    def __init__(self, models_dir: str = None):
+    def __init__(self, models_dir: str = None, apply_calibration: bool = True):
         self._models_dir = models_dir or _MODELS_DIR
+        self._apply_calibration = apply_calibration
         self._glm: Dict[str, Any] = {m: None for m in _GLM_MARKETS}
         self._load_glm_models()
+
+    def _finalize(self, result: Dict | None) -> Dict | None:
+        """Apply (or skip) probability calibration per this model's config."""
+        return _calibrate_result(result, enabled=self._apply_calibration)
+
+    def calibrate_over(self, prob_over: float, market: str) -> float:
+        """Apply this model's active probability calibration to an OVER prob.
+
+        Mirrors _finalize so alt-line reprices share the SAME calibrated basis
+        the anchor projection was built on (the anchor prob is calibrated; the
+        alt-line reprice was not, so the agreement gate and truth-shift compared
+        a calibrated number against raw ones). Identity when calibration is
+        disabled for this model or no params exist for the market.
+        """
+        if not self._apply_calibration:
+            return prob_over
+        return max(0.0, min(1.0, _apply_calibration(prob_over, market)))
 
     def _load_glm_models(self):
         """Load any serialized PoissonGLM models from disk; silently skip missing ones."""
@@ -135,7 +304,7 @@ class ProjectionModel:
             dispersion=disp,
         )
         if glm_result is not None:
-            return glm_result
+            return self._finalize(glm_result)
 
         # Sort by date descending
         logs = sorted(pitcher_logs, key=lambda x: x['date'], reverse=True)
@@ -172,19 +341,22 @@ class ProjectionModel:
 
         # Final projection — ump_k_factor multiplies the raw K projection directly.
         # A large-zone umpire (factor > 1) boosts Ks; a tight zone (factor < 1) suppresses.
-        projected_k = (blended_k_per_9 / 9.0) * proj_ip * opp_adj * park_adj * ump_k_factor
+        projected_k = max(0.0, (blended_k_per_9 / 9.0) * proj_ip * opp_adj * park_adj * ump_k_factor)
 
         prob_over, prob_under = get_probabilities(
             projected_k, line, "pitcher_strikeouts", alpha=disp.get("alpha"),
         )
 
-        return {
+        return self._finalize({
             "player_name": None,  # set by caller
             "market": "pitcher_strikeouts",
             "line": line,
             "projected_mean": round(projected_k, 2),
             "prob_over": prob_over,
             "prob_under": prob_under,
+            "alpha": disp.get("alpha"),
+            "sigma": disp.get("sigma"),
+            "pi0": None,
             "injury_status": "Healthy",
             "sample_size": len(logs),
             "context": {
@@ -200,14 +372,15 @@ class ProjectionModel:
                 "venue": venue,
                 "weather": weather,
             },
-        }
+        })
 
     def project_pitcher_earned_runs(self, pitcher_logs: List[Dict], opponent_runs_per_game: float,
                                     venue: str, line: float,
                                     weather: dict = None,
                                     ump_k_factor: float = 1.0,
                                     extra_features: dict = None,
-                                    player_id: int = None) -> Optional[Dict]:
+                                    player_id: int = None,
+                                    bp_weight: float = 0.10) -> Optional[Dict]:
         """Project pitcher earned runs for a game."""
         if not pitcher_logs or len(pitcher_logs) < 3:
             return None
@@ -226,7 +399,7 @@ class ProjectionModel:
             dispersion=disp,
         )
         if glm_result is not None:
-            return glm_result
+            return self._finalize(glm_result)
 
         logs = sorted(pitcher_logs, key=lambda x: x['date'], reverse=True)
 
@@ -266,21 +439,24 @@ class ProjectionModel:
         
         # Bullpen effect: a bad bullpen allows more of the starter's inherited runners to score
         pitcher_bullpen_era = extra_features.get('pitcher_bullpen_era', LEAGUE_AVG_RUNS_PER_GAME) if extra_features else LEAGUE_AVG_RUNS_PER_GAME
-        bp_adj = 1.0 + ((pitcher_bullpen_era / LEAGUE_AVG_RUNS_PER_GAME) - 1.0) * bp_weight if LEAGUE_AVG_RUNS_PER_GAME > 0 else 1.0
+        bp_adj = (1.0 + ((pitcher_bullpen_era / LEAGUE_AVG_RUNS_PER_GAME) - 1.0) * bp_weight) if LEAGUE_AVG_RUNS_PER_GAME > 0 else 1.0
         
-        projected_er = (blended_era / 9.0) * proj_ip * opp_adj * park_adj * ump_er_factor * bp_adj
+        projected_er = max(0.0, (blended_era / 9.0) * proj_ip * opp_adj * park_adj * ump_er_factor * bp_adj)
 
         prob_over, prob_under = get_probabilities(
             projected_er, line, "pitcher_earned_runs", alpha=disp.get("alpha"),
         )
 
-        return {
+        return self._finalize({
             "player_name": None,
             "market": "pitcher_earned_runs",
             "line": line,
             "projected_mean": round(projected_er, 2),
             "prob_over": prob_over,
             "prob_under": prob_under,
+            "alpha": disp.get("alpha"),
+            "sigma": disp.get("sigma"),
+            "pi0": None,
             "injury_status": "Healthy",
             "sample_size": len(logs),
             "context": {
@@ -298,7 +474,7 @@ class ProjectionModel:
                 "venue": venue,
                 "weather": weather,
             },
-        }
+        })
 
     def project_batter_stat(self, batter_logs: List[Dict], stat_type: str,
                             pitcher_hand: str, batter_hand: str,
@@ -308,7 +484,8 @@ class ProjectionModel:
                             extra_features: dict = None,
                             player_id: int = None,
                             game_total: float = None,
-                            bp_weight: float = 0.10) -> Optional[Dict]:
+                            bp_weight: float = 0.10,
+                            implied_team_total_override: float = None) -> Optional[Dict]:
         """
         Project a batter stat (hits, total_bases, home_runs).
 
@@ -342,9 +519,10 @@ class ProjectionModel:
             extra_features=extra_features,
             dispersion=disp,
             game_total=game_total,
+            implied_team_total_override=implied_team_total_override,
         )
         if glm_result is not None:
-            return glm_result
+            return self._finalize(glm_result)
 
         # --- Per-PA rates (not per-game) ---
         # Season per-PA rate
@@ -368,7 +546,15 @@ class ProjectionModel:
 
         # --- Projected plate appearances from lineup position, scaled by game total ---
         base_pa = LINEUP_PA_MAP.get(lineup_position, DEFAULT_PROJECTED_PA)
-        projected_pa = _scale_pa_for_game_total(base_pa, game_total)
+        if PA_ESTIMATOR_ENABLED:
+            itt = (implied_team_total_override if implied_team_total_override is not None
+                   else implied_team_total(game_total))
+            pa_dist = estimate_pa_distribution(lineup_position, itt)
+            projected_pa = expected_pa(pa_dist)
+        else:
+            itt = None
+            pa_dist = None
+            projected_pa = _scale_pa_for_game_total(base_pa, game_total)
 
         # Platoon adjustment
         platoon_adj = self._get_platoon_adjustment(batter_hand, pitcher_hand, stat_type)
@@ -380,24 +566,37 @@ class ProjectionModel:
 
         # Bullpen effect: bad opposing bullpen gives batters more late-inning opportunities
         opp_bullpen_era = extra_features.get('opp_bullpen_era', LEAGUE_AVG_RUNS_PER_GAME) if extra_features else LEAGUE_AVG_RUNS_PER_GAME
-        bp_adj = 1.0 + ((opp_bullpen_era / LEAGUE_AVG_RUNS_PER_GAME) - 1.0) * bp_weight if LEAGUE_AVG_RUNS_PER_GAME > 0 else 1.0
+        bp_adj = (1.0 + ((opp_bullpen_era / LEAGUE_AVG_RUNS_PER_GAME) - 1.0) * bp_weight) if LEAGUE_AVG_RUNS_PER_GAME > 0 else 1.0
 
         # Final projection: rate * opportunities * adjustments
-        projected = blended_per_pa * projected_pa * platoon_adj * park_adj * bp_adj
+        projected = max(0.0, blended_per_pa * projected_pa * platoon_adj * park_adj * bp_adj)
 
         market_key = self._stat_type_to_market(stat_type)
-        prob_over, prob_under = get_probabilities(
-            projected, line, market_key,
-            alpha=disp.get("alpha"), sigma=disp.get("sigma"),
-        )
+        pi0 = _compute_hr_pi0(market_key, logs, park_adj, extra_features, weather)
+        if pa_dist is not None:
+            prob_over, prob_under = get_probabilities_mixture(
+                blended_per_pa, line, market_key, pa_dist,
+                adjustments=platoon_adj * park_adj * bp_adj,
+                alpha=disp.get("alpha"), sigma=disp.get("sigma"),
+                pi0=pi0,
+            )
+        else:
+            prob_over, prob_under = get_probabilities(
+                projected, line, market_key,
+                alpha=disp.get("alpha"), sigma=disp.get("sigma"),
+                pi0=pi0,
+            )
 
-        return {
+        return self._finalize({
             "player_name": None,
             "market": market_key,
             "line": line,
             "projected_mean": round(projected, 3),
             "prob_over": prob_over,
             "prob_under": prob_under,
+            "alpha": disp.get("alpha"),
+            "sigma": disp.get("sigma"),
+            "pi0": pi0,
             "injury_status": "Healthy",
             "sample_size": len(logs),
             "context": {
@@ -407,17 +606,20 @@ class ProjectionModel:
                 "season_rate_per_pa": round(season_rate_per_pa, 4),
                 "base_pa": base_pa,
                 "projected_pa": projected_pa,
+                "pa_distribution": pa_dist,
+                "implied_team_total": itt,
                 "game_total": game_total,
                 "lineup_position": lineup_position,
                 "platoon_adj": round(platoon_adj, 3),
                 "park_adj": round(park_adj, 3),
                 "bp_adj": round(bp_adj, 3),
+                "hr_pi0": pi0,
                 "batter_hand": batter_hand,
                 "pitcher_hand": pitcher_hand,
                 "venue": venue,
                 "weather": weather,
             },
-        }
+        })
 
     # ------------------------------------------------------------------
     # GLM branch: shared helpers for pitcher and batter markets
@@ -430,7 +632,6 @@ class ProjectionModel:
         if glm is None:
             return None
         from src.data.feature_builder import build_pitcher_features
-        from src.models.monte_carlo import mc_prob_over
         disp = dispersion or {}
 
         ip_result = self._project_innings(
@@ -449,17 +650,21 @@ class ProjectionModel:
             )
         except Exception as e:
             logger.warning(f"GLM feature build failed for {market}: {e}; falling back.")
+            _glm_degradations[market] += 1
             return None
 
         try:
             projected_mean = glm.predict_mean(features, exposure=ip_result['proj_ip'])
         except Exception as e:
             logger.warning(f"GLM predict failed for {market}: {e}; falling back.")
+            _glm_degradations[market] += 1
             return None
 
-        prob_over, prob_under = mc_prob_over(
-            projected_mean, line, market,
-            nb_alpha=disp.get("alpha"),
+        # Analytic NB/Poisson CDF — Monte Carlo at n=1000 carries ~1.6pp of
+        # sampling noise, the same order as the edge threshold and the
+        # sharp-agreement gate, and makes decisions irreproducible.
+        prob_over, prob_under = get_probabilities(
+            projected_mean, line, market, alpha=disp.get("alpha"),
         )
 
         return {
@@ -469,6 +674,9 @@ class ProjectionModel:
             "projected_mean": round(projected_mean, 3),
             "prob_over": prob_over,
             "prob_under": prob_under,
+            "alpha": disp.get("alpha"),
+            "sigma": disp.get("sigma"),
+            "pi0": None,
             "injury_status": "Healthy",
             "sample_size": len(pitcher_logs),
             "context": {
@@ -484,17 +692,25 @@ class ProjectionModel:
 
     def _try_glm_batter(self, market, batter_logs, pitcher_hand, batter_hand,
                         venue, line, lineup_position, weather, extra_features,
-                        dispersion=None, game_total=None):
+                        dispersion=None, game_total=None,
+                        implied_team_total_override=None):
         """Run the Poisson GLM path for a batter market. Returns None if unavailable."""
         glm = self._glm.get(market)
         if glm is None:
             return None
         from src.data.feature_builder import build_batter_features
-        from src.models.monte_carlo import mc_prob_over
         disp = dispersion or {}
 
         base_pa = LINEUP_PA_MAP.get(lineup_position, DEFAULT_PROJECTED_PA)
-        projected_pa = _scale_pa_for_game_total(base_pa, game_total)
+        if PA_ESTIMATOR_ENABLED:
+            itt = (implied_team_total_override if implied_team_total_override is not None
+                   else implied_team_total(game_total))
+            pa_dist = estimate_pa_distribution(lineup_position, itt)
+            projected_pa = expected_pa(pa_dist)
+        else:
+            itt = None
+            pa_dist = None
+            projected_pa = _scale_pa_for_game_total(base_pa, game_total)
 
         try:
             features = build_batter_features(
@@ -510,19 +726,51 @@ class ProjectionModel:
             )
         except Exception as e:
             logger.warning(f"GLM feature build failed for {market}: {e}; falling back.")
+            _glm_degradations[market] += 1
             return None
 
         try:
             projected_mean = glm.predict_mean(features, exposure=projected_pa)
         except Exception as e:
             logger.warning(f"GLM predict failed for {market}: {e}; falling back.")
+            _glm_degradations[market] += 1
             return None
 
-        prob_over, prob_under = mc_prob_over(
-            projected_mean, line, market,
-            nb_alpha=disp.get("alpha"),
-            tb_std=disp.get("sigma"),
-        )
+        park_hr_factor = get_park_factor(venue, weather=weather).get("hr", 1.0)
+        pi0 = _compute_hr_pi0(market, batter_logs, park_hr_factor, extra_features, weather)
+
+        # Analytic CDFs throughout — mixing exact NB/ZINB/Normal probabilities
+        # across the PA distribution is exact and reproducible, unlike the
+        # previous n=1000 Monte Carlo draws (~1.6pp sampling noise per call).
+        if pa_dist is not None:
+            prob_over = 0.0
+            prob_under = 0.0
+            for k, p_k in pa_dist.items():
+                if p_k <= 0:
+                    continue
+                try:
+                    mean_k = glm.predict_mean(features, exposure=k)
+                except Exception as e:
+                    logger.warning(f"GLM predict failed for {market} at PA={k}: {e}; falling back.")
+                    prob_over, prob_under = get_probabilities(
+                        projected_mean, line, market,
+                        alpha=disp.get("alpha"), sigma=disp.get("sigma"),
+                        pi0=pi0,
+                    )
+                    break
+                over_k, under_k = get_probabilities(
+                    mean_k, line, market,
+                    alpha=disp.get("alpha"), sigma=disp.get("sigma"),
+                    pi0=pi0,
+                )
+                prob_over += p_k * over_k
+                prob_under += p_k * under_k
+        else:
+            prob_over, prob_under = get_probabilities(
+                projected_mean, line, market,
+                alpha=disp.get("alpha"), sigma=disp.get("sigma"),
+                pi0=pi0,
+            )
 
         return {
             "player_name": None,
@@ -531,12 +779,18 @@ class ProjectionModel:
             "projected_mean": round(projected_mean, 3),
             "prob_over": prob_over,
             "prob_under": prob_under,
+            "alpha": disp.get("alpha"),
+            "sigma": disp.get("sigma"),
+            "pi0": pi0,
             "injury_status": "Healthy",
             "sample_size": len(batter_logs),
             "context": {
                 "model": "glm",
                 "base_pa": base_pa,
                 "projected_pa": projected_pa,
+                "pa_distribution": pa_dist,
+                "implied_team_total": itt,
+                "hr_pi0": pi0,
                 "game_total": game_total,
                 "lineup_position": lineup_position,
                 "batter_hand": batter_hand,
@@ -557,7 +811,10 @@ class ProjectionModel:
     def _stat_to_park_key(self, stat_type: str) -> str:
         mapping = {
             "hits": "hits",
-            "total_bases": "hr",  # TB heavily influenced by HR factor
+            # TB is ~60% singles/doubles; a pure HR factor mis-prices
+            # doubles-friendly, HR-suppressing parks (e.g. Fenway). Use the
+            # blended 'tb' factor (0.45*hr + 0.55*hits) from get_park_factor.
+            "total_bases": "tb",
             "home_runs": "hr",
         }
         return mapping.get(stat_type, "runs")
@@ -572,13 +829,17 @@ class ProjectionModel:
 
     def _project_innings(self, logs: List[Dict]) -> Dict:
         """
-        Estimate today's projected innings from pitch efficiency.
+        Estimate today's projected innings from pitch efficiency and role.
 
-        Pulls recent pitches-per-inning from the last 5 starts, anchors the
-        starter pitch limit at DEFAULT_PITCH_LIMIT (+10 if a pitcher has been
-        running deeper than that), and divides to get projected IP.
+        Pulls recent pitches-per-inning from the last 5 starts and anchors a
+        pitch budget. Established starters anchor at DEFAULT_PITCH_LIMIT (+10 if
+        they've been running deeper). Short-role arms (openers / piggyback /
+        bullpen games — recent avg IP < 4 or avg pitches < 60) are anchored to
+        THEIR OWN recent workload instead: the old 100-pitch floor ballooned a
+        2-IP opener to a ~6 IP projection and badly over-stated K/ER.
         """
         recent = logs[:5] if logs else []
+        n = len(recent)
 
         total_ip = sum(l.get('innings_pitched') or 0 for l in recent)
         total_pitches = sum(l.get('pitches_thrown') or 0 for l in recent)
@@ -588,18 +849,27 @@ class ProjectionModel:
         else:
             pitches_per_ip = LEAGUE_AVG_PITCHES_PER_IP
 
-        # Allow a small bump for pitchers who've been averaging more pitches
-        # than the league standard starter budget.
-        if recent:
-            recent_pitch_counts = [l.get('pitches_thrown') or 0 for l in recent]
-            avg_pitches = sum(recent_pitch_counts) / len(recent_pitch_counts) if recent_pitch_counts else 0
-            est_pitch_limit = int(min(110, max(DEFAULT_PITCH_LIMIT, avg_pitches + 10)))
-        else:
+        avg_ip = (total_ip / n) if n else 0.0
+        avg_pitches = (total_pitches / n) if n else 0.0
+
+        # Short-role detection: consistently low IP or low pitch counts.
+        is_short_role = n > 0 and ((0 < avg_ip < 4.0) or (0 < avg_pitches < 60.0))
+
+        if not recent:
             est_pitch_limit = DEFAULT_PITCH_LIMIT
+            ip_floor = 3.0
+        elif is_short_role:
+            # Anchor to the pitcher's own budget; no starter floor. Floor IP at
+            # 0.5 so an opener can project well under 3 innings.
+            est_pitch_limit = int(max(15, min(80, avg_pitches + 5)))
+            ip_floor = 0.5
+        else:
+            est_pitch_limit = int(min(110, max(DEFAULT_PITCH_LIMIT, avg_pitches + 10)))
+            ip_floor = 3.0
 
         proj_ip = est_pitch_limit / pitches_per_ip if pitches_per_ip > 0 else 5.5
-        # Safety clamp: starters almost never exceed 8 IP or go under 3 IP in a projection
-        proj_ip = max(3.0, min(8.0, proj_ip))
+        # Safety clamp: full-game starters rarely exceed 8 IP; openers can go low.
+        proj_ip = max(ip_floor, min(8.0, proj_ip))
 
         return {
             "proj_ip": proj_ip,

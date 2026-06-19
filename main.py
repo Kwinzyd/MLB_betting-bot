@@ -1,12 +1,16 @@
 import argparse
 import asyncio
+from datetime import datetime
 from src.data.db import init_db
 from src.pipelines.sync_events import sync_events
 from src.pipelines.sync_injuries import sync_injuries
 from src.pipelines.sync_stats import sync_stats
 from src.pipelines.scan_props import scan_props
 from src.pipelines.send_alerts import send_alerts
+from src.pipelines.scan_game_markets import scan_game_markets
+from src.pipelines.send_game_alerts import send_game_alerts
 from src.pipelines.find_sgp import find_and_alert_sgps
+from src.pipelines.find_parlays import find_and_alert_parlays
 from src.pipelines.trigger_watch import run_trigger_watch
 from src.pipelines.sync_lineups import sync_lineups
 from src.pipelines.sync_umpires import sync_umpires
@@ -34,12 +38,26 @@ def main():
     run_parser.add_argument('--force', action='store_true',
                             help="Bypass the quota gate and scan every active game")
 
+    # scan-games (game markets: moneyline / total / run line, off BDL odds)
+    subparsers.add_parser('scan-games',
+                          help="Scan game markets (moneyline/total/run line) and alert")
+
     # settle, prune, sgp, trigger, fit-dispersion
     subparsers.add_parser('settle', help="Sync stats and settle completed bets")
     subparsers.add_parser('prune', help="Prune old database records")
+    repair_parser = subparsers.add_parser(
+        'repair-logs',
+        help="One-off repair: IP baseball-notation + empty game-log dates")
+    repair_parser.add_argument('--seasons', metavar='YYYY[,YYYY,...]', default=None,
+                               help="Also restore missing historical games rows from BDL "
+                                    "/games (no stats calls) before the date backfill")
     subparsers.add_parser('sgp', help="Find and alert Same Game Parlays (SGPs)")
+    subparsers.add_parser('parlay', help="Find and alert cross-game 2/4/8-leg parlays")
     subparsers.add_parser('trigger', help="Run trigger watch for weather and umpires")
     subparsers.add_parser('fit-dispersion', help="Fit dispersion models for projections")
+    subparsers.add_parser('enrich', help="LLM-normalize today's injury reports into availability signals")
+    subparsers.add_parser('reconcile', help="LLM-resolve unmatched prop player names into the resolution cache")
+    subparsers.add_parser('live', help="Run the continuous Live State Machine daemon for in-game prop sniping")
 
     # schedule
     subparsers.add_parser(
@@ -68,6 +86,9 @@ def main():
     backtest_parser.add_argument('--market', action='append', dest='markets', metavar='MARKET',
                                  help="Restrict to specific market(s); repeatable. "
                                       "E.g. --market pitcher_strikeouts --market batter_hits")
+    backtest_parser.add_argument('--use-trained-models', action='store_true',
+                                 help="Use the current champion GLM + calibration (IN-SAMPLE; "
+                                      "default is the out-of-sample-safe weighted-average model)")
 
     # backfill + train flags
     backfill_parser = subparsers.add_parser('backfill', help="Backfill historical game logs")
@@ -86,6 +107,34 @@ def main():
                            help="step size between folds in days (default 7)")
     wf_parser.add_argument('--mode', choices=['sliding', 'expanding'], default='sliding',
                            help="sliding (fixed window) or expanding training set")
+    wf_parser.add_argument('--market', action='append', dest='markets', metavar='MARKET',
+                           help="Restrict to specific market(s); repeatable")
+    wf_parser.add_argument('--model', choices=['glm', 'lgbm'], default='glm',
+                           help="Model type to use for walk-forward (default: glm)")
+    wf_parser.add_argument('--compare-versions', action='store_true',
+                           help="Run both GLM and LGBM and print a side-by-side comparison")
+    wf_parser.add_argument('--history', action='store_true',
+                           help="Show historical walk-forward results from DB instead of running a new backtest")
+    wf_parser.add_argument('--last', type=int, default=5, metavar='N',
+                           help="Number of past runs to show per market with --history (default 5)")
+
+    # statcast / calibrate / fit-correlations / monitor-drift
+    statcast_parser = subparsers.add_parser(
+        'statcast', help="Sync Baseball Savant Statcast leaderboards"
+    )
+    statcast_parser.add_argument(
+        '--season', type=int, default=None,
+        help="Season year to sync (default: current year)"
+    )
+    ask_parser = subparsers.add_parser(
+        'ask', help="Ask the LLM research agent a natural-language question over the BDL data")
+    ask_parser.add_argument('question', nargs='+', help="The question, e.g. ask how has Cole trended")
+
+    subparsers.add_parser('calibrate', help="Fit Platt/isotonic calibration params per market")
+    subparsers.add_parser('fit-correlations',
+                          help="Fit empirical portfolio correlations from settled bets")
+    subparsers.add_parser('monitor-drift',
+                          help="Check model drift; retrain if drift_score > 0.15 or PSI > 0.20")
 
     args = parser.parse_args()
 
@@ -95,11 +144,15 @@ def main():
     try:
         if args.command == 'sync':
             logger.info("Running SYNC mode...")
+            from src.pipelines.enrich_injuries import enrich_injuries
             asyncio.run(sync_events())
             asyncio.run(sync_injuries())
+            asyncio.run(enrich_injuries())  # LLM injury signals (no-op if LLM off)
             asyncio.run(sync_stats())
             asyncio.run(sync_lineups())
             sync_umpires()
+            from src.pipelines.sync_statcast import sync_statcast
+            asyncio.run(sync_statcast())
 
         elif args.command == 'scan':
             logger.info("Running SCAN mode...")
@@ -107,36 +160,72 @@ def main():
 
         elif args.command == 'run':
             logger.info("Running FULL pipeline (sync -> scan -> alerts)...")
+            from src.pipelines.enrich_injuries import enrich_injuries
             asyncio.run(sync_events())
             asyncio.run(sync_injuries())
+            asyncio.run(enrich_injuries())  # LLM injury signals (no-op if LLM off)
             asyncio.run(sync_lineups())
             sync_umpires()
             # asyncio.run(sync_stats()) omitted by default (slow, run separately)
             asyncio.run(scan_props(force=args.force))
             asyncio.run(send_alerts())
             asyncio.run(find_and_alert_sgps())
+            asyncio.run(find_and_alert_parlays())
+            # Game markets (no-op unless GAME_MARKETS_ENABLED).
+            asyncio.run(scan_game_markets())
+            asyncio.run(send_game_alerts())
+
+        elif args.command == 'scan-games':
+            logger.info("Running SCAN-GAMES mode (moneyline / total / run line)...")
+            asyncio.run(scan_game_markets())
+            asyncio.run(send_game_alerts())
 
         elif args.command == 'sgp':
             logger.info("Running SGP mode...")
             asyncio.run(find_and_alert_sgps())
 
+        elif args.command == 'parlay':
+            logger.info("Running PARLAY mode...")
+            asyncio.run(find_and_alert_parlays())
+
         elif args.command == 'trigger':
             logger.info("Running TRIGGER WATCH mode...")
             asyncio.run(run_trigger_watch())
 
+        elif args.command == 'live':
+            from src.pipelines.live_state_machine import run_live_state_machine
+            logger.info("Running LIVE STATE MACHINE daemon (Ctrl-C to stop)...")
+            asyncio.run(run_live_state_machine())
+
         elif args.command == 'walkforward':
-            from src.pipelines.walk_forward import walk_forward_all, print_walk_forward_report
-            logger.info(
-                f"Running WALK-FORWARD backtest "
-                f"(window={args.train_window}d, step={args.step}d, mode={args.mode})..."
+            from src.pipelines.walk_forward import (
+                walk_forward_all, print_walk_forward_report,
+                compare_walk_forward_market, print_compare_report,
+                print_walk_forward_history,
             )
-            results = walk_forward_all(
-                markets=args.markets,
-                train_window_days=args.train_window,
-                step_days=args.step,
-                mode=args.mode,
-            )
-            print_walk_forward_report(results)
+            if args.history:
+                print_walk_forward_history(markets=args.markets, last_n=args.last)
+            elif args.compare_versions:
+                targets = list(args.markets) if args.markets else None
+                from src.pipelines.train_model import _ALL_MARKETS
+                targets = targets or list(_ALL_MARKETS)
+                for m in targets:
+                    comparison = compare_walk_forward_market(
+                        m,
+                        train_window_days=args.train_window,
+                        step_days=args.step,
+                        mode=args.mode,
+                    )
+                    print_compare_report(comparison)
+            else:
+                results = walk_forward_all(
+                    markets=args.markets,
+                    train_window_days=args.train_window,
+                    step_days=args.step,
+                    mode=args.mode,
+                    model_type=args.model,
+                )
+                print_walk_forward_report(results)
 
         elif args.command == 'settle':
             logger.info("Running SETTLE mode...")
@@ -156,6 +245,13 @@ def main():
             logger.info("Running PRUNE mode...")
             prune_old_data()
 
+        elif args.command == 'repair-logs':
+            from src.pipelines.repair_game_logs import repair_game_logs
+            logger.info("Running REPAIR-LOGS mode...")
+            seasons = ([int(s.strip()) for s in args.seasons.split(',') if s.strip()]
+                       if args.seasons else None)
+            repair_game_logs(seasons=seasons)
+
         elif args.command == 'backfill':
             from src.pipelines.sync_historical import sync_historical
             seasons = [int(s.strip()) for s in args.seasons.split(',') if s.strip()]
@@ -174,6 +270,43 @@ def main():
             for r in results:
                 logger.info(f"Training result: {r}")
 
+        elif args.command == 'statcast':
+            from src.pipelines.sync_statcast import sync_statcast
+            season = args.season or datetime.now().year
+            logger.info(f"Running STATCAST sync for season {season}...")
+            asyncio.run(sync_statcast(season=season))
+
+        elif args.command == 'ask':
+            from src.pipelines.research_agent import ask
+            question = ' '.join(args.question)
+            answer = asyncio.run(ask(question))
+            print(f"\n{answer}\n")
+
+        elif args.command == 'enrich':
+            from src.pipelines.enrich_injuries import enrich_injuries
+            logger.info("Running ENRICH (LLM injury signals)...")
+            asyncio.run(enrich_injuries())
+
+        elif args.command == 'reconcile':
+            from src.pipelines.reconcile_names import reconcile_names
+            logger.info("Running RECONCILE (LLM name resolution)...")
+            asyncio.run(reconcile_names())
+
+        elif args.command == 'calibrate':
+            from src.pipelines.calibrate_model import calibrate_all
+            logger.info("Running CALIBRATE...")
+            calibrate_all()
+
+        elif args.command == 'fit-correlations':
+            from src.pipelines.fit_correlations import fit_correlations
+            logger.info("Running FIT-CORRELATIONS...")
+            fit_correlations()
+
+        elif args.command == 'monitor-drift':
+            from src.pipelines.monitor_drift import monitor_drift
+            logger.info("Running MONITOR-DRIFT...")
+            monitor_drift()
+
         elif args.command == 'backtest':
             from src.backtesting.engine import BacktestEngine
             from src.backtesting.metrics import compute_summary
@@ -185,6 +318,7 @@ def main():
                 end_date=args.end,
                 min_edge=min_edge,
                 markets=args.markets,
+                use_trained_models=args.use_trained_models,
             )
             records = engine.run()
             summary = compute_summary(records, args.start, args.end, min_edge)
@@ -207,11 +341,14 @@ def _notify_crash(command: str, exception: Exception) -> None:
     try:
         import traceback
         from src.clients.telegram_bot import TelegramClient
-        tail = ''.join(traceback.format_exception_only(type(exception), exception)).strip()
+        tb = ''.join(traceback.format_exception(
+            type(exception), exception, exception.__traceback__
+        ))
+        tail = '\n'.join(tb.strip().splitlines()[-16:])
         msg = (
             f"\U0001F6A8 <b>Pipeline Crash</b>\n"
             f"Command: <code>{command}</code>\n"
-            f"Error: <code>{tail[:400]}</code>"
+            f"<pre>{tail[:800]}</pre>"
         )
         TelegramClient().send_message_sync(msg)
     except Exception as notify_err:

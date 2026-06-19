@@ -1,4 +1,4 @@
-from datetime import datetime
+from src.utils.time_utils import utcnow
 from src.data.db import get_db_connection
 from src.utils.logging_utils import get_logger
 
@@ -59,7 +59,7 @@ def calculate_team_stats():
                     k_rate=excluded.k_rate,
                     runs_per_game=excluded.runs_per_game,
                     last_updated=excluded.last_updated
-            ''', (team_id, k_rate, runs_per_game, datetime.utcnow().isoformat()))
+            ''', (team_id, k_rate, runs_per_game, utcnow().isoformat()))
             stats_calculated += 1
 
         conn.commit()

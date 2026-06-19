@@ -42,6 +42,13 @@ def _seed_schema(conn):
             player_id INTEGER, throws TEXT, date TEXT,
             UNIQUE(game_id, team)
         );
+        CREATE TABLE game_totals_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            game_id TEXT NOT NULL,
+            total REAL NOT NULL,
+            source TEXT NOT NULL,
+            timestamp TEXT NOT NULL
+        );
     ''')
 
 
@@ -97,12 +104,16 @@ def _patch_common(memory_db, weather_return=None):
     weather_client.get_game_weather.return_value = weather_return
     telegram_instance = MagicMock()
     telegram_instance.send_message = AsyncMock()
+    odds_instance = MagicMock()
+    odds_instance.get_event_odds = AsyncMock(return_value=None)
     return {
         'db': patch('src.pipelines.trigger_watch.get_db_connection', db_ctx),
         'weather_cls': patch('src.pipelines.trigger_watch.WeatherClient',
                              return_value=weather_client),
         'telegram_cls': patch('src.pipelines.trigger_watch.TelegramClient',
                               return_value=telegram_instance),
+        'odds_cls': patch('src.pipelines.trigger_watch.OddsAPIClient',
+                          return_value=odds_instance),
         'scan_props': patch('src.pipelines.trigger_watch.scan_props',
                             new_callable=AsyncMock),
         'send_alerts': patch('src.pipelines.trigger_watch.send_alerts',
@@ -116,7 +127,7 @@ async def test_umpire_extreme_fires_when_k_factor_above_threshold(memory_db):
     memory_db.commit()
 
     patches = _patch_common(memory_db, weather_return=None)
-    with patches['db'], patches['weather_cls'], patches['telegram_cls'], \
+    with patches['db'], patches['weather_cls'], patches['telegram_cls'], patches['odds_cls'], \
          patches['scan_props'] as mock_scan, patches['send_alerts'] as mock_alerts:
         from src.pipelines.trigger_watch import run_trigger_watch
         await run_trigger_watch()
@@ -137,7 +148,7 @@ async def test_umpire_no_fire_when_games_called_below_min(memory_db):
     memory_db.commit()
 
     patches = _patch_common(memory_db, weather_return=None)
-    with patches['db'], patches['weather_cls'], patches['telegram_cls'], \
+    with patches['db'], patches['weather_cls'], patches['telegram_cls'], patches['odds_cls'], \
          patches['scan_props'] as mock_scan, patches['send_alerts']:
         from src.pipelines.trigger_watch import run_trigger_watch
         await run_trigger_watch()
@@ -152,7 +163,7 @@ async def test_umpire_no_fire_when_deviation_below_threshold(memory_db):
     memory_db.commit()
 
     patches = _patch_common(memory_db, weather_return=None)
-    with patches['db'], patches['weather_cls'], patches['telegram_cls'], \
+    with patches['db'], patches['weather_cls'], patches['telegram_cls'], patches['odds_cls'], \
          patches['scan_props'] as mock_scan, patches['send_alerts']:
         from src.pipelines.trigger_watch import run_trigger_watch
         await run_trigger_watch()
@@ -171,7 +182,7 @@ async def test_weather_extreme_fires_on_hr_adjust(memory_db):
     weather = {'temp_f': 72, 'wind_mph': 18, 'wind_deg': 20, 'humidity': 50}
 
     patches = _patch_common(memory_db, weather_return=weather)
-    with patches['db'], patches['weather_cls'], patches['telegram_cls'], \
+    with patches['db'], patches['weather_cls'], patches['telegram_cls'], patches['odds_cls'], \
          patches['scan_props'] as mock_scan, patches['send_alerts']:
         from src.pipelines.trigger_watch import run_trigger_watch
         await run_trigger_watch()
@@ -194,7 +205,7 @@ async def test_weather_no_fire_when_dome(memory_db):
     weather = {'temp_f': 72, 'wind_mph': 30, 'wind_deg': 180, 'humidity': 50}
 
     patches = _patch_common(memory_db, weather_return=weather)
-    with patches['db'], patches['weather_cls'], patches['telegram_cls'], \
+    with patches['db'], patches['weather_cls'], patches['telegram_cls'], patches['odds_cls'], \
          patches['scan_props'] as mock_scan, patches['send_alerts']:
         from src.pipelines.trigger_watch import run_trigger_watch
         await run_trigger_watch()
@@ -216,7 +227,7 @@ async def test_dedup_prevents_second_fire_within_window(memory_db):
     memory_db.commit()
 
     patches = _patch_common(memory_db, weather_return=None)
-    with patches['db'], patches['weather_cls'], patches['telegram_cls'], \
+    with patches['db'], patches['weather_cls'], patches['telegram_cls'], patches['odds_cls'], \
          patches['scan_props'] as mock_scan, patches['send_alerts']:
         from src.pipelines.trigger_watch import run_trigger_watch
         await run_trigger_watch()
@@ -239,7 +250,7 @@ async def test_dedup_allows_second_fire_after_window(memory_db):
     memory_db.commit()
 
     patches = _patch_common(memory_db, weather_return=None)
-    with patches['db'], patches['weather_cls'], patches['telegram_cls'], \
+    with patches['db'], patches['weather_cls'], patches['telegram_cls'], patches['odds_cls'], \
          patches['scan_props'] as mock_scan, patches['send_alerts']:
         from src.pipelines.trigger_watch import run_trigger_watch
         await run_trigger_watch()
@@ -253,7 +264,7 @@ async def test_no_active_games_exits_cleanly(memory_db):
     memory_db.commit()
 
     patches = _patch_common(memory_db, weather_return=None)
-    with patches['db'], patches['weather_cls'], patches['telegram_cls'], \
+    with patches['db'], patches['weather_cls'], patches['telegram_cls'], patches['odds_cls'], \
          patches['scan_props'] as mock_scan, patches['send_alerts']:
         from src.pipelines.trigger_watch import run_trigger_watch
         await run_trigger_watch()

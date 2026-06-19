@@ -19,11 +19,14 @@ _DEFAULT_TB_STD_VARIANCE_FACTOR = 1.2
 
 
 def mc_prob_over(mean: float, line: float, market: str, n_sims: int = 1000,
-                 tb_std: float = None, nb_alpha: float = None) -> tuple[float, float]:
+                 tb_std: float = None, nb_alpha: float = None,
+                 zinb_pi0: float = None) -> tuple[float, float]:
     """
     Returns (prob_over, prob_under) via Monte Carlo simulation.
 
-    - Count markets: NB sampling when nb_alpha > 0, else Poisson.
+    - Count markets: NB sampling when nb_alpha > 0, else Poisson. ZINB inflation
+      via zinb_pi0 in (0, 1): a Bernoulli(pi0) gate forces zeros, and the NB
+      mean is rescaled to mu/(1-pi0) so the marginal mean equals `mean`.
     - batter_total_bases: Normal sampling with tb_std (fitted) or sqrt(mean*1.2) default.
     """
     if mean is None or mean <= 0 or math.isnan(mean):
@@ -32,7 +35,18 @@ def mc_prob_over(mean: float, line: float, market: str, n_sims: int = 1000,
     rng = np.random.default_rng()
 
     if market in _POISSON_MARKETS:
-        if nb_alpha is not None and nb_alpha > 0 and math.isfinite(nb_alpha):
+        if zinb_pi0 is not None and zinb_pi0 > 0 and math.isfinite(zinb_pi0):
+            pi0 = min(zinb_pi0, 0.999)
+            mu_nb = mean / (1.0 - pi0)
+            if nb_alpha is not None and nb_alpha > 0 and math.isfinite(nb_alpha):
+                n = 1.0 / nb_alpha
+                p = 1.0 / (1.0 + nb_alpha * mu_nb)
+                count = rng.negative_binomial(n, p, size=n_sims)
+            else:
+                count = rng.poisson(lam=mu_nb, size=n_sims)
+            zero_gate = rng.random(size=n_sims) < pi0
+            samples = np.where(zero_gate, 0, count)
+        elif nb_alpha is not None and nb_alpha > 0 and math.isfinite(nb_alpha):
             n = 1.0 / nb_alpha
             p = 1.0 / (1.0 + nb_alpha * mean)
             samples = rng.negative_binomial(n, p, size=n_sims)

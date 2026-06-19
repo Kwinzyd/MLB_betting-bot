@@ -63,6 +63,26 @@ def negbin_prob_over(mean: float, line: float, alpha: float) -> tuple[float, flo
     return p_over, p_under
 
 
+def zinb_prob_over(marginal_mean: float, line: float, alpha: float,
+                   pi0: float) -> tuple[float, float]:
+    """ZINB CDF: P(Y=0) = pi0 + (1-pi0)*NB(0; mu, alpha); P(Y=k>0) = (1-pi0)*NB(k).
+
+    `marginal_mean` is the unconditional E[Y]; the NB component mean is
+    mu = marginal_mean / (1 - pi0) so the ZINB marginal mean equals the input.
+    Falls back to negbin_prob_over when pi0 <= 0.
+    """
+    if marginal_mean <= 0:
+        return 0.0, 1.0
+    if not math.isfinite(pi0) or pi0 <= 0:
+        return negbin_prob_over(marginal_mean, line, alpha)
+    pi0 = min(pi0, 0.999)
+    mu_nb = marginal_mean / (1.0 - pi0)
+    nb_over, nb_under = negbin_prob_over(mu_nb, line, alpha)
+    p_under = pi0 + (1.0 - pi0) * nb_under
+    p_over = (1.0 - pi0) * nb_over
+    return float(p_over), float(p_under)
+
+
 def normal_prob_over(mean: float, line: float, std: float) -> tuple[float, float]:
     """P(over) and P(under) via Normal distribution with given σ."""
     if mean <= 0:

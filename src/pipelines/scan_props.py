@@ -1,12 +1,19 @@
 import uuid
 import json
 import os
+import time
+from collections import Counter
 from datetime import datetime, timezone, timedelta
 from src.config import (
     MARKETS_MAPPING, UMP_MIN_GAMES, UMP_K_WEIGHT, PREGAME_WINDOW_MINUTES,
-    SHARP_BOOKMAKERS,
+    PREGAME_RESCAN_MINUTES,
+    SHARP_BOOKMAKERS, ALT_LINE_MAX_DISTANCE, MAX_BETS_PER_PLAYER,
+    SHARP_MODEL_AGREEMENT_TOL, BOOKMAKER_BIAS_THRESHOLD, EDGE_MIN,
+    REQUIRE_CONFIRMED_LINEUP,
 )
+from src.models.distributions import get_probabilities
 from src.clients.odds_api import OddsAPIClient
+from src.clients.bdl_odds import get_game_market
 from src.clients.weather import WeatherClient
 from src.data.db import get_db_connection
 from src.data.park_factors import get_stadium_meta
@@ -14,10 +21,43 @@ from src.models.devig import devig_multiplicative
 from src.models.projections import ProjectionModel
 from src.models.edge_ranker import rank_edge
 from src.utils.logging_utils import get_logger
-from src.data.feature_builder import compute_bullpen_factor
-from src.utils.time_utils import get_eastern_local_date
+from src.data.feature_builder import (
+    compute_bullpen_factor,
+    compute_pitcher_h2h_vs_team,
+    compute_platoon_split,
+)
+from src.utils.time_utils import get_eastern_local_date, utcnow
 
 logger = get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Bookmaker bias cache — refreshed at most once per day
+# ---------------------------------------------------------------------------
+_bias_cache: dict = {}   # (bookmaker, market, side) → avg_bias float
+_bias_cache_ts: float = 0.0
+_BIAS_CACHE_TTL = 86400.0  # 24h
+
+
+def _load_bookmaker_bias() -> dict:
+    """Load active bookmaker_bias rows from DB with 24h TTL."""
+    global _bias_cache, _bias_cache_ts
+    now = time.monotonic()
+    if _bias_cache and (now - _bias_cache_ts) < _BIAS_CACHE_TTL:
+        return _bias_cache
+    result: dict = {}
+    try:
+        with get_db_connection() as conn:
+            rows = conn.execute(
+                "SELECT bookmaker, market, side, avg_bias FROM bookmaker_bias "
+                "WHERE avg_bias IS NOT NULL"
+            ).fetchall()
+        for r in rows:
+            result[(r["bookmaker"], r["market"], r["side"])] = float(r["avg_bias"])
+    except Exception as e:
+        logger.debug("Could not load bookmaker_bias: %s", e)
+    _bias_cache = result
+    _bias_cache_ts = now
+    return result
 
 
 async def scan_props(force: bool = False, game_ids: list = None):
@@ -35,9 +75,16 @@ async def scan_props(force: bool = False, game_ids: list = None):
     cache for those events so the trigger path beats the 5-min TTL.
     """
     logger.info("Executing pipeline: scan_props")
+    
+    from src.data.cache import cache
+    if cache.get("odds_api_quota_exhausted"):
+        logger.error("Pipeline aborted: API Quota Circuit Breaker is active.")
+        return
+
     odds_client = OddsAPIClient()
     weather_client = WeatherClient()
     proj_model = ProjectionModel()
+    bias_map = _load_bookmaker_bias()
 
     force = force or os.getenv("ODDS_SCAN_FORCE", "").lower() in ("1", "true", "yes")
     targeted = bool(game_ids)
@@ -50,12 +97,14 @@ async def scan_props(force: bool = False, game_ids: list = None):
         if targeted:
             placeholders = ",".join("?" for _ in game_ids)
             games = conn.execute(
-                f"SELECT * FROM games WHERE status != 'COMPLETED' "
+                f"SELECT * FROM games WHERE status NOT IN ('COMPLETED', 'POSTPONED') "
                 f"AND game_id IN ({placeholders})",
                 tuple(game_ids),
             ).fetchall()
         else:
-            games = conn.execute("SELECT * FROM games WHERE status != 'COMPLETED'").fetchall()
+            games = conn.execute(
+                "SELECT * FROM games WHERE status NOT IN ('COMPLETED', 'POSTPONED')"
+            ).fetchall()
 
     if not games:
         logger.info("No active games found for odds scanning.")
@@ -65,7 +114,7 @@ async def scan_props(force: bool = False, game_ids: list = None):
     markets = list(MARKETS_MAPPING.keys())
     api_markets = markets + ["totals"]
     total_edges = 0
-    skipped_quota = 0
+    skip_reasons: Counter = Counter()
 
     for game in games:
         game_id = game['game_id']
@@ -73,17 +122,27 @@ async def scan_props(force: bool = False, game_ids: list = None):
         away_team = game['away_team']
         venue = game['venue']
 
-        if not force and not _should_scan_game(game, now_utc):
-            skipped_quota += 1
-            continue
+        if not force:
+            decision, reason = _should_scan_game(game, now_utc)
+            if decision == "skip":
+                skip_reasons[reason] += 1
+                logger.debug(
+                    f"Skipping {away_team} @ {home_team} ({game_id}): {reason}"
+                )
+                continue
 
         logger.info(f"Scanning: {away_team} @ {home_team}")
 
-        # Fetch live weather for this stadium
+        # Fetch first-pitch weather for this stadium (forecast nearest game_time,
+        # with a signed in/out wind component for the HR model).
         weather = None
         meta = get_stadium_meta(venue)
         if meta and meta.get("roof") != "dome":
-            weather = weather_client.get_game_weather(meta["lat"], meta["lon"])
+            weather = weather_client.get_game_weather(
+                meta["lat"], meta["lon"],
+                outfield_bearing=meta.get("outfield_bearing"),
+                game_time=dict(game).get("game_time"),
+            )
 
         # Umpire K factor — looked up once per game, applied to all pitcher props
         ump_k_factor = _get_ump_k_factor(game_id)
@@ -97,118 +156,273 @@ async def scan_props(force: bool = False, game_ids: list = None):
         if not event_odds:
             continue
 
-        # 2. Parse odds and group by player+market+line for devigging
+        # 2. Parse odds and group by player+market(+line) for devigging
         player_lines = _parse_odds_by_player(event_odds)
+        player_market_groups = _group_by_player_market(player_lines)
         game_total = _parse_game_total(event_odds)
 
-        # 3. For each player+market+line:
-        #    (a) Devig the sharp book → TRUE probability (source of truth).
-        #    (b) Hunt soft books for the best offer deviating from sharp consensus.
-        #    (c) rank_edge compares sharp_prob vs the soft-book's implied price.
-        #    Props with no sharp quote are skipped — we don't bet without truth.
-        for key, line_data in player_lines.items():
-            player_name, market_key, line = key
+        # BDL game-level odds (free, unlimited): back up a missing Odds API
+        # total and supply moneylines for moneyline-tilted implied team totals.
+        # BDL has no player props, so this only touches the game-total feature.
+        bdl_market = await get_game_market(dict(game).get('bdl_game_id'))
+        if game_total is None and bdl_market and bdl_market.get('total') is not None:
+            game_total = bdl_market['total']
+            logger.info("Using BDL game total %.1f for %s (Odds API total unavailable).",
+                        game_total, game_id)
+            _record_total_snapshot(game_id, game_total, source='bdl_fallback')
+        elif game_total is not None:
+            _record_total_snapshot(game_id, game_total, source='scan')
 
-            sharp_pair = _pick_sharp_pair(line_data, SHARP_BOOKMAKERS)
-            if sharp_pair is None:
+        # 3. For each (player, market):
+        #    (a) Pick a sharp-anchored line and devig → TRUE probability at anchor.
+        #    (b) Build the projection ONCE; agreement-gate model vs sharp at anchor.
+        #    (c) For each soft-quoted alt-line within ALT_LINE_MAX_DISTANCE,
+        #        re-price model probability via get_probabilities and rank_edge
+        #        against the best soft offer at that line.
+        #    (d) Keep up to MAX_BETS_PER_PLAYER highest-EV winners per player.
+        for (player_name, market_key), lines_for_market in player_market_groups.items():
+            anchor = _pick_anchor_line(lines_for_market, SHARP_BOOKMAKERS)
+            if anchor is None:
                 continue
-
-            sharp_over_odds, sharp_under_odds, sharp_book = sharp_pair
-            sharp_prob_over, sharp_prob_under = devig_multiplicative(
+            anchor_line, sharp_over_odds, sharp_under_odds, sharp_book = anchor
+            sharp_prob_over_anchor, sharp_prob_under_anchor = devig_multiplicative(
                 sharp_over_odds, sharp_under_odds
             )
-            if sharp_prob_over is None:
-                # Devig sanity check rejected the sharp pair — treat as no truth.
-                continue
-
-            soft_best = _pick_best_soft_line(line_data, SHARP_BOOKMAKERS)
-            over_odds, over_book = soft_best['over']
-            under_odds, under_book = soft_best['under']
-            if not over_odds or not under_odds:
-                continue
-            if over_odds <= 1.0 or under_odds <= 1.0:
+            if sharp_prob_over_anchor is None:
                 continue
 
             projection = _build_projection(
-                proj_model, player_name, market_key, line,
+                proj_model, player_name, market_key, anchor_line,
                 game_id, home_team, away_team, venue,
                 weather=weather, ump_k_factor=ump_k_factor,
-                game_total=game_total,
+                game_total=game_total, bdl_market=bdl_market,
             )
-
             if not projection:
                 continue
-
             projection['player_name'] = player_name
 
-            # Composite book label when over and under come from different soft books
-            book_label = over_book if over_book == under_book else f"{over_book}/{under_book}"
+            # Anchor-level agreement gate. If model and sharp disagree at the
+            # consensus line, we don't trust the model anywhere — bail on this
+            # (player, market) before evaluating any alt-lines.
+            disagreement = abs(projection['prob_over'] - sharp_prob_over_anchor)
+            if disagreement > SHARP_MODEL_AGREEMENT_TOL:
+                logger.debug("Skipped %s %s: model_prob=%.3f, sharp_prob=%.3f (diff=%.3f)", 
+                             player_name, market_key, projection['prob_over'], sharp_prob_over_anchor, disagreement)
+                continue
 
-            snapshot_id = str(uuid.uuid4())
-            timestamp = datetime.utcnow().isoformat()
+            timestamp = utcnow().isoformat()
 
+            # Raw model probability at the anchor line — the basis for shifting
+            # the sharp truth onto alt-lines. Computed with the same distribution
+            # family as the alt-line reprice so the over/under ratio is consistent.
+            raw_anchor_over, _ = get_probabilities(
+                projection['projected_mean'], anchor_line, market_key,
+                alpha=projection.get('alpha'),
+                sigma=projection.get('sigma'),
+                pi0=projection.get('pi0'),
+            )
+            # Calibrate to the anchor projection's basis (it was calibrated in
+            # _finalize); keeps the truth-shift ratio and agreement gate on one
+            # consistent probability scale.
+            raw_anchor_over = proj_model.calibrate_over(raw_anchor_over, market_key)
+
+            # Walk every soft-quoted alt-line within range; collect playable edges.
+            candidates = []  # (ev, line, side, soft_book, odds, edge_result, line_data)
             with get_db_connection() as conn:
-                # Fetch opening prob before inserting new snapshot
-                opening_row = conn.execute('''
-                    SELECT devigged_over, devigged_under 
-                    FROM prop_snapshots 
-                    WHERE game_id = ? AND player_name = ? AND market = ? AND line = ?
-                      AND devigged_over IS NOT NULL
-                    ORDER BY timestamp ASC 
-                    LIMIT 1
-                ''', (game_id, player_name, market_key, line)).fetchone()
-
-                # Pre-calculate steam detection before overwriting latest snaps
-                steam_over = _detect_steam_in_soft_books(conn, game_id, player_name, market_key, line, 'over', line_data, SHARP_BOOKMAKERS)
-                steam_under = _detect_steam_in_soft_books(conn, game_id, player_name, market_key, line, 'under', line_data, SHARP_BOOKMAKERS)
-
-                # Store snapshots for all books to track convergence and market sweeps
-                for book, pair in line_data.items():
-                    o_odds = pair.get('over')
-                    u_odds = pair.get('under')
-                    if not o_odds or not u_odds or o_odds <= 1.0 or u_odds <= 1.0:
+                for line, line_data in lines_for_market.items():
+                    if abs(line - anchor_line) > ALT_LINE_MAX_DISTANCE:
                         continue
-                        
-                    dev_o, dev_u = None, None
-                    if book in SHARP_BOOKMAKERS:
-                        dev_o, dev_u = devig_multiplicative(o_odds, u_odds)
-                        
-                    conn.execute('''
-                        INSERT INTO prop_snapshots
-                        (snapshot_id, game_id, player_name, market, line,
-                         over_odds, under_odds, bookmaker, timestamp,
-                         devigged_over, devigged_under)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (
-                        str(uuid.uuid4()), game_id, player_name, market_key,
-                        line, o_odds, u_odds, book, timestamp,
-                        dev_o, dev_u,
-                    ))
 
-                playable_any = False
-                for side, odds_val, sharp_prob, side_book in [
-                    ('over', over_odds, sharp_prob_over, over_book),
-                    ('under', under_odds, sharp_prob_under, under_book),
-                ]:
-                    opening_prob = opening_row[f'devigged_{side}'] if opening_row else None
-                    is_steam = steam_over if side == 'over' else steam_under
-                    edge_result = rank_edge(
-                        projection, odds_val, side, sharp_prob, 
-                        opening_prob=opening_prob, steam_detected=is_steam
+                    soft_best = _pick_best_soft_line(line_data, SHARP_BOOKMAKERS)
+                    over_odds, over_book = soft_best['over']
+                    under_odds, under_book = soft_best['under']
+
+                    # Re-price model at this line. The projection mean,
+                    # dispersion, and zero-inflation are line-independent, so
+                    # we just recompute over/under probabilities at the
+                    # alt-line with the same distribution family as the anchor.
+                    prob_over_line, prob_under_line = get_probabilities(
+                        projection['projected_mean'], line, market_key,
+                        alpha=projection.get('alpha'),
+                        sigma=projection.get('sigma'),
+                        pi0=projection.get('pi0'),
+                    )
+                    # Same calibration the anchor projection carries, so the
+                    # agreement gate compares like-for-like probabilities.
+                    prob_over_line = proj_model.calibrate_over(prob_over_line, market_key)
+                    prob_under_line = 1.0 - prob_over_line
+                    line_proj = dict(projection)
+                    line_proj['line'] = line
+                    line_proj['prob_over'] = prob_over_line
+                    line_proj['prob_under'] = prob_under_line
+
+                    opening_row = conn.execute('''
+                        SELECT devigged_over, devigged_under
+                        FROM prop_snapshots
+                        WHERE game_id = ? AND player_name = ? AND market = ? AND line = ?
+                          AND devigged_over IS NOT NULL
+                        ORDER BY timestamp ASC
+                        LIMIT 1
+                    ''', (game_id, player_name, market_key, line)).fetchone()
+
+                    steam_over = _detect_steam_in_soft_books(conn, game_id, player_name, market_key, line, 'over', line_data, SHARP_BOOKMAKERS)
+                    steam_under = _detect_steam_in_soft_books(conn, game_id, player_name, market_key, line, 'under', line_data, SHARP_BOOKMAKERS)
+
+                    # Snapshot every book at this line — schema unchanged.
+                    for book, pair in line_data.items():
+                        o_odds = pair.get('over')
+                        u_odds = pair.get('under')
+                        if not o_odds or not u_odds or o_odds <= 1.0 or u_odds <= 1.0:
+                            continue
+                        dev_o, dev_u = None, None
+                        if book in SHARP_BOOKMAKERS:
+                            dev_o, dev_u = devig_multiplicative(o_odds, u_odds)
+                        conn.execute('''
+                            INSERT INTO prop_snapshots
+                            (snapshot_id, game_id, player_name, market, line,
+                             over_odds, under_odds, bookmaker, timestamp,
+                             devigged_over, devigged_under)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (
+                            str(uuid.uuid4()), game_id, player_name, market_key,
+                            line, o_odds, u_odds, book, timestamp,
+                            dev_o, dev_u,
+                        ))
+
+                    # Truth source per line:
+                    #   anchor line → devigged sharp (Pinnacle/Circa) probability.
+                    #   alt-line    → the SHARP anchor probability shifted along
+                    #                 the model CDF to this line (sharp stays the
+                    #                 basis; the model only interpolates shape).
+                    #                 Using the raw model prob as truth here would
+                    #                 let the model grade itself and defeat the
+                    #                 agreement gate — see _shift_anchor_truth.
+                    if line == anchor_line:
+                        truth_over = sharp_prob_over_anchor
+                        truth_under = sharp_prob_under_anchor
+                        edge_source = 'sharp_anchor'
+                    else:
+                        truth_over, truth_under = _shift_anchor_truth(
+                            sharp_prob_over_anchor, sharp_prob_under_anchor,
+                            raw_anchor_over, prob_over_line,
+                        )
+                        if truth_over is None:
+                            continue  # degenerate anchor prob — can't shift safely
+                        edge_source = 'model_altline'
+                    for side, odds_val, side_book, sharp_prob, is_steam in [
+                        ('over', over_odds, over_book, truth_over, steam_over),
+                        ('under', under_odds, under_book, truth_under, steam_under),
+                    ]:
+                        if not odds_val or odds_val <= 1.0:
+                            continue
+                        opening_prob = opening_row[f'devigged_{side}'] if opening_row else None
+                        edge_result = rank_edge(
+                            line_proj, odds_val, side, sharp_prob,
+                            opening_prob=opening_prob, steam_detected=is_steam,
+                        )
+                        # Bookmaker bias boost: if this book systematically
+                        # underprices this (market, side) vs sharp, add a small
+                        # edge credit and re-flag as playable if it crosses the bar.
+                        bias = bias_map.get((side_book, market_key, side), 0.0)
+                        if bias > BOOKMAKER_BIAS_THRESHOLD:
+                            edge_result = dict(edge_result)
+                            edge_result['edge_pct'] = round(
+                                edge_result['edge_pct'] + 0.5, 4
+                            )
+                            edge_result['bias_boosted'] = True
+                            # The boost may only rescue a bet whose SOLE kill
+                            # reason was the edge bar. Injury, sample-size,
+                            # steam-against, or negative-Kelly kills stand.
+                            reasons = edge_result.get('reasons', [])
+                            edge_killed_only = (
+                                len(reasons) == 1
+                                and reasons[0].startswith('Edge too small')
+                            )
+                            if not edge_result['is_playable'] and edge_killed_only:
+                                edge_result['is_playable'] = edge_result['edge_pct'] >= EDGE_MIN
+                                if edge_result['is_playable']:
+                                    logger.debug(
+                                        "Bias boost made playable: %s %s %s @ %s (bias=%.3f)",
+                                        player_name, market_key, side, side_book, bias,
+                                    )
+                        if edge_result['is_playable']:
+                            edge_result['edge_source'] = edge_source
+                            candidates.append((
+                                edge_result['ev'], line, side, side_book,
+                                odds_val, edge_result, sharp_book,
+                            ))
+
+                # Pick top MAX_BETS_PER_PLAYER by EV; persist the winners so
+                # send_alerts consumes exactly this decision instead of
+                # re-deriving bets from raw snapshots.
+                candidates.sort(key=lambda c: c[0], reverse=True)
+                winners = candidates[:MAX_BETS_PER_PLAYER]
+                for ev, line, side, side_book, odds_val, edge_result, sharp_book_used in winners:
+                    total_edges += 1
+                    logger.info(
+                        f"EDGE FOUND: {player_name} {market_key} {side.upper()} {line} "
+                        f"@ {side_book} (vs {sharp_book_used}, anchor {anchor_line}) | "
+                        f"Edge: {edge_result['edge_pct']:.1f}% | EV: {ev:.3f} | "
+                        f"Kelly: ${edge_result['kelly']['recommended_stake']}"
                     )
 
-                    if edge_result['is_playable']:
-                        total_edges += 1
-                        playable_any = True
-                        logger.info(
-                            f"EDGE FOUND: {player_name} {market_key} {side.upper()} {line} "
-                            f"@ {side_book} (vs {sharp_book}) | Edge: {edge_result['edge_pct']:.1f}% | "
-                            f"EV: {edge_result['ev']:.3f} | "
-                            f"Kelly: ${edge_result['kelly']['recommended_stake']}"
-                        )
+                    # CLV opening basis: devig the chosen book's own two-sided
+                    # quote at this line; fall back to the truth prob when the
+                    # book is one-sided.
+                    open_devig = None
+                    book_pair = lines_for_market.get(line, {}).get(side_book) or {}
+                    dev_o, dev_u = devig_multiplicative(
+                        book_pair.get('over'), book_pair.get('under')
+                    )
+                    if dev_o is not None:
+                        open_devig = dev_o if side == 'over' else dev_u
+                    if open_devig is None:
+                        open_devig = edge_result['sharp_prob']
 
-                if playable_any:
-                    context_json = json.dumps(projection.get('context', {}))
+                    conn.execute('''
+                        INSERT INTO bet_candidates
+                        (game_id, player_id, player_name, market, line, side,
+                         bookmaker, odds, sharp_book, anchor_line, truth_prob,
+                         model_prob, open_devig_prob, edge_pct, ev,
+                         kelly_fraction, recommended_stake, steam_detected,
+                         edge_source, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(game_id, player_name, market, line, side, bookmaker)
+                        DO UPDATE SET
+                            odds=excluded.odds,
+                            truth_prob=excluded.truth_prob,
+                            model_prob=excluded.model_prob,
+                            open_devig_prob=excluded.open_devig_prob,
+                            edge_pct=excluded.edge_pct,
+                            ev=excluded.ev,
+                            kelly_fraction=excluded.kelly_fraction,
+                            recommended_stake=excluded.recommended_stake,
+                            steam_detected=excluded.steam_detected,
+                            edge_source=excluded.edge_source,
+                            created_at=excluded.created_at
+                    ''', (
+                        game_id, projection.get('player_id'), player_name,
+                        market_key, line, side, side_book, odds_val,
+                        sharp_book_used, anchor_line,
+                        edge_result['sharp_prob'], edge_result['model_prob'],
+                        open_devig, edge_result['edge_pct'], ev,
+                        edge_result['kelly']['kelly_fraction'],
+                        edge_result['kelly']['recommended_stake'],
+                        int(edge_result.get('steam_detected', False)),
+                        edge_result.get('edge_source'),
+                        timestamp,
+                    ))
+
+                if winners:
+                    ctx = dict(projection.get('context', {}))
+                    ctx['sample_size'] = projection.get('sample_size', 0)
+                    # Carry dispersion params so the alert can show an honest
+                    # ± band instead of a bare point estimate. Only when present
+                    # (keeps the heuristic/mock context shape unchanged).
+                    for k in ('alpha', 'sigma', 'pi0'):
+                        if projection.get(k) is not None:
+                            ctx[k] = projection[k]
+                    context_json = json.dumps(ctx)
                     conn.execute('''
                         INSERT INTO projections
                         (game_id, player_name, market, projected_mean,
@@ -227,17 +441,56 @@ async def scan_props(force: bool = False, game_ids: list = None):
                         context_json, timestamp,
                     ))
 
-                # Stamp last_scanned_at so subsequent scans respect the gate
                 conn.execute(
                     "UPDATE games SET last_scanned_at = ? WHERE game_id = ?",
                     (now_utc.isoformat(), game_id),
                 )
                 conn.commit()
 
-    logger.info(
-        f"Scan complete. Found {total_edges} playable edges; "
-        f"skipped {skipped_quota} games by quota gate."
-    )
+    skipped_total = sum(skip_reasons.values())
+    if skip_reasons:
+        breakdown = ", ".join(f"{k}={v}" for k, v in sorted(skip_reasons.items()))
+        skip_str = f"skipped {skipped_total} games ({breakdown})"
+    else:
+        skip_str = f"skipped {skipped_total} games"
+    logger.info(f"Scan complete. Found {total_edges} playable edges; {skip_str}.")
+
+    # Surface silent model degradation: a loaded GLM that failed feature-build or
+    # predict fell back to the crude heuristic (no Statcast). This is invisible
+    # per-prop; aggregate it so a broken model/feature pipeline doesn't quietly
+    # downgrade the whole slate.
+    from src.models.projections import pop_glm_degradations
+    degradations = pop_glm_degradations()
+    if degradations:
+        logger.warning(
+            "GLM degraded to heuristic on %d projection(s) this scan: %s",
+            sum(degradations.values()), degradations,
+        )
+
+
+def _shift_anchor_truth(sharp_over: float, sharp_under: float,
+                        model_anchor_over: float, model_alt_over: float):
+    """Translate the devigged SHARP probability from the anchor line to an
+    alt-line along the model's CDF, keeping sharp as the basis.
+
+    The old code used the raw model probability as 'truth' at alt-lines, which
+    let the model grade its own homework: the edge became (model - book) and the
+    model/sharp agreement gate compared the model against itself. Here the sharp
+    anchor probability is scaled by the model's relative CDF movement
+    (odds-ratio style) and renormalized, so the edge stays tethered to the sharp
+    market while the model only supplies the *shape* between lines.
+
+    Returns (truth_over, truth_under), or (None, None) when the anchor model
+    probability is degenerate (can't form a ratio) — caller should skip the line.
+    """
+    if not (0.0 < model_anchor_over < 1.0):
+        return None, None
+    over = sharp_over * (model_alt_over / model_anchor_over)
+    under = sharp_under * ((1.0 - model_alt_over) / (1.0 - model_anchor_over))
+    total = over + under
+    if total <= 0:
+        return None, None
+    return over / total, under / total
 
 
 def _parse_iso(ts: str):
@@ -283,28 +536,51 @@ def _detect_steam_in_soft_books(conn, game_id, player_name, market_key, line, si
     return steam_count >= 3
 
 
-def _should_scan_game(game, now_utc: datetime) -> bool:
+def _should_scan_game(game, now_utc: datetime) -> tuple[str, str | None]:
     """
-    Quota gate. Scan a game only if either:
+    Eligibility gate. Returns ("scan", None) if the game should be scanned,
+    else ("skip", reason). Reasons:
+      - "already_started":   first pitch has passed — pregame pipeline never
+                             produces in-play alerts (the live daemon does)
+      - "no_lineup_confirm": lineups not yet stamped, and outside pregame window
+      - "already_scanned":   lineups stamped but already scanned since
+      - "recently_scanned":  in the window but scanned within PREGAME_RESCAN_MINUTES
+      - "outside_window":    first pitch is not within PREGAME_WINDOW_MINUTES
+
+    Scan when either:
       (a) lineups were confirmed after the last scan (new info → re-price), or
-      (b) first pitch is within PREGAME_WINDOW_MINUTES (high-volatility window).
+      (b) first pitch is within PREGAME_WINDOW_MINUTES (high-volatility window),
+          throttled to one scan per PREGAME_RESCAN_MINUTES to bound quota.
     """
     confirmed_at = _parse_iso(game['lineups_confirmed_at'])
     last_scanned = _parse_iso(game['last_scanned_at'])
     game_time = _parse_iso(game['game_time'])
 
+    # Hard guard: a game whose first pitch has passed is never scanned by the
+    # pregame pipeline — this is what keeps a late lineup confirmation (or a
+    # forced run) from firing an in-play alert.
+    if game_time is not None and game_time <= now_utc:
+        return ("skip", "already_started")
+
     # (a) Lineup drop triggers one re-scan.
     if confirmed_at is not None:
         if last_scanned is None or last_scanned < confirmed_at:
-            return True
+            return ("scan", None)
 
     # (b) Pregame window: first pitch within PREGAME_WINDOW_MINUTES from now.
     if game_time is not None:
         minutes_until = (game_time - now_utc).total_seconds() / 60.0
         if 0 <= minutes_until <= PREGAME_WINDOW_MINUTES:
-            return True
+            if (last_scanned is None
+                    or (now_utc - last_scanned).total_seconds() >= PREGAME_RESCAN_MINUTES * 60):
+                return ("scan", None)
+            return ("skip", "recently_scanned")
 
-    return False
+    if confirmed_at is None:
+        return ("skip", "no_lineup_confirm")
+    if last_scanned is not None and last_scanned >= confirmed_at:
+        return ("skip", "already_scanned")
+    return ("skip", "outside_window")
 
 
 def _pick_best_line(line_data: dict) -> dict:
@@ -370,6 +646,31 @@ def _pick_best_soft_line(line_data: dict, sharp_books: list) -> dict:
     return {'over': best_over, 'under': best_under}
 
 
+def _group_by_player_market(player_lines: dict) -> dict:
+    """Re-bucket {(player, market, line): book_data} into
+    {(player, market): {line: book_data}}. Lets the scan loop iterate one
+    (player, market) at a time and consider every quoted line within range
+    instead of only sharp-anchored lines."""
+    grouped = {}
+    for (player, market, line), book_data in player_lines.items():
+        grouped.setdefault((player, market), {})[line] = book_data
+    return grouped
+
+
+def _pick_anchor_line(lines_for_market: dict, sharp_books: list):
+    """Find the first line for a (player, market) where a sharp book quotes
+    a valid two-sided pair. Returns (line, sharp_over, sharp_under, book) or
+    None. The anchor's devigged probability is the source-of-truth used to
+    re-price every alt-line in this market."""
+    for line in sorted(lines_for_market.keys()):
+        sharp_pair = _pick_sharp_pair(lines_for_market[line], sharp_books)
+        if sharp_pair is None:
+            continue
+        sharp_over, sharp_under, book = sharp_pair
+        return (line, sharp_over, sharp_under, book)
+    return None
+
+
 def _parse_odds_by_player(event_odds: dict) -> dict:
     """
     Parse the Odds API response into a structure grouped by (player, market, line).
@@ -404,6 +705,21 @@ def _parse_odds_by_player(event_odds: dict) -> dict:
     return result
 
 
+def _record_total_snapshot(game_id: str, total: float, source: str) -> None:
+    """Persist a game-total observation. Read by trigger_watch as the
+    baseline for between-scan shift detection."""
+    try:
+        with get_db_connection() as conn:
+            conn.execute(
+                "INSERT INTO game_totals_history (game_id, total, source, timestamp) "
+                "VALUES (?, ?, ?, ?)",
+                (game_id, float(total), source, datetime.now(timezone.utc).isoformat()),
+            )
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"Failed to record game total for {game_id}: {e}")
+
+
 def _parse_game_total(event_odds: dict) -> float | None:
     """Extract the consensus game total (over/under) line from the API response.
 
@@ -431,21 +747,26 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
                       game_id: str, home_team: str, away_team: str,
                       venue: str, weather: dict = None,
                       ump_k_factor: float = 1.0,
-                      game_total: float = None) -> dict:
+                      game_total: float = None,
+                      bdl_market: dict = None) -> dict:
     """Build a projection for a player+market by looking up their stats in the DB."""
     with get_db_connection() as conn:
-        # Find the player
+        # Resolve the player deterministically (cache -> exact -> accent/suffix-
+        # normalized unique). The old `name LIKE '%X%'` first-row match could pull
+        # an entirely different player's logs on duplicate MLB names (two Will
+        # Smiths, multiple José Ramírez). We never project a bet on a guess: an
+        # ambiguous or unresolved name skips the prop.
+        from src.data.player_resolver import resolve_player_id
+        pid, method = resolve_player_id(conn, player_name)
+        if pid is None:
+            logger.info(
+                "Skipping %s %s: name unresolved (%s) — refusing to project on a guess.",
+                player_name, market_key, method,
+            )
+            return None
         player = conn.execute(
-            "SELECT * FROM players WHERE name = ? COLLATE NOCASE", (player_name,)
+            "SELECT * FROM players WHERE player_id = ?", (pid,)
         ).fetchone()
-
-        if not player:
-            # Try partial match
-            player = conn.execute(
-                "SELECT * FROM players WHERE name LIKE ? COLLATE NOCASE",
-                (f"%{player_name}%",)
-            ).fetchone()
-
         if not player:
             return None
 
@@ -455,12 +776,11 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
         bats = player['bats'] or ''
         throws = player['throws'] or ''
         
-        # Determine opposing team ID
-        home = conn.execute("SELECT team_id FROM teams WHERE name LIKE ? COLLATE NOCASE", (f"%{home_team}%",)).fetchone()
-        away = conn.execute("SELECT team_id FROM teams WHERE name LIKE ? COLLATE NOCASE", (f"%{away_team}%",)).fetchone()
-        
-        home_id = home['team_id'] if home else None
-        away_id = away['team_id'] if away else None
+        # Determine opposing team ID. Resolve via the exact Odds-API->abbrev map
+        # rather than `name LIKE '%City%'`, which collides on "Chicago"
+        # (Cubs/White Sox) and "Los Angeles" (Angels/Dodgers).
+        home_id = _resolve_team_id(conn, home_team)
+        away_id = _resolve_team_id(conn, away_team)
         opp_team_id = away_id if team_id == home_id else home_id
 
         # Check injury status
@@ -473,15 +793,55 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
 
         if injury_status in ('IL', 'Out'):
             return None
+
+        # Confirmed-starter gate (pitcher markets). Bet the listed probable
+        # pitcher only — never a pitcher who isn't confirmed to start (an
+        # unconfirmed/scratched arm would otherwise project off stale logs and
+        # only void post-hoc). Batter lineup confirmation is enforced in the
+        # batter branch where the lineup slot is looked up.
+        if (REQUIRE_CONFIRMED_LINEUP
+                and market_key in ('pitcher_strikeouts', 'pitcher_earned_runs')
+                and not _is_confirmed_starter(conn, game_id, player_id)):
+            logger.info(
+                "Skipping %s %s: starting pitcher not confirmed for game %s.",
+                player_name, market_key, game_id,
+            )
+            return None
+
+        # LLM injury signal (optional): a tightening-only gate. When the player
+        # already carries a non-clear status AND the model estimates a low
+        # probability of appearing, skip the prop. The LLM never loosens a
+        # decision and never changes a projection number; its impact_summary is
+        # carried into the projection context for the alert rationale.
+        injury_summary = None
+        if injury_status != 'Healthy':
+            from src.pipelines.enrich_injuries import get_injury_signal
+            from src.config import LLM_INJURY_SKIP_PROBABILITY
+            sig = get_injury_signal(conn, player_id, today)
+            if sig:
+                injury_summary = sig.get('impact_summary')
+                prob = sig.get('play_probability')
+                if (sig.get('play_status') == 'out'
+                        or (prob is not None and prob < LLM_INJURY_SKIP_PROBABILITY)):
+                    logger.info(
+                        "LLM injury gate skipped %s (%s, p_play=%s): %s",
+                        player_name, injury_status, prob, injury_summary,
+                    )
+                    return None
             
         pitcher_bullpen_era = compute_bullpen_factor(team_id, today, db=conn)
         opp_bullpen_era = compute_bullpen_factor(opp_team_id, today, db=conn)
+        # Materialize DB-derived features here so the conn never escapes this
+        # context manager. Downstream feature builders prefer these scalars
+        # over their `extra["db"]` fallback path.
+        h2h_k_delta = compute_pitcher_h2h_vs_team(player_id, opp_team_id, today, db=conn)
         extra_features = {
             'pitcher_bullpen_era': pitcher_bullpen_era,
             'opp_bullpen_era': opp_bullpen_era,
             'opp_team_id': opp_team_id,
             'pitcher_id': player_id,
-            'db': conn
+            'h2h_k_delta': h2h_k_delta,
+            'db': conn,
         }
 
         # Build projection based on market type
@@ -492,13 +852,11 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
             ).fetchall()
             logs = [dict(l) for l in logs]
 
-            # Get opponent team K rate.
-            # NOTE: _get_team_stats performs a heavy aggregation. For better performance,
-            # this value should be pre-calculated by a separate pipeline and stored in a
-            # `team_stats` table. The call would then be a simple lookup.
+            # Opponent = the team the pitcher faces (opp_team_id), NOT always
+            # the away team — for away starters that would be their own club.
             from src.config import LEAGUE_AVG_K_RATE
-            opp_team_stats = _get_team_stats(conn, away_team)
-            opp_k_rate = opp_team_stats.get('k_rate', LEAGUE_AVG_K_RATE)
+            opp_team_stats = _get_team_stats_by_id(conn, opp_team_id)
+            opp_k_rate = opp_team_stats.get('k_rate') or LEAGUE_AVG_K_RATE
 
             proj = proj_model.project_pitcher_strikeouts(
                 logs, opp_k_rate, venue, line, weather=weather, ump_k_factor=ump_k_factor,
@@ -506,6 +864,9 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
             )
             if proj:
                 proj['injury_status'] = injury_status
+                proj['player_id'] = player_id
+                if injury_summary:
+                    proj.setdefault('context', {})['llm_injury_summary'] = injury_summary
             return proj
 
         elif market_key == 'pitcher_earned_runs':
@@ -516,8 +877,8 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
             logs = [dict(l) for l in logs]
 
             from src.config import LEAGUE_AVG_RUNS_PER_GAME
-            opp_team_stats = _get_team_stats(conn, away_team)
-            opp_runs_pg = opp_team_stats.get('runs_per_game', LEAGUE_AVG_RUNS_PER_GAME)
+            opp_team_stats = _get_team_stats_by_id(conn, opp_team_id)
+            opp_runs_pg = opp_team_stats.get('runs_per_game') or LEAGUE_AVG_RUNS_PER_GAME
 
             proj = proj_model.project_pitcher_earned_runs(
                 logs, opp_runs_pg, venue, line, weather=weather, ump_k_factor=ump_k_factor,
@@ -525,6 +886,9 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
             )
             if proj:
                 proj['injury_status'] = injury_status
+                proj['player_id'] = player_id
+                if injury_summary:
+                    proj.setdefault('context', {})['llm_injury_summary'] = injury_summary
             return proj
 
         elif market_key in ('batter_hits', 'batter_total_bases', 'batter_home_runs'):
@@ -543,22 +907,132 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
             # Get opposing pitcher's throwing hand from probable pitchers
             pitcher_hand = _get_opposing_pitcher_hand(conn, game_id, home_team, away_team, player)
 
-            # Look up today's lineup position for PA projection
+            # Look up today's lineup position for PA projection (by id when the
+            # name lookup misses — the resolver gave us a trustworthy player_id).
             lineup_position = _get_lineup_position(conn, player_name, game_id)
+            if lineup_position is None and player_id:
+                row = conn.execute(
+                    "SELECT lineup_position FROM daily_lineups WHERE game_id = ? AND player_id = ?",
+                    (game_id, player_id),
+                ).fetchone()
+                if row and row['lineup_position']:
+                    lineup_position = int(row['lineup_position'])
+
+            # Confirmed-lineup gate (batter markets): a batter not in today's
+            # posted lineup would otherwise project off DEFAULT_PROJECTED_PA and
+            # only void post-hoc if they sit. Skip rather than guess.
+            if REQUIRE_CONFIRMED_LINEUP and lineup_position is None:
+                logger.info(
+                    "Skipping %s %s: batter not in confirmed lineup for game %s.",
+                    player_name, market_key, game_id,
+                )
+                return None
+
+            # Materialize platoon rate here while conn is alive so the feature
+            # builder doesn't need to reach back into the DB after this block.
+            batter_extra = dict(extra_features)
+            batter_extra['batter_id'] = player_id
+            batter_extra['platoon_rate_vs_hand'] = compute_platoon_split(
+                batter_logs=logs, vs_hand=pitcher_hand or '', stat_key=stat_type,
+                db=conn, batter_id=player_id,
+            )
+
+            # Moneyline-tilted implied team total when BDL supplied moneylines:
+            # the batter's club's share of the game total leans to the favorite.
+            itt_override = None
+            if (bdl_market and bdl_market.get('ml_home') is not None
+                    and bdl_market.get('ml_away') is not None):
+                from src.models.pa_estimator import implied_team_total
+                batter_side = 'home' if team_id == home_id else 'away'
+                itt_override = implied_team_total(
+                    game_total, bdl_market['ml_home'], bdl_market['ml_away'],
+                    side=batter_side,
+                )
 
             proj = proj_model.project_batter_stat(
                 logs, stat_type, pitcher_hand, bats, venue, line,
                 lineup_position=lineup_position,
                 weather=weather,
-                extra_features=extra_features,
+                extra_features=batter_extra,
                 player_id=player_id,
                 game_total=game_total,
+                implied_team_total_override=itt_override,
             )
             if proj:
                 proj['injury_status'] = injury_status
+                proj['player_id'] = player_id
+                if injury_summary:
+                    proj.setdefault('context', {})['llm_injury_summary'] = injury_summary
             return proj
 
     return None
+
+
+def _is_confirmed_starter(conn, game_id: str, player_id: int) -> bool:
+    """True iff this player is the confirmed probable starter for this game.
+
+    probable_pitchers is populated by sync_lineups from BDL's /lineups feed; a
+    row keyed to this (game_id, player_id) is our 'starter confirmed' signal.
+    """
+    if not player_id:
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM probable_pitchers WHERE game_id = ? AND player_id = ? LIMIT 1",
+        (game_id, player_id),
+    ).fetchone()
+    return row is not None
+
+
+def _resolve_team_id(conn, team_name: str):
+    """Resolve an Odds-API team name to a BDL team_id without LIKE collisions.
+
+    Priority: exact Odds-API->abbreviation map (config) joined on teams.abbreviation,
+    then exact name match, then a logged fuzzy LIKE as a last resort. Returns the
+    team_id or None. The abbreviation path is what disambiguates "Chicago" and
+    "Los Angeles", which `name LIKE '%City%'` cannot.
+    """
+    if not team_name:
+        return None
+    from src.config import ODDS_API_TEAM_ABBREV
+    abbrev = ODDS_API_TEAM_ABBREV.get(team_name)
+    if abbrev:
+        row = conn.execute(
+            "SELECT team_id FROM teams WHERE abbreviation = ? COLLATE NOCASE",
+            (abbrev,),
+        ).fetchone()
+        if row:
+            return row['team_id']
+    row = conn.execute(
+        "SELECT team_id FROM teams WHERE name = ? COLLATE NOCASE", (team_name,)
+    ).fetchone()
+    if row:
+        return row['team_id']
+    row = conn.execute(
+        "SELECT team_id FROM teams WHERE name LIKE ? COLLATE NOCASE",
+        (f"%{team_name}%",),
+    ).fetchone()
+    if row:
+        logger.debug("Team '%s' resolved via fuzzy LIKE — verify abbrev map.", team_name)
+        return row['team_id']
+    return None
+
+
+def _get_team_stats_by_id(conn, team_id) -> dict:
+    """Pre-calculated team offensive stats (calculate_team_stats pipeline),
+    looked up directly by BDL team_id. Returns {} when unknown so callers
+    fall back to league averages."""
+    if not team_id:
+        return {}
+
+    stats = conn.execute(
+        "SELECT k_rate, runs_per_game FROM team_stats WHERE team_id = ?",
+        (team_id,)
+    ).fetchone()
+
+    if not stats:
+        return {}
+
+    return {'k_rate': stats['k_rate'], 'runs_per_game': stats['runs_per_game']}
 
 
 def _get_team_stats(conn, team_name: str) -> dict:
@@ -571,44 +1045,30 @@ def _get_team_stats(conn, team_name: str) -> dict:
         "SELECT team_id FROM teams WHERE name LIKE ? COLLATE NOCASE",
         (f"%{team_name}%",)
     ).fetchone()
- 
+
     if not team:
         return {}
- 
-    # Look up stats from the pre-calculated table
-    stats = conn.execute(
-        "SELECT k_rate, runs_per_game FROM team_stats WHERE team_id = ?",
-        (team['team_id'],)
-    ).fetchone()
- 
-    if not stats:
-        return {}
- 
-    return {'k_rate': stats['k_rate'], 'runs_per_game': stats['runs_per_game']}
+
+    return _get_team_stats_by_id(conn, team['team_id'])
 
 
 def _get_opposing_pitcher_hand(conn, game_id: str, home_team: str, away_team: str, batter_player) -> str:
     """
-    Look up the opposing probable pitcher's throwing hand.
+    Look up the opposing probable pitcher's throwing hand from the confirmed
+    probable_pitchers table (BDL /lineups). Returns '' (neutral) when no
+    confirmed starter exists.
 
-    Priority:
-    1. probable_pitchers table (from BDL /lineups endpoint) — the correct answer
-    2. Fallback: most recent pitcher on opposing team from game logs (old heuristic)
+    The previous "most recent pitcher on the opposing team" fallback guessed a
+    hand from an unrelated pitcher's game log — that silently applied the WRONG
+    platoon split. A wrong platoon adjustment is worse than none, so when the
+    starter isn't confirmed we return '' and the platoon multiplier stays 1.0.
     """
     batter_team_id = batter_player['team_id']
 
-    # Determine which team the batter is on to find the opposing team
-    home = conn.execute(
-        "SELECT team_id FROM teams WHERE name LIKE ? COLLATE NOCASE",
-        (f"%{home_team}%",)
-    ).fetchone()
+    # Determine which team the batter is on to find the opposing team.
+    home_id = _resolve_team_id(conn, home_team)
+    opp_team_name = away_team if (home_id is not None and batter_team_id == home_id) else home_team
 
-    if home and batter_team_id == home['team_id']:
-        opp_team_name = away_team
-    else:
-        opp_team_name = home_team
-
-    # --- Primary: look up probable pitcher from today's lineup sync ---
     pitcher = conn.execute(
         "SELECT throws FROM probable_pitchers WHERE game_id = ? AND team LIKE ? COLLATE NOCASE",
         (game_id, f"%{opp_team_name}%")
@@ -617,25 +1077,11 @@ def _get_opposing_pitcher_hand(conn, game_id: str, home_team: str, away_team: st
     if pitcher and pitcher['throws']:
         return pitcher['throws']
 
-    # --- Fallback: most recent pitcher on opposing team (old heuristic) ---
-    logger.debug(f"No probable pitcher for {opp_team_name} in game {game_id}, using fallback")
-
-    opp_team = conn.execute(
-        "SELECT team_id FROM teams WHERE name LIKE ? COLLATE NOCASE",
-        (f"%{opp_team_name}%",)
-    ).fetchone()
-
-    if not opp_team:
-        return 'R'
-
-    pitcher = conn.execute('''
-        SELECT p.throws FROM players p
-        JOIN pitcher_game_logs pgl ON p.player_id = pgl.player_id
-        WHERE p.team_id = ? AND p.position = 'P'
-        ORDER BY pgl.date DESC LIMIT 1
-    ''', (opp_team['team_id'],)).fetchone()
-
-    return pitcher['throws'] if pitcher and pitcher['throws'] else 'R'
+    logger.debug(
+        "No confirmed probable pitcher for %s in game %s — neutral platoon (no guess).",
+        opp_team_name, game_id,
+    )
+    return ''
 
 
 def _get_ump_k_factor(game_id: str) -> float:

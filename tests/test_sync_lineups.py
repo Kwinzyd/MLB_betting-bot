@@ -47,14 +47,14 @@ def memory_db():
 
 LINEUP_ENTRIES = [
     {
-        'player': {'id': 10, 'first_name': 'Gerrit', 'last_name': 'Cole', 'throws': 'R'},
-        'team': {'full_name': 'Yankees'},
+        'player': {'id': 10, 'first_name': 'Gerrit', 'last_name': 'Cole', 'bats_throws': 'Right/R'},
+        'team': {'display_name': 'Yankees'},
         'is_probable_pitcher': True,
         'batting_order': None,
     },
     {
-        'player': {'id': 20, 'first_name': 'Aaron', 'last_name': 'Judge', 'throws': 'R'},
-        'team': {'full_name': 'Yankees'},
+        'player': {'id': 20, 'first_name': 'Aaron', 'last_name': 'Judge', 'bats_throws': 'Right/R'},
+        'team': {'display_name': 'Yankees'},
         'is_probable_pitcher': False,
         'batting_order': 3,
     },
@@ -120,8 +120,8 @@ async def test_sync_lineups_pitcher_upsert(mock_client_cls, mock_get_db, _mock_d
     # Second run — different pitcher announced
     updated_entries = [
         {
-            'player': {'id': 11, 'first_name': 'Nathan', 'last_name': 'Eovaldi', 'throws': 'R'},
-            'team': {'full_name': 'Yankees'},
+            'player': {'id': 11, 'first_name': 'Nathan', 'last_name': 'Eovaldi', 'bats_throws': 'Right/R'},
+            'team': {'display_name': 'Yankees'},
             'is_probable_pitcher': True,
             'batting_order': None,
         }
@@ -132,3 +132,48 @@ async def test_sync_lineups_pitcher_upsert(mock_client_cls, mock_get_db, _mock_d
     pitchers = memory_db.execute("SELECT * FROM probable_pitchers WHERE game_id = 'g1'").fetchall()
     assert len(pitchers) == 1
     assert pitchers[0]['player_name'] == 'Nathan Eovaldi'
+
+
+@patch('src.pipelines.sync_lineups.get_eastern_local_date',
+       return_value=datetime.date(2024, 5, 15))
+@patch('src.pipelines.sync_lineups.get_db_connection')
+@patch('src.pipelines.sync_lineups.MLBStatsClient')
+async def test_sync_lineups_includes_late_night_game(mock_client_cls, mock_get_db, _mock_date):
+    """A 10pm-ET game rolls to the next UTC day (02:00Z). The old `date LIKE
+    '<eastern-date>%'` filter dropped it; the Eastern-day window must include it
+    so its lineups confirm pregame."""
+    conn = sqlite3.connect(':memory:')
+    conn.row_factory = sqlite3.Row
+    conn.executescript('''
+        CREATE TABLE games (
+            game_id TEXT PRIMARY KEY, bdl_game_id INTEGER,
+            home_team TEXT, away_team TEXT, status TEXT, date TEXT,
+            lineups_confirmed_at TEXT
+        );
+        CREATE TABLE daily_lineups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, game_id TEXT, team TEXT,
+            player_name TEXT, player_id INTEGER, lineup_position INTEGER, date TEXT,
+            UNIQUE(game_id, player_name)
+        );
+        CREATE TABLE probable_pitchers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, game_id TEXT, team TEXT,
+            player_name TEXT, player_id INTEGER, throws TEXT, date TEXT,
+            UNIQUE(game_id, team)
+        );
+    ''')
+    # 10pm ET on 2024-05-15 == 02:00 UTC on 2024-05-16.
+    conn.execute(
+        "INSERT INTO games VALUES ('late', 888, 'Yankees', 'Red Sox', "
+        "'SCHEDULED', '2024-05-16T02:00:00Z', NULL)")
+    conn.commit()
+
+    mock_client_cls.return_value.get_lineups = AsyncMock(return_value=LINEUP_ENTRIES)
+    mock_get_db.return_value.__enter__.return_value = conn
+    mock_get_db.return_value.__exit__.return_value = None
+
+    from src.pipelines.sync_lineups import sync_lineups
+    await sync_lineups()
+
+    pitcher = conn.execute("SELECT * FROM probable_pitchers WHERE game_id = 'late'").fetchone()
+    assert pitcher is not None  # would be None under the old UTC-string filter
+    assert pitcher['player_name'] == 'Gerrit Cole'

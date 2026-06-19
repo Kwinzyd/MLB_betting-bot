@@ -16,8 +16,8 @@ from __future__ import annotations
 
 import os
 from collections import defaultdict
-from datetime import datetime
 from typing import Dict, List, Tuple
+from src.utils.time_utils import utcnow
 
 import numpy as np
 
@@ -188,7 +188,7 @@ def _fit_market(market: str) -> List[dict]:
 
     is_tb = market == "batter_total_bases"
     entity_type = "pitcher" if is_pitcher else "batter"
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    now = utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
     all_y = np.concatenate([np.array([t[0] for t in v]) for v in residuals.values()])
     all_mu = np.concatenate([np.array([t[1] for t in v]) for v in residuals.values()])

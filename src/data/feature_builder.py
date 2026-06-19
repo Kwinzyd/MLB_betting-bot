@@ -25,6 +25,14 @@ import numpy as np
 from src.data.park_factors import get_park_factor
 from src.config import LEAGUE_AVG_K_RATE, LEAGUE_AVG_RUNS_PER_GAME
 
+# Statcast league-average constants used for normalization / delta calculations.
+_LEAGUE_AVG_WHIFF_PCT         = 0.255   # ~25.5% league-wide whiff rate
+_LEAGUE_AVG_K_PER_9_PITCHER   = 8.8    # league avg K/9 per pitcher IP (2024 MLB)
+_LEAGUE_AVG_SPIN_RATE_FF      = 2250.0  # rpm — 4-seam fastball league average
+_LEAGUE_AVG_SPIN_RATE_STD     = 200.0   # rpm — std dev for z-scoring
+_LEAGUE_AVG_EXIT_VELO         = 88.5   # mph — batter average exit velocity
+_LEAGUE_AVG_SPRINT_SPEED      = 27.0   # ft/sec — runner sprint speed league avg
+
 
 PITCHER_FEATURE_NAMES: List[str] = [
     "recent_k_per_9_l5",
@@ -56,6 +64,20 @@ PITCHER_FEATURE_NAMES: List[str] = [
     "k_volatility_l10",
     "ip_volatility_l10",
     "h2h_k_per_9_delta",
+    # Statcast stuff-quality metrics (Baseball Savant, no API key).
+    # whiff_pct and chase_rate are the strongest K predictors in small samples.
+    # barrel_pct_against and hard_hit_pct_against predict ER/HR allowed.
+    # spin_rate_ff: high spin → more break → higher K rate.
+    # delta_k9_vs_xk9: K/9 minus expected from whiff% — regression-to-mean signal.
+    # velocity_delta_l5: fastball velocity trend in last 5 starts (fatigue/injury proxy).
+    "statcast_whiff_pct",
+    "statcast_chase_rate",
+    "statcast_barrel_pct_against",
+    "statcast_hard_hit_pct_against",
+    "statcast_spin_rate_ff_z",
+    "statcast_avg_exit_velo_against",
+    "statcast_delta_k9_vs_xk9",
+    "statcast_k9_momentum_l5",
 ]
 
 BATTER_FEATURE_NAMES: List[str] = [
@@ -79,6 +101,19 @@ BATTER_FEATURE_NAMES: List[str] = [
     # hits/TB distributions (more 0s) which matters at the under line.
     "stat_volatility_l15",
     "k_rate_l15",
+    # Statcast contact-quality metrics (Baseball Savant).
+    # barrel_pct and xwoba are the strongest HR/TB predictors in small samples.
+    # exit_velocity_avg and hard_hit_pct capture overall contact quality.
+    # launch_angle_avg: high launch → more HRs/XBH, low launch → grounders/singles.
+    # whiff_pct_batter: K risk proxy (relevant for hit-under bets).
+    # sprint_speed: infield hit rate booster for hit props.
+    "statcast_barrel_pct",
+    "statcast_xwoba",
+    "statcast_exit_velocity_avg",
+    "statcast_hard_hit_pct",
+    "statcast_launch_angle_avg",
+    "statcast_whiff_pct_batter",
+    "statcast_sprint_speed",
 ]
 
 
@@ -178,16 +213,49 @@ def compute_rest_days(logs: List[Dict], game_date: str) -> int:
     return max(0, (gd - ld).days)
 
 
-def compute_platoon_split(batter_logs: List[Dict], vs_hand: str, stat_key: str,
-                          db=None, batter_id: int = None) -> float:
-    """
-    Historical per-PA rate for a batter when facing a given pitcher hand.
+_STAT_KEY_TO_MARKET = {
+    "hits":        "batter_hits",
+    "home_runs":   "batter_home_runs",
+    "total_bases": "batter_total_bases",
+}
 
-    For the simple path we compute it from the batter's own logs joined to
-    probable_pitchers (which stores today's pitcher hand). When the DB is
-    available AND batter_id is passed, we do that join; otherwise we fall
-    back to the batter's overall season rate from logs (safe default).
+# Bayesian prior strength: number of pseudo-PA to weight toward the prior.
+# At 50 PA the empirical rate is used directly; below 50 we shrink.
+_PLATOON_PRIOR_PA = 30
+
+
+def compute_platoon_split(batter_logs: List[Dict], vs_hand: str, stat_key: str,
+                          db=None, batter_id: int = None,
+                          season: int = None) -> float:
+    """Per-PA rate for a batter vs a given pitcher hand.
+
+    Lookup order:
+      1. batter_platoon_splits table (empirical, Bayesian-shrunk when n_pa < 50).
+      2. Fallback JOIN on probable_pitchers (legacy path).
+      3. Overall season rate from logs.
     """
+    season_rate = _rolling_batter_rate(batter_logs, stat_key, window=max(30, len(batter_logs)))
+
+    if db is not None and batter_id is not None and vs_hand and season:
+        market = _STAT_KEY_TO_MARKET.get(stat_key)
+        if market:
+            try:
+                row = db.execute(
+                    "SELECT rate_per_pa, n_pa FROM batter_platoon_splits "
+                    "WHERE player_id=? AND season=? AND vs_hand=? AND market=?",
+                    (batter_id, season, vs_hand.upper(), market),
+                ).fetchone()
+                if row and row["n_pa"]:
+                    n_pa = int(row["n_pa"])
+                    empirical = float(row["rate_per_pa"])
+                    if n_pa >= 50:
+                        return empirical
+                    # Bayesian shrinkage: blend empirical toward prior (season rate)
+                    return (n_pa * empirical + _PLATOON_PRIOR_PA * season_rate) / (n_pa + _PLATOON_PRIOR_PA)
+            except Exception:
+                pass
+
+    # Legacy: join on probable_pitchers game-by-game
     if db is not None and batter_id is not None and vs_hand:
         try:
             rows = db.execute(
@@ -208,13 +276,12 @@ def compute_platoon_split(batter_logs: List[Dict], vs_hand: str, stat_key: str,
                 """,
                 (vs_hand.upper(), batter_id),
             ).fetchone()
-            if rows and rows['pa']:
-                return _safe_div(rows['stat'] or 0, rows['pa'])
+            if rows and rows["pa"]:
+                return _safe_div(rows["stat"] or 0, rows["pa"])
         except Exception:
             pass
 
-    # Fallback: overall rate from the caller-supplied logs
-    return _rolling_batter_rate(batter_logs, stat_key, window=max(30, len(batter_logs)))
+    return season_rate
 
 
 def _sqlite_identifier(ident: str) -> str:
@@ -327,6 +394,57 @@ def _is_day_game(game_time: Optional[str]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Statcast DB lookups
+# ---------------------------------------------------------------------------
+
+def _load_statcast_pitcher(player_id: int, season: int, db) -> Dict[str, Optional[float]]:
+    """Return a dict of Statcast pitcher metrics for (player_id, season), or all None."""
+    blank: Dict[str, Optional[float]] = {
+        "whiff_pct": None, "chase_rate": None, "barrel_pct_against": None,
+        "hard_hit_pct_against": None, "spin_rate_ff": None,
+        "avg_exit_velocity_against": None,
+    }
+    if db is None or not player_id:
+        return blank
+    try:
+        row = db.execute(
+            """SELECT whiff_pct, chase_rate, barrel_pct_against, hard_hit_pct_against,
+                      spin_rate_ff, avg_exit_velocity_against
+               FROM statcast_pitcher_stats
+               WHERE player_id = ? AND season = ?""",
+            (player_id, season),
+        ).fetchone()
+        if row:
+            return {k: row[k] for k in blank}
+    except Exception:
+        pass
+    return blank
+
+
+def _load_statcast_batter(player_id: int, season: int, db) -> Dict[str, Optional[float]]:
+    """Return a dict of Statcast batter metrics for (player_id, season), or all None."""
+    blank: Dict[str, Optional[float]] = {
+        "exit_velocity_avg": None, "launch_angle_avg": None, "barrel_pct": None,
+        "xwoba": None, "sprint_speed": None, "whiff_pct": None, "hard_hit_pct": None,
+    }
+    if db is None or not player_id:
+        return blank
+    try:
+        row = db.execute(
+            """SELECT exit_velocity_avg, launch_angle_avg, barrel_pct,
+                      xwoba, sprint_speed, whiff_pct, hard_hit_pct
+               FROM statcast_batter_stats
+               WHERE player_id = ? AND season = ?""",
+            (player_id, season),
+        ).fetchone()
+        if row:
+            return {k: row[k] for k in blank}
+    except Exception:
+        pass
+    return blank
+
+
+# ---------------------------------------------------------------------------
 # Public: pitcher feature builder
 # ---------------------------------------------------------------------------
 
@@ -336,7 +454,7 @@ def build_pitcher_features(pitcher_logs: List[Dict],
                            venue: Optional[str],
                            weather: Optional[Dict],
                            ump_k_factor: float = 1.0,
-                           projected_ip: float = 5.5,
+                           projected_ip: float = 5.5,  # noqa: ARG001
                            extra: Optional[Dict] = None) -> np.ndarray:
     """
     Build a feature vector in the order of PITCHER_FEATURE_NAMES.
@@ -372,11 +490,41 @@ def build_pitcher_features(pitcher_logs: List[Dict],
     k_vol_l10 = _rolling_pitcher_start_stdev(logs, "strikeouts", 10)
     ip_vol_l10 = _rolling_pitcher_start_stdev(logs, "innings_pitched", 10)
 
-    h2h_k_delta = 0.0
-    if extra.get("db") and extra.get("pitcher_id") and extra.get("opp_team_id"):
-        h2h_k_delta = compute_pitcher_h2h_vs_team(
-            extra["pitcher_id"], extra["opp_team_id"], game_date, extra["db"]
-        )
+    h2h_k_delta = extra.get("h2h_k_delta")
+    if h2h_k_delta is None:
+        h2h_k_delta = 0.0
+        if extra.get("db") and extra.get("pitcher_id") and extra.get("opp_team_id"):
+            h2h_k_delta = compute_pitcher_h2h_vs_team(
+                extra["pitcher_id"], extra["opp_team_id"], game_date, extra["db"]
+            )
+
+    # Statcast metrics — loaded from DB when pitcher_id and season are available.
+    _cur_year = datetime.now().year
+    sc_season = extra.get("season") or extra.get("month_of_season") or _cur_year
+    sc = _load_statcast_pitcher(
+        extra.get("pitcher_id") or 0,
+        sc_season if sc_season > 2000 else _cur_year,
+        extra.get("db"),
+    )
+    sc_whiff     = sc["whiff_pct"]           or 0.0
+    sc_chase     = sc["chase_rate"]           or 0.0
+    sc_barrel    = sc["barrel_pct_against"]   or 0.0
+    sc_hard_hit  = sc["hard_hit_pct_against"] or 0.0
+    sc_spin_z    = ((sc["spin_rate_ff"] or _LEAGUE_AVG_SPIN_RATE_FF) - _LEAGUE_AVG_SPIN_RATE_FF) / _LEAGUE_AVG_SPIN_RATE_STD
+    sc_exit_velo = sc["avg_exit_velocity_against"] or _LEAGUE_AVG_EXIT_VELO
+
+    # delta_k9_vs_xk9: positive = outperforming stuff (regression expected).
+    # xK/9 estimated from whiff% scaled to league average K/9 rate.
+    if sc_whiff > 0:
+        xk9 = (sc_whiff / _LEAGUE_AVG_WHIFF_PCT) * _LEAGUE_AVG_K_PER_9_PITCHER
+        sc_delta_k9 = season["k_per_9"] - xk9
+    else:
+        sc_delta_k9 = 0.0
+
+    # k9_momentum_l5: recent K/9 trend (l5 minus l10). Positive = pitcher gaining
+    # K rate over last 5 starts; negative = declining. Explicit delta is more
+    # useful for the GLM (linear on log scale) than the two raw values separately.
+    sc_k9_momentum = l5["k_per_9"] - l10["k_per_9"]
 
     values = [
         l5["k_per_9"],
@@ -404,6 +552,15 @@ def build_pitcher_features(pitcher_logs: List[Dict],
         float(k_vol_l10),
         float(ip_vol_l10),
         float(h2h_k_delta),
+        # Statcast features (8)
+        float(sc_whiff),
+        float(sc_chase),
+        float(sc_barrel),
+        float(sc_hard_hit),
+        float(sc_spin_z),
+        float(sc_exit_velo),
+        float(sc_delta_k9),
+        float(sc_k9_momentum),
     ]
     return np.array(values, dtype=np.float64)
 
@@ -426,7 +583,7 @@ def build_batter_features(batter_logs: List[Dict],
                           venue: Optional[str],
                           weather: Optional[Dict],
                           lineup_position: Optional[int],
-                          projected_pa: float = 4.0,
+                          projected_pa: float = 4.0,  # noqa: ARG001
                           extra: Optional[Dict] = None) -> np.ndarray:
     """Build a feature vector in the order of BATTER_FEATURE_NAMES."""
     extra = extra or {}
@@ -438,12 +595,14 @@ def build_batter_features(batter_logs: List[Dict],
     rate_season = _rolling_batter_rate(logs, stat_key, max(30, len(logs)))
 
     # Platoon split: if caller passed explicit rate in `extra`, use it; else
-    # compute from DB (if available) or fall back to season rate.
+    # compute from batter_platoon_splits table (with Bayesian shrinkage) or fall back.
     platoon_rate = extra.get("platoon_rate_vs_hand")
     if platoon_rate is None:
+        sc_season = extra.get("season") or extra.get("month_of_season") or 2025
         platoon_rate = compute_platoon_split(
             batter_logs=logs, vs_hand=pitcher_hand or "", stat_key=stat_key,
             db=extra.get("db"), batter_id=extra.get("batter_id"),
+            season=sc_season if sc_season > 2000 else 2025,
         )
 
     is_switch = 1 if (batter_hand and batter_hand.upper() == 'S') else 0
@@ -451,7 +610,11 @@ def build_batter_features(batter_logs: List[Dict],
     if batter_hand and pitcher_hand and not is_switch:
         same_hand = 1 if batter_hand.upper() == pitcher_hand.upper() else 0
 
-    park_key_map = {"batter_hits": "hits", "batter_home_runs": "hr", "batter_total_bases": "hr"}
+    # TB uses the blended 'tb' factor (singles/doubles-weighted), not pure 'hr'.
+    # Train and serve share this builder, so the next retrain reconciles the
+    # GLM to the corrected feature; the transient shift is small (tb≈hr at most
+    # parks) and bounded by the champion/challenger promotion gate.
+    park_key_map = {"batter_hits": "hits", "batter_home_runs": "hr", "batter_total_bases": "tb"}
     park_key = park_key_map.get(market, "runs")
     park_adj = get_park_factor(venue, weather=weather).get(park_key, 1.0) if venue else 1.0
 
@@ -466,6 +629,22 @@ def build_batter_features(batter_logs: List[Dict],
 
     stat_vol_l15 = _rolling_batter_game_stdev(logs, stat_key, 15)
     k_rate_l15 = _rolling_batter_rate(logs, "strikeouts", 15)
+
+    # Statcast contact-quality metrics
+    _cur_year = datetime.now().year
+    sc_season = extra.get("season") or extra.get("month_of_season") or _cur_year
+    sc = _load_statcast_batter(
+        extra.get("batter_id") or 0,
+        sc_season if sc_season > 2000 else _cur_year,
+        extra.get("db"),
+    )
+    sc_barrel      = sc["barrel_pct"]        or 0.0
+    sc_xwoba       = sc["xwoba"]             or 0.0
+    sc_exit_velo   = sc["exit_velocity_avg"] or _LEAGUE_AVG_EXIT_VELO
+    sc_hard_hit    = sc["hard_hit_pct"]      or 0.0
+    sc_launch_ang  = sc["launch_angle_avg"]  or 0.0
+    sc_whiff       = sc["whiff_pct"]         or 0.0
+    sc_sprint      = sc["sprint_speed"]      or _LEAGUE_AVG_SPRINT_SPEED
 
     values = [
         rate_l15,
@@ -487,5 +666,13 @@ def build_batter_features(batter_logs: List[Dict],
         float(opp_bullpen_era),
         float(stat_vol_l15),
         float(k_rate_l15),
+        # Statcast features (7)
+        float(sc_barrel),
+        float(sc_xwoba),
+        float(sc_exit_velo),
+        float(sc_hard_hit),
+        float(sc_launch_ang),
+        float(sc_whiff),
+        float(sc_sprint),
     ]
     return np.array(values, dtype=np.float64)

@@ -8,13 +8,14 @@ logger = get_logger(__name__)
 
 
 def get_current_bankroll() -> float:
-    """Starting bankroll plus cumulative settled P&L.
+    """Starting bankroll plus cumulative settled P&L (singles + SGPs + parlays).
 
-    `bet_results.profit` is the per-bet ledger written by settle_results — summing
-    it gives net realized P&L since inception. Adding the configured starting
-    bankroll yields the amount Kelly should size against today. This lets stake
-    sizing compound with wins and shrink after losses instead of forever pretending
-    we still have the day-one roll.
+    `bet_results.profit` is the per-bet ledger written by settle_results;
+    `sgp_results.profit` is the same-game parlay ledger and `parlay_results.profit`
+    the cross-game parlay ledger. Summing all three gives net realized P&L since
+    inception. Adding the configured starting bankroll yields the amount Kelly
+    should size against today, floored at 0 so a deep drawdown can never produce
+    negative stakes.
 
     Falls back to the static `BANKROLL` on any DB error (fresh install, table
     missing, file locked) so the pipeline never sizes against zero.
@@ -24,8 +25,17 @@ def get_current_bankroll() -> float:
             row = conn.execute(
                 "SELECT COALESCE(SUM(profit), 0.0) AS total FROM bet_results"
             ).fetchone()
-        settled_pnl = float(row['total'] or 0.0) if row else 0.0
-        return BANKROLL + settled_pnl
+            settled_pnl = float(row['total'] or 0.0) if row else 0.0
+            # Parlay ledgers may not exist on old DBs; tolerate each independently.
+            for table in ("sgp_results", "parlay_results"):
+                try:
+                    prow = conn.execute(
+                        f"SELECT COALESCE(SUM(profit), 0.0) AS total FROM {table}"
+                    ).fetchone()
+                    settled_pnl += float(prow['total'] or 0.0) if prow else 0.0
+                except sqlite3.Error:
+                    pass
+        return max(0.0, BANKROLL + settled_pnl)
     except sqlite3.Error as e:
         logger.debug(
             f"Bankroll ledger lookup failed ({e}); using starting bankroll {BANKROLL}"
@@ -34,7 +44,8 @@ def get_current_bankroll() -> float:
 
 
 def fractional_kelly(model_prob: float, decimal_odds: float,
-                     fraction: float = None, bankroll: float = None) -> dict:
+                     fraction: float = None, bankroll: float = None,
+                     kelly_fraction_override: float = 1.0) -> dict:
     """
     Calculate fractional Kelly stake.
 
@@ -48,7 +59,9 @@ def fractional_kelly(model_prob: float, decimal_odds: float,
     (starting roll + settled P&L) so stake sizes compound with results rather
     than anchoring forever to the day-one value.
     """
-    fraction = fraction or KELLY_FRACTION
+    # `is None` — a deliberate fraction of 0.0 (e.g. a line-movement kill)
+    # must produce a zero stake, not silently fall back to the default.
+    fraction = KELLY_FRACTION if fraction is None else fraction
     if bankroll is None:
         bankroll = get_current_bankroll()
 
@@ -64,7 +77,7 @@ def fractional_kelly(model_prob: float, decimal_odds: float,
     if full_kelly <= 0:
         return {"kelly_fraction": 0.0, "recommended_stake": 0.0, "full_kelly_pct": full_kelly}
 
-    adjusted_kelly = full_kelly * fraction
+    adjusted_kelly = full_kelly * fraction * kelly_fraction_override
 
     # Cap at 5% of bankroll max per single bet
     max_fraction = 0.05

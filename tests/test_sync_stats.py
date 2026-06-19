@@ -1,42 +1,15 @@
 import pytest
-import sqlite3
 from unittest.mock import patch, MagicMock, AsyncMock
+
+from tests.fixtures.fixture_db import memory_conn
 
 
 @pytest.fixture
 def memory_db():
-    """In-memory DB with the tables sync_stats reads from and writes to."""
-    conn = sqlite3.connect(':memory:')
-    conn.row_factory = sqlite3.Row
-    conn.executescript('''
-        CREATE TABLE games (
-            game_id TEXT PRIMARY KEY, bdl_game_id INTEGER,
-            home_team TEXT, away_team TEXT, home_team_id INTEGER,
-            away_team_id INTEGER, status TEXT
-        );
-        CREATE TABLE teams (
-            team_id INTEGER PRIMARY KEY, abbreviation TEXT, name TEXT,
-            league TEXT, division TEXT
-        );
-        CREATE TABLE players (
-            player_id INTEGER PRIMARY KEY, name TEXT, team_id INTEGER,
-            position TEXT, bats TEXT, throws TEXT, active BOOLEAN DEFAULT 1
-        );
-        CREATE TABLE pitcher_game_logs (
-            game_id INTEGER, player_id INTEGER, date TEXT,
-            innings_pitched REAL, hits_allowed INTEGER, runs_allowed INTEGER,
-            earned_runs INTEGER, walks INTEGER, strikeouts INTEGER,
-            home_runs_allowed INTEGER, pitches_thrown INTEGER,
-            PRIMARY KEY (game_id, player_id)
-        );
-        CREATE TABLE batter_game_logs (
-            game_id INTEGER, player_id INTEGER, date TEXT,
-            at_bats INTEGER, hits INTEGER, doubles INTEGER, triples INTEGER,
-            home_runs INTEGER, runs INTEGER, rbis INTEGER, walks INTEGER,
-            strikeouts INTEGER, total_bases INTEGER, plate_appearances INTEGER,
-            PRIMARY KEY (game_id, player_id)
-        );
-    ''')
+    """In-memory DB (full production schema) with the tables sync_stats reads
+    from and writes to. Built via memory_conn() so columns like last_synced_at
+    that sync_stats now depends on are always present."""
+    conn = memory_conn()
     conn.execute('''
         INSERT INTO games (game_id, bdl_game_id, home_team, away_team,
                            home_team_id, away_team_id, status)
@@ -125,6 +98,38 @@ async def test_sync_stats_batter_log(mock_client_cls, mock_get_db, memory_db):
     assert row['runs'] == 2
     # singles=0, doubles=1 (×2=2), triples=0, home_runs=1 (×4=4) → total_bases=6
     assert row['total_bases'] == 6
+
+
+# Real BDL MLB batter shape: home runs under 'hr', total_bases provided directly.
+BATTER_STAT_BDL = {
+    'player': {'id': 21, 'first_name': 'Juan', 'last_name': 'Soto',
+               'position': 'OF', 'bats': 'L', 'throws': 'L'},
+    'team': {'id': 1},
+    'game': {'id': 999, 'date': '2024-05-01'},
+    'innings_pitched': None,
+    'at_bats': 4, 'hits': 3, 'doubles': 0, 'triples': 0, 'hr': 2,
+    'total_bases': 9, 'runs': 2, 'rbi': 4, 'bb': 1, 'k': 1, 'plate_appearances': 5,
+}
+
+
+@patch('src.pipelines.sync_stats.get_db_connection')
+@patch('src.pipelines.sync_stats.MLBStatsClient')
+async def test_sync_stats_batter_hr_from_bdl_fields(mock_client_cls, mock_get_db, memory_db):
+    """Home runs are read from BDL's 'hr' field (not 'home_runs') and total_bases
+    is taken from BDL's authoritative field — the bug that zeroed every HR and
+    undercounted total_bases."""
+    mock_client_cls.return_value = _make_bdl_client(PITCHER_STAT, BATTER_STAT_BDL)
+    mock_get_db.return_value.__enter__.return_value = memory_db
+    mock_get_db.return_value.__exit__.return_value = None
+
+    from src.pipelines.sync_stats import sync_stats
+    await sync_stats()
+
+    row = memory_db.execute("SELECT * FROM batter_game_logs WHERE player_id = 21").fetchone()
+    assert row is not None
+    assert row['home_runs'] == 2          # from 'hr'
+    assert row['total_bases'] == 9        # 3 hits, 2 HR -> 1 single(1) + 2 HR(8) = 9
+    assert row['hits'] == 3
 
 
 @patch('src.pipelines.sync_stats.get_db_connection')

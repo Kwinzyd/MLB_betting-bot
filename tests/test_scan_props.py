@@ -1,65 +1,21 @@
 import pytest
-import sqlite3
 import json
 from unittest.mock import patch, AsyncMock
+
+from tests.fixtures.fixture_db import memory_conn
 
 
 @pytest.fixture
 def memory_db():
-    """
-    Creates an in-memory SQLite database with the minimum schema 
-    required to test the scan_props pipeline.
-    """
-    conn = sqlite3.connect(':memory:')
-    conn.row_factory = sqlite3.Row
-    
-    # Create minimal schema required for scan_props reads and inserts
-    conn.executescript('''
-        CREATE TABLE games (
-            game_id TEXT PRIMARY KEY, home_team TEXT, away_team TEXT, venue TEXT, status TEXT,
-            last_scanned_at TEXT
-        );
-        CREATE TABLE prop_snapshots (
-            snapshot_id TEXT PRIMARY KEY, game_id TEXT, player_name TEXT, market TEXT,
-            line REAL, over_odds REAL, under_odds REAL, bookmaker TEXT, timestamp TEXT,
-            devigged_over REAL, devigged_under REAL
-        );
-        CREATE TABLE projections (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, game_id TEXT, player_name TEXT,
-            market TEXT, projected_mean REAL, prob_over REAL, prob_under REAL,
-            context_json TEXT, timestamp TEXT, UNIQUE(game_id, player_name, market)
-        );
-        CREATE TABLE umpire_stats (
-            umpire_id INTEGER PRIMARY KEY, umpire_name TEXT, games_called INTEGER,
-            k_factor REAL
-        );
-        CREATE TABLE umpire_game_assignments (
-            mlb_game_pk INTEGER PRIMARY KEY, game_id TEXT, umpire_id INTEGER,
-            umpire_name TEXT, date TEXT
-        );
-        CREATE TABLE daily_lineups (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            game_id TEXT, team TEXT, player_name TEXT, player_id INTEGER,
-            lineup_position INTEGER, date TEXT
-        );
-        CREATE TABLE probable_pitchers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            game_id TEXT, team TEXT, player_name TEXT, player_id INTEGER,
-            throws TEXT, date TEXT
-        );
-        CREATE TABLE injury_reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, player_name TEXT,
-            status TEXT
-        );
-    ''')
-    
-    # Seed the DB with a dummy active game so the pipeline has something to scan
+    """In-memory DB on the full production schema (so every table scan_props
+    writes — snapshots, projections, bet_candidates — exists), seeded with one
+    active game."""
+    conn = memory_conn()
     conn.execute('''
-        INSERT INTO games (game_id, home_team, away_team, venue, status) 
+        INSERT INTO games (game_id, home_team, away_team, venue, status)
         VALUES ('game_123', 'Yankees', 'Red Sox', 'Yankee Stadium', 'SCHEDULED')
     ''')
     conn.commit()
-    
     return conn
 
 
@@ -134,4 +90,25 @@ async def test_scan_props_database_inserts(
     assert proj['player_name'] == 'Gerrit Cole'
     assert proj['market'] == 'pitcher_strikeouts'
     assert proj['prob_over'] == 0.60
-    assert json.loads(proj['context_json']) == {'mock_data': True}
+    # scan_props merges the projection's sample_size into context_json so the
+    # downstream rank_edge MIN_SAMPLE_SIZE gate can read it.
+    assert json.loads(proj['context_json']) == {'mock_data': True, 'sample_size': 20}
+
+    # The winning bet is persisted to bet_candidates — this is the handoff
+    # send_alerts consumes (it never re-derives bets from snapshots).
+    cands = memory_db.execute("SELECT * FROM bet_candidates").fetchall()
+    assert len(cands) == 1
+    cand = dict(cands[0])
+    assert cand['game_id'] == 'game_123'
+    assert cand['player_name'] == 'Gerrit Cole'
+    assert cand['market'] == 'pitcher_strikeouts'
+    assert cand['side'] == 'over'
+    assert cand['bookmaker'] == 'draftkings'
+    assert cand['odds'] == 2.0
+    assert cand['sharp_book'] == 'pinnacle'
+    assert cand['anchor_line'] == 6.5
+    # Truth = sharp devig at the anchor (1.67/2.50 -> ~0.599 over)
+    assert cand['truth_prob'] == pytest.approx(0.599, abs=0.005)
+    # CLV open basis: draftkings' own two-sided devig (2.0/1.8 -> ~0.474 over)
+    assert cand['open_devig_prob'] == pytest.approx(0.4737, abs=0.005)
+    assert cand['recommended_stake'] > 0

@@ -1,13 +1,15 @@
 """One-shot backfill of multi-season BDL game logs for model training.
 
 Pulls every completed game for the given seasons, batches `/stats` calls to
-/50 games per HTTP request, and writes into the existing pitcher_game_logs /
+50 games per HTTP request, and writes into the existing pitcher_game_logs /
 batter_game_logs tables. Rows written by this pipeline set `games.historical=1`
 so the 90-day prune leaves them alone.
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Iterable, List
+from src.utils.time_utils import utcnow
 
 from src.clients.mlb_stats import MLBStatsClient
 from src.data.db import get_db_connection
@@ -16,21 +18,30 @@ from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
-_COMPLETED_STATUSES = frozenset({'Final', 'final', 'COMPLETED'})
+_COMPLETED_STATUSES = frozenset({
+    'Final', 'final', 'COMPLETED',
+    'STATUS_FINAL',         # BDL MLB API actual value
+    'STATUS_SCHEDULED',     # Not completed but listed for reference
+})
+# Only these indicate a finished game we can learn from:
+_FINISHED_STATUSES = frozenset({'Final', 'final', 'COMPLETED', 'STATUS_FINAL'})
 
 
-def sync_historical(seasons: Iterable[int], chunk_size: int = 50) -> dict:
+async def _sync_historical_async(seasons: List[int], chunk_size: int,
+                                 requests_per_second: float = 2.0) -> dict:
     """
-    Backfill games + game logs for the given MLB seasons.
+    All BDL I/O runs inside a single async context so the httpx.AsyncClient
+    is created, used, and closed within one event loop — multiple asyncio.run()
+    calls would close and re-open the loop, breaking the persistent httpx client.
 
-    Returns a summary dict of rows written per table.
+    Backfill is a bulk operation, so it uses a faster request rate than the
+    live `sync_stats` default (1 req / 14 s). The client's own 429 backoff still
+    protects against overshooting BDL's limit; 2 req/s ran clean on Goat tier.
     """
-    seasons = list(seasons)
-    logger.info(f"Executing pipeline: sync_historical for seasons={seasons}")
-    client = MLBStatsClient()
+    client = MLBStatsClient(requests_per_second=requests_per_second)
 
-    # Seed teams table (the stat inserts depend on it for FK-like semantics)
-    all_teams = client.get_teams()
+    # Seed teams table
+    all_teams = await client.get_teams()
     with get_db_connection() as conn:
         _upsert_teams(conn, all_teams)
         conn.commit()
@@ -39,11 +50,11 @@ def sync_historical(seasons: Iterable[int], chunk_size: int = 50) -> dict:
 
     for season in seasons:
         logger.info(f"Fetching season {season} games from BDL ...")
-        games = client.get_games(season=season)
-        completed = [g for g in games if g.get('status') in _COMPLETED_STATUSES]
+        games = await client.get_games(season=season)
+        completed = [g for g in games if g.get('status') in _FINISHED_STATUSES]
         logger.info(f"  season={season}: {len(completed)} completed games")
 
-        # Insert games rows tagged historical=1
+        # Insert game rows tagged historical=1
         with get_db_connection() as conn:
             for g in completed:
                 gid = g.get('id')
@@ -51,6 +62,13 @@ def sync_historical(seasons: Iterable[int], chunk_size: int = 50) -> dict:
                     continue
                 home = g.get('home_team') or {}
                 away = g.get('visitor_team') or g.get('away_team') or {}
+                # BDL MLB uses 'display_name'; fall back chain for robustness
+                home_name = (home.get('display_name') or home.get('full_name')
+                             or home.get('name') or '') if isinstance(home, dict) else ''
+                away_name = (away.get('display_name') or away.get('full_name')
+                             or away.get('name') or '') if isinstance(away, dict) else ''
+                home_id = home.get('id') if isinstance(home, dict) else None
+                away_id = away.get('id') if isinstance(away, dict) else None
                 conn.execute(
                     """
                     INSERT INTO games (game_id, bdl_game_id, date, home_team, away_team,
@@ -71,34 +89,64 @@ def sync_historical(seasons: Iterable[int], chunk_size: int = 50) -> dict:
                         f"bdl:{gid}",
                         gid,
                         g.get('date'),
-                        (home.get('full_name') if isinstance(home, dict) else None) or '',
-                        (away.get('full_name') if isinstance(away, dict) else None) or '',
-                        home.get('id') if isinstance(home, dict) else None,
-                        away.get('id') if isinstance(away, dict) else None,
-                        g.get('venue') or '',
+                        home_name,
+                        away_name,
+                        home_id,
+                        away_id,
+                        g.get('venue') or g.get('location') or '',
                     ),
                 )
                 totals["games"] += 1
             conn.commit()
 
-        # Fetch stats in batches
+        # Fetch ALL stats in one get_stats_batch call — its own semaphore
+        # (max_concurrency=5) handles rate-limiting correctly. Chunking here
+        # too would create thousands of concurrent HTTP requests.
         game_ids: List[int] = [g['id'] for g in completed if g.get('id')]
         if not game_ids:
             continue
 
-        for i in range(0, len(game_ids), chunk_size):
-            chunk = game_ids[i:i + chunk_size]
-            stats = client.get_stats_batch(chunk)
-            if not stats:
-                continue
+        # Resume support: skip games whose stats were already written
+        with get_db_connection() as conn:
+            placeholders = ",".join("?" * len(game_ids))
+            rows = conn.execute(
+                f"SELECT bdl_game_id FROM games WHERE bdl_game_id IN ({placeholders}) AND last_synced_at IS NOT NULL",
+                game_ids,
+            ).fetchall()
+        already_synced = {r[0] for r in rows}
+        if already_synced:
+            game_ids = [gid for gid in game_ids if gid not in already_synced]
+            logger.info(f"  season={season}: {len(already_synced)} already synced, {len(game_ids)} remaining")
+        if not game_ids:
+            logger.info(f"  season={season}: all games already synced, skipping stats fetch")
+            continue
 
+        logger.info(f"  season={season}: fetching stats for {len(game_ids)} games ...")
+        # Larger batches (200) reduce total requests; max_concurrency=3 keeps it polite
+        stats = await client.get_stats_batch(game_ids, chunk_size=200, max_concurrency=3)
+        logger.info(f"  season={season}: received {len(stats)} player-game stat rows")
+
+        # Authoritative gid -> date map from the season /games payload; the
+        # stat payload's own date fields are unreliable (observed empty).
+        game_dates = {
+            g['id']: str(g.get('date') or '')[:10]
+            for g in completed
+            if g.get('id') is not None
+        }
+
+        # Write to DB in chunks of 500 so we don't hold one giant transaction
+        for i in range(0, len(stats), 500):
+            batch = stats[i:i + 500]
             with get_db_connection() as conn:
-                for player_stat in stats:
+                for player_stat in batch:
                     player_id, player_name, position, gid, game_date = _upsert_player(conn, player_stat)
                     if player_id is None:
                         continue
-                    ip = player_stat.get('innings_pitched') or player_stat.get('ip')
-                    if ip is not None and (position == 'P' or str(ip) != '0'):
+                    if not game_date:
+                        game_date = game_dates.get(gid, '')
+                    ip = player_stat.get('ip') or player_stat.get('innings_pitched')
+                    is_pitcher = ip is not None and str(ip) not in ('0', '0.0', '')
+                    if is_pitcher:
                         totals["pitcher_logs"] += _insert_pitcher_log(
                             conn, gid, player_id, game_date, player_stat, player_name
                         )
@@ -106,10 +154,35 @@ def sync_historical(seasons: Iterable[int], chunk_size: int = 50) -> dict:
                         totals["batter_logs"] += _insert_batter_log(
                             conn, gid, player_id, game_date, player_stat, player_name
                         )
+                # Mark these games as synced so restarts skip them
+                synced_ids = list({stat.get("game", {}).get("id") for stat in batch if stat.get("game", {}).get("id")})
+                if synced_ids:
+                    now = utcnow().isoformat()
+                    conn.execute(
+                        "UPDATE games SET last_synced_at = ? WHERE bdl_game_id IN ({})".format(
+                            ",".join("?" * len(synced_ids))
+                        ),
+                        [now] + synced_ids,
+                    )
                 conn.commit()
+            if i > 0 and i % 5000 == 0:
+                logger.info(f"  season={season}: wrote {i} stat rows so far ...")
 
-            if (i // chunk_size) % 20 == 0 and i > 0:
-                logger.info(f"  season={season}: processed {i}/{len(game_ids)} games")
 
     logger.info(f"sync_historical complete: {totals}")
     return totals
+
+
+def sync_historical(seasons: Iterable[int], chunk_size: int = 50,
+                    requests_per_second: float = 2.0) -> dict:
+    """
+    Backfill games + game logs for the given MLB seasons.
+
+    Synchronous entry point called from main.py. All async I/O is wrapped
+    inside a single asyncio.run() so the httpx client stays on one event loop.
+
+    Returns a summary dict of rows written per table.
+    """
+    seasons = list(seasons)
+    logger.info(f"Executing pipeline: sync_historical for seasons={seasons}")
+    return asyncio.run(_sync_historical_async(seasons, chunk_size, requests_per_second))

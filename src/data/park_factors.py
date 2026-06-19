@@ -161,6 +161,13 @@ def get_park_factor(venue: str, weather: dict = None) -> dict:
             base["hits"] *= adjustments["hits"]
             base["so"]   *= adjustments["so"]
 
+    # Derived total-bases factor: TB is dominated by singles/doubles, with a
+    # meaningful HR component. Blend hits- and hr-factors (0.55/0.45) so TB props
+    # aren't mis-priced by the pure HR factor at parks where the two diverge
+    # (e.g. Fenway: hr 0.95 but hits 1.12). Computed after weather so it tracks
+    # live conditions too.
+    base["tb"] = round(0.55 * base["hits"] + 0.45 * base["hr"], 4)
+
     return base
 
 

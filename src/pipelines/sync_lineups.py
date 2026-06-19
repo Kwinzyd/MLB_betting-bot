@@ -1,6 +1,8 @@
 from src.clients.mlb_stats import MLBStatsClient
 from src.data.db import get_db_connection
-from src.utils.time_utils import get_eastern_local_date, get_utc_now_iso
+from src.utils.time_utils import (
+    get_eastern_local_date, get_utc_now_iso, eastern_date_utc_window,
+)
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -41,14 +43,20 @@ async def sync_lineups():
     """
     logger.info("Executing pipeline: sync_lineups")
     bdl_client = MLBStatsClient()
-    today = str(get_eastern_local_date())
+    today_date = get_eastern_local_date()
+    today = str(today_date)
 
-    # Get today's games from DB
+    # Get today's games by the Eastern-day UTC window. Filtering on the UTC
+    # `date` string with the Eastern date dropped late games (UTC rolls to the
+    # next day), so their lineups never confirmed pregame and the scan only
+    # fired in-play. The window captures every game on the Eastern slate.
+    start_utc, end_utc = eastern_date_utc_window(today_date)
     with get_db_connection() as conn:
-        games = conn.execute(
-            "SELECT game_id, bdl_game_id, home_team, away_team FROM games WHERE status != 'COMPLETED' AND date LIKE ?",
-            (f"{today}%",)
-        ).fetchall()
+        games = [dict(r) for r in conn.execute(
+            "SELECT game_id, bdl_game_id, home_team, away_team FROM games "
+            "WHERE status != 'COMPLETED' AND date >= ? AND date < ?",
+            (start_utc, end_utc)
+        ).fetchall()]
 
     if not games:
         logger.info("No games today for lineup sync.")
@@ -57,12 +65,23 @@ async def sync_lineups():
     lineup_count = 0
     pitcher_count = 0
 
+    failed_games = 0
     for game in games:
         bdl_game_id = game['bdl_game_id']
         if not bdl_game_id:
             continue
 
-        lineup_data = await bdl_client.get_lineups(bdl_game_id)
+        # Per-game isolation: a transient BDL 5xx on one game must not abort
+        # the rest of the pipeline (scan_props/send_alerts/SGP run after this).
+        try:
+            lineup_data = await bdl_client.get_lineups(bdl_game_id)
+        except Exception as e:
+            failed_games += 1
+            logger.warning(
+                f"Lineup fetch failed for game {game['game_id']} "
+                f"(bdl_game_id={bdl_game_id}): {e}. Skipping; pipeline continues."
+            )
+            continue
         if not lineup_data:
             logger.debug(f"No lineup data yet for game {game['game_id']}")
             continue
@@ -76,8 +95,13 @@ async def sync_lineups():
 
                 player_name = f"{player.get('first_name', '')} {player.get('last_name', '')}".strip()
                 player_id = player.get('id')
-                team_name = team_data.get('full_name', '') if isinstance(team_data, dict) else ''
-                throws = player.get('throws', '')
+                team_name = (
+                    team_data.get('display_name')
+                    or team_data.get('name')
+                    or ''
+                ) if isinstance(team_data, dict) else ''
+                bats_throws = player.get('bats_throws', '') or ''
+                throws = bats_throws.split('/', 1)[1].strip() if '/' in bats_throws else ''
                 is_probable_pitcher = entry.get('is_probable_pitcher', False)
                 batting_order = entry.get('batting_order') or entry.get('lineup_position')
 
@@ -109,4 +133,7 @@ async def sync_lineups():
             )
             conn.commit()
 
-    logger.info(f"Synced {lineup_count} lineup entries and {pitcher_count} probable pitchers for {today}.")
+    logger.info(
+        f"Synced {lineup_count} lineup entries and {pitcher_count} probable "
+        f"pitchers for {today}. Failed games: {failed_games}."
+    )

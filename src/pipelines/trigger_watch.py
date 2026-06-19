@@ -18,13 +18,16 @@ from src.config import (
     TRIGGER_WEATHER_HR_THRESHOLD,
     TRIGGER_WEATHER_SO_THRESHOLD,
     TRIGGER_DEDUP_HOURS,
+    TRIGGER_TOTAL_SHIFT_THRESHOLD,
+    TRIGGER_TOTAL_MIN_HISTORY_MINUTES,
     UMP_MIN_GAMES,
 )
+from src.clients.odds_api import OddsAPIClient
 from src.clients.weather import WeatherClient
 from src.clients.telegram_bot import TelegramClient
 from src.data.db import get_db_connection
 from src.data.park_factors import get_stadium_meta, compute_weather_adjustments
-from src.pipelines.scan_props import scan_props
+from src.pipelines.scan_props import scan_props, _parse_game_total, _record_total_snapshot
 from src.pipelines.send_alerts import send_alerts
 from src.utils.logging_utils import get_logger
 
@@ -34,6 +37,11 @@ logger = get_logger(__name__)
 async def run_trigger_watch():
     """Entry point: scan active games for ump/weather triggers, fire if extreme."""
     logger.info("Executing pipeline: trigger_watch")
+    
+    from src.data.cache import cache
+    if cache.get("odds_api_quota_exhausted"):
+        logger.error("Trigger pipeline aborted: API Quota Circuit Breaker is active.")
+        return
 
     with get_db_connection() as conn:
         games = conn.execute(
@@ -46,6 +54,7 @@ async def run_trigger_watch():
         return
 
     weather_client = WeatherClient()
+    odds_client = OddsAPIClient()
     now_utc = datetime.now(timezone.utc)
     dedup_cutoff = (now_utc - timedelta(hours=TRIGGER_DEDUP_HOURS)).isoformat()
 
@@ -67,6 +76,11 @@ async def run_trigger_watch():
         platoon_hit = _check_matchup_volatility(game_id, game['home_team'], game['away_team'])
         if platoon_hit and not _already_fired(game_id, 'platoon', dedup_cutoff):
             fired.append((game_id, matchup, 'platoon', platoon_hit))
+
+        if not _already_fired(game_id, 'total_shift', dedup_cutoff):
+            total_hit = await _check_total_shift(game_id, odds_client)
+            if total_hit:
+                fired.append((game_id, matchup, 'total_shift', total_hit))
 
     if not fired:
         logger.info("Trigger watch: no extreme conditions detected.")
@@ -201,6 +215,53 @@ def _check_matchup_volatility(game_id, home_team, away_team):
     return None
 
 
+async def _check_total_shift(game_id, odds_client):
+    """Return detail dict if the consensus game total has moved by
+    TRIGGER_TOTAL_SHIFT_THRESHOLD vs the latest history snapshot, else None.
+
+    Always re-records the freshly polled total (even when below threshold) so
+    future deltas measure from the most recent observation rather than a
+    stale baseline.
+    """
+    with get_db_connection() as conn:
+        prior = conn.execute(
+            "SELECT total, timestamp FROM game_totals_history "
+            "WHERE game_id = ? ORDER BY timestamp DESC LIMIT 1",
+            (game_id,),
+        ).fetchone()
+    if not prior:
+        return None
+    try:
+        prior_ts = datetime.fromisoformat(prior['timestamp'])
+    except ValueError:
+        return None
+    age_min = (datetime.now(timezone.utc) - prior_ts).total_seconds() / 60
+    if age_min < TRIGGER_TOTAL_MIN_HISTORY_MINUTES:
+        return None
+
+    try:
+        event_odds = await odds_client.get_event_odds(
+            game_id, ['totals'], bust_cache=True
+        )
+    except Exception as e:
+        logger.warning(f"Total-shift fetch failed for {game_id}: {e}")
+        return None
+    fresh = _parse_game_total(event_odds) if event_odds else None
+    if fresh is None:
+        return None
+
+    _record_total_snapshot(game_id, fresh, source='trigger')
+    delta = fresh - float(prior['total'])
+    if abs(delta) < TRIGGER_TOTAL_SHIFT_THRESHOLD:
+        return None
+    return {
+        'prior_total': float(prior['total']),
+        'current_total': float(fresh),
+        'delta': delta,
+        'prior_age_min': round(age_min, 1),
+    }
+
+
 def _already_fired(game_id, trigger_type, dedup_cutoff_iso):
     """True if a trigger of this type fired for this game within the dedup window."""
     with get_db_connection() as conn:
@@ -257,6 +318,12 @@ def _format_detail(trigger_type, detail):
             f"{detail['venue']}: {detail['temp_f']:.0f}°F, "
             f"wind {detail['wind_mph']:.0f}mph @ {detail['wind_deg']}° — "
             f"hr×{detail['hr_adjust']:.3f}, so×{detail['so_adjust']:.3f}"
+        )
+    if trigger_type == 'total_shift':
+        sign = '+' if detail['delta'] >= 0 else ''
+        return (
+            f"Total moved {detail['prior_total']:.1f} → {detail['current_total']:.1f} "
+            f"(Δ={sign}{detail['delta']:.1f}, prior {detail['prior_age_min']}min ago)"
         )
     if trigger_type == 'platoon':
         hitters = ", ".join(detail['switch_hitters'])
