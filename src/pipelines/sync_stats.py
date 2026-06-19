@@ -7,7 +7,14 @@ from src.utils.validators import parse_baseball_ip
 
 logger = get_logger(__name__)
 
-_COMPLETED_STATUSES = frozenset({'Final', 'final', 'COMPLETED'})
+_COMPLETED_STATUSES = frozenset({'Final', 'final', 'COMPLETED', 'STATUS_FINAL'})
+# Statuses that mean the game will not produce a box score for the originally
+# scheduled date — bets on it should be voided/refunded, not left PENDING.
+_VOID_STATUSES = frozenset({
+    'Postponed', 'postponed', 'PPD',
+    'Suspended', 'suspended',
+    'Cancelled', 'Canceled', 'cancelled', 'canceled',
+})
 _LOOKBACK_DAYS = 30
 
 
@@ -231,6 +238,26 @@ async def sync_stats():
         if cur.rowcount:
             logger.info(f"Marked {cur.rowcount} finished games COMPLETED.")
 
+    # Mark postponed/suspended/cancelled games so the scan stops polling them and
+    # settle_results can void (refund) any open bets instead of leaving them
+    # PENDING forever and tying up modeled exposure.
+    voided_bdl_ids = [
+        g['id'] for g in all_recent_games
+        if g.get('id') is not None and g.get('status') in _VOID_STATUSES
+    ]
+    if voided_bdl_ids:
+        with get_db_connection() as conn:
+            placeholders = ",".join("?" for _ in voided_bdl_ids)
+            cur = conn.execute(
+                f"UPDATE games SET status='POSTPONED' "
+                f"WHERE bdl_game_id IN ({placeholders}) "
+                f"AND status NOT IN ('COMPLETED', 'POSTPONED')",
+                voided_bdl_ids,
+            )
+            conn.commit()
+        if cur.rowcount:
+            logger.info(f"Marked {cur.rowcount} postponed/suspended games POSTPONED.")
+
     recent_game_ids = {
         g['id']
         for g in all_recent_games
@@ -288,14 +315,24 @@ async def sync_stats():
                 game_date = game_dates.get(gid, '')
 
             ip = player_stat.get('ip') or player_stat.get('innings_pitched')
-            is_pitcher = ip is not None and str(ip) not in ('0', '0.0', '')
-            if is_pitcher:
+            pitched = ip is not None and str(ip) not in ('0', '0.0', '')
+            ab = int(player_stat.get('at_bats', 0) or player_stat.get('ab', 0) or 0)
+            pa = int(player_stat.get('plate_appearances', 0) or player_stat.get('pa', 0) or 0)
+            batted = ab > 0 or pa > 0
+
+            # A two-way player / position-player-pitching gets BOTH logs. The old
+            # either/or routing dropped the batting line on any day a player
+            # pitched, silently undercounting their batter sample and PAs.
+            wrote = False
+            if pitched:
                 n = _insert_pitcher_log(conn, gid, player_id, game_date, player_stat, player_name)
                 total_pitcher_logs += n
-            else:
+                wrote = wrote or bool(n)
+            if batted or not pitched:
                 n = _insert_batter_log(conn, gid, player_id, game_date, player_stat, player_name)
                 total_batter_logs += n
-            if n and gid is not None:
+                wrote = wrote or bool(n)
+            if wrote and gid is not None:
                 synced_gids.add(gid)
 
         # Stamp last_synced_at so these games are skipped on future runs.

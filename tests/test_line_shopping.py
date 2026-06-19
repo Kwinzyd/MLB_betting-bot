@@ -106,6 +106,7 @@ def _seed_schema(conn):
             sharp_book TEXT, anchor_line REAL, truth_prob REAL, model_prob REAL,
             open_devig_prob REAL, edge_pct REAL, ev REAL, kelly_fraction REAL,
             recommended_stake REAL, steam_detected INTEGER DEFAULT 0,
+            edge_source TEXT,
             created_at TEXT NOT NULL,
             UNIQUE(game_id, player_name, market, line, side, bookmaker)
         );

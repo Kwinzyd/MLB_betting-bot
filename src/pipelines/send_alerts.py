@@ -69,7 +69,7 @@ def _load_fresh_candidates() -> list[dict]:
                 p.player_name = bc.player_name AND
                 p.market = bc.market
             WHERE bc.created_at >= ?
-              AND g.status NOT IN ('COMPLETED', 'IN_PROGRESS')
+              AND g.status NOT IN ('COMPLETED', 'IN_PROGRESS', 'POSTPONED')
             ORDER BY bc.edge_pct DESC
         ''', (cutoff,)).fetchall()]
     return rows
@@ -98,6 +98,7 @@ def _build_candidate(row: dict) -> dict:
         # Only playable winners are ever persisted to bet_candidates.
         'is_playable': True,
         'steam_detected': bool(row.get('steam_detected')),
+        'edge_source': row.get('edge_source'),
         'kelly': {
             'kelly_fraction': row['kelly_fraction'],
             'recommended_stake': row['recommended_stake'],

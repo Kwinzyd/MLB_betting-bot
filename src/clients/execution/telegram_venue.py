@@ -6,6 +6,7 @@ send_alerts pipeline can persist orders the same way for every venue.
 """
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 from src.clients.execution.base import ExecutionVenue, utc_now_iso
@@ -83,6 +84,34 @@ class TelegramVenue(ExecutionVenue):
         }
 
 
+def _format_projection(market: str, mean, context: dict) -> str:
+    """'6.42 ± 1.85 (n=24)' — point estimate, ±1σ band, and sample size.
+
+    Std comes from the fitted dispersion when present: NB variance
+    (mean + alpha*mean^2) for counts, Normal sigma for total_bases. Falls back
+    to the distribution default (Poisson sqrt(mean)) when no dispersion was fit.
+    """
+    if mean is None:
+        return "n/a"
+    ctx = context or {}
+    out = f"{mean:.2f}"
+    std = None
+    if mean > 0:
+        if market == "batter_total_bases":
+            sigma = ctx.get("sigma")
+            std = sigma if sigma else math.sqrt(mean * 1.2)
+        else:
+            alpha = ctx.get("alpha")
+            var = mean + alpha * mean * mean if alpha else mean
+            std = math.sqrt(var) if var > 0 else None
+    if std is not None:
+        out += f" ± {std:.2f}"
+    n = ctx.get("sample_size")
+    if n:
+        out += f" (n={n})"
+    return out
+
+
 def format_alert_message(player_name, market, side, line, odds, bookmaker,
                          edge, projection, context, home_team, away_team, venue,
                          rationale=None):
@@ -116,7 +145,16 @@ def format_alert_message(player_name, market, side, line, odds, bookmaker,
         if 'platoon_adj' in context:
             msg += f"Platoon Adj: {context['platoon_adj']:.3f}\n"
 
-    msg += f"\nProjected: {projection['projected_mean']:.2f}"
+    # Projection shown with an honest ±1σ band and the sample size behind it, so
+    # the number doesn't read as a guarantee. Band comes from the fitted
+    # dispersion (NB alpha / Normal sigma) when available, else the distribution
+    # default (Poisson sqrt(mean) for counts).
+    msg += f"\nProjected: {_format_projection(market, projection.get('projected_mean'), context)}"
+    # Flag edges priced off a sharp line shifted to an off-consensus alt-line
+    # (no direct sharp two-sided quote AT this line) so they're not read as a
+    # full sharp-anchored edge.
+    if edge.get('edge_source') == 'model_altline':
+        msg += "\n<i>⚠️ alt-line edge (sharp price shifted along model — lower confidence)</i>"
     if rationale:
         msg += f"\n\n<i>\U0001F9E0 {rationale}</i>"
     return msg

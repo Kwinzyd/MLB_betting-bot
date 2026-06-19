@@ -56,6 +56,12 @@ MIN_MODEL_PROB = float(os.getenv("MIN_MODEL_PROB", "0.55"))
 MIN_SAMPLE_SIZE = int(os.getenv("MIN_SAMPLE_SIZE", "10"))
 MAX_BETS_PER_GAME = int(os.getenv("MAX_BETS_PER_GAME", "3"))
 MAX_BETS_PER_PLAYER = int(os.getenv("MAX_BETS_PER_PLAYER", "1"))
+# Require a confirmed lineup/starter before a prop is playable. Default True so a
+# batter not in today's posted lineup, or an unconfirmed/scratched starting
+# pitcher, is never bet on a fallback projection (DEFAULT_PROJECTED_PA, neutral
+# platoon) — that risk was only recovered as a post-hoc DNP void. Set False to
+# bet early markets before lineups post, at the cost of late-scratch exposure.
+REQUIRE_CONFIRMED_LINEUP = os.getenv("REQUIRE_CONFIRMED_LINEUP", "true").lower() in ("1", "true", "yes")
 # How far before first pitch a game becomes scan-eligible. 120 min gives a few
 # hours of pregame coverage so picks land well before the game starts (player
 # props usually post 2-4h out). Raise for earlier picks at the cost of more
@@ -114,6 +120,32 @@ ALT_LINE_MAX_DISTANCE = float(os.getenv("ALT_LINE_MAX_DISTANCE", "1.0"))
 # send_alerts only consumes bet_candidates younger than this. Candidates are
 # written by scan_props; anything older reflects odds that have likely moved.
 ALERT_CANDIDATE_MAX_AGE_MINUTES = int(os.getenv("ALERT_CANDIDATE_MAX_AGE_MINUTES", "15"))
+
+# --- Cross-game parlay builder (find_parlays.py) ---
+# Distinct from the SGP pipeline: these parlays combine the strongest single-bet
+# edges across DIFFERENT games (one leg per game), so legs are independent and
+# the joint price is an exact product — no within-game correlation modeling.
+# Leg counts to build. Each is the top-N legs by per-leg EV (which maximizes
+# parlay EV under independence); they nest (the 8-leg contains the 2/4-leg legs)
+# and are presented as alternative tickets — pick one.
+PARLAY_SIZES = [int(x.strip()) for x in os.getenv("PARLAY_SIZES", "2,4,8").split(",") if x.strip()]
+# Minimum ticket EV to alert. +EV legs compound (ev = prod(1+leg_ev) - 1), so
+# any parlay of playable legs clears this easily; it mainly drops marginal 2-leggers.
+PARLAY_MIN_EV = float(os.getenv("PARLAY_MIN_EV", "0.10"))
+# Only legs whose single-bet edge clears this (%) are eligible. Defaults to the
+# single-bet bar so a parlay never includes a leg we wouldn't bet straight.
+PARLAY_MIN_LEG_EDGE = float(os.getenv("PARLAY_MIN_LEG_EDGE", str(EDGE_MIN)))
+# Cap on parlay tickets persisted/alerted per run (across all sizes).
+PARLAY_MAX_PER_DAY = int(os.getenv("PARLAY_MAX_PER_DAY", "3"))
+# Kelly haircut for parlays (effective Kelly = KELLY_FRACTION * this). Parlay
+# variance compounds with every leg; the Kelly math already shrinks long-shot
+# stakes, and this adds a further safety margin.
+PARLAY_KELLY_FRACTION_MULT = float(os.getenv("PARLAY_KELLY_FRACTION_MULT", "0.5"))
+# Legs are sourced from bet_candidates no older than this (same staleness logic
+# as send_alerts — older quotes have likely moved).
+PARLAY_CANDIDATE_MAX_AGE_MINUTES = int(
+    os.getenv("PARLAY_CANDIDATE_MAX_AGE_MINUTES", str(ALERT_CANDIDATE_MAX_AGE_MINUTES))
+)
 
 # Camouflage stake rounding. Soft books fingerprint accounts that bet exact
 # fractional-Kelly amounts ($18.42, $7.31). Snap persisted/displayed stakes

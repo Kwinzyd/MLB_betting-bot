@@ -9,6 +9,7 @@ from src.config import (
     PREGAME_RESCAN_MINUTES,
     SHARP_BOOKMAKERS, ALT_LINE_MAX_DISTANCE, MAX_BETS_PER_PLAYER,
     SHARP_MODEL_AGREEMENT_TOL, BOOKMAKER_BIAS_THRESHOLD, EDGE_MIN,
+    REQUIRE_CONFIRMED_LINEUP,
 )
 from src.models.distributions import get_probabilities
 from src.clients.odds_api import OddsAPIClient
@@ -96,12 +97,14 @@ async def scan_props(force: bool = False, game_ids: list = None):
         if targeted:
             placeholders = ",".join("?" for _ in game_ids)
             games = conn.execute(
-                f"SELECT * FROM games WHERE status != 'COMPLETED' "
+                f"SELECT * FROM games WHERE status NOT IN ('COMPLETED', 'POSTPONED') "
                 f"AND game_id IN ({placeholders})",
                 tuple(game_ids),
             ).fetchall()
         else:
-            games = conn.execute("SELECT * FROM games WHERE status != 'COMPLETED'").fetchall()
+            games = conn.execute(
+                "SELECT * FROM games WHERE status NOT IN ('COMPLETED', 'POSTPONED')"
+            ).fetchall()
 
     if not games:
         logger.info("No active games found for odds scanning.")
@@ -130,11 +133,16 @@ async def scan_props(force: bool = False, game_ids: list = None):
 
         logger.info(f"Scanning: {away_team} @ {home_team}")
 
-        # Fetch live weather for this stadium
+        # Fetch first-pitch weather for this stadium (forecast nearest game_time,
+        # with a signed in/out wind component for the HR model).
         weather = None
         meta = get_stadium_meta(venue)
         if meta and meta.get("roof") != "dome":
-            weather = weather_client.get_game_weather(meta["lat"], meta["lon"])
+            weather = weather_client.get_game_weather(
+                meta["lat"], meta["lon"],
+                outfield_bearing=meta.get("outfield_bearing"),
+                game_time=dict(game).get("game_time"),
+            )
 
         # Umpire K factor — looked up once per game, applied to all pitcher props
         ump_k_factor = _get_ump_k_factor(game_id)
@@ -196,10 +204,27 @@ async def scan_props(force: bool = False, game_ids: list = None):
             # Anchor-level agreement gate. If model and sharp disagree at the
             # consensus line, we don't trust the model anywhere — bail on this
             # (player, market) before evaluating any alt-lines.
-            if abs(projection['prob_over'] - sharp_prob_over_anchor) > SHARP_MODEL_AGREEMENT_TOL:
+            disagreement = abs(projection['prob_over'] - sharp_prob_over_anchor)
+            if disagreement > SHARP_MODEL_AGREEMENT_TOL:
+                logger.debug("Skipped %s %s: model_prob=%.3f, sharp_prob=%.3f (diff=%.3f)", 
+                             player_name, market_key, projection['prob_over'], sharp_prob_over_anchor, disagreement)
                 continue
 
             timestamp = utcnow().isoformat()
+
+            # Raw model probability at the anchor line — the basis for shifting
+            # the sharp truth onto alt-lines. Computed with the same distribution
+            # family as the alt-line reprice so the over/under ratio is consistent.
+            raw_anchor_over, _ = get_probabilities(
+                projection['projected_mean'], anchor_line, market_key,
+                alpha=projection.get('alpha'),
+                sigma=projection.get('sigma'),
+                pi0=projection.get('pi0'),
+            )
+            # Calibrate to the anchor projection's basis (it was calibrated in
+            # _finalize); keeps the truth-shift ratio and agreement gate on one
+            # consistent probability scale.
+            raw_anchor_over = proj_model.calibrate_over(raw_anchor_over, market_key)
 
             # Walk every soft-quoted alt-line within range; collect playable edges.
             candidates = []  # (ev, line, side, soft_book, odds, edge_result, line_data)
@@ -222,6 +247,10 @@ async def scan_props(force: bool = False, game_ids: list = None):
                         sigma=projection.get('sigma'),
                         pi0=projection.get('pi0'),
                     )
+                    # Same calibration the anchor projection carries, so the
+                    # agreement gate compares like-for-like probabilities.
+                    prob_over_line = proj_model.calibrate_over(prob_over_line, market_key)
+                    prob_under_line = 1.0 - prob_over_line
                     line_proj = dict(projection)
                     line_proj['line'] = line
                     line_proj['prob_over'] = prob_over_line
@@ -262,16 +291,24 @@ async def scan_props(force: bool = False, game_ids: list = None):
 
                     # Truth source per line:
                     #   anchor line → devigged sharp (Pinnacle/Circa) probability.
-                    #   alt-line    → model probability at that line. The model
-                    #                 was anchor-validated against sharp at the
-                    #                 consensus line, so its CDF shape is
-                    #                 trusted across nearby alt-lines.
+                    #   alt-line    → the SHARP anchor probability shifted along
+                    #                 the model CDF to this line (sharp stays the
+                    #                 basis; the model only interpolates shape).
+                    #                 Using the raw model prob as truth here would
+                    #                 let the model grade itself and defeat the
+                    #                 agreement gate — see _shift_anchor_truth.
                     if line == anchor_line:
                         truth_over = sharp_prob_over_anchor
                         truth_under = sharp_prob_under_anchor
+                        edge_source = 'sharp_anchor'
                     else:
-                        truth_over = prob_over_line
-                        truth_under = prob_under_line
+                        truth_over, truth_under = _shift_anchor_truth(
+                            sharp_prob_over_anchor, sharp_prob_under_anchor,
+                            raw_anchor_over, prob_over_line,
+                        )
+                        if truth_over is None:
+                            continue  # degenerate anchor prob — can't shift safely
+                        edge_source = 'model_altline'
                     for side, odds_val, side_book, sharp_prob, is_steam in [
                         ('over', over_odds, over_book, truth_over, steam_over),
                         ('under', under_odds, under_book, truth_under, steam_under),
@@ -309,6 +346,7 @@ async def scan_props(force: bool = False, game_ids: list = None):
                                         player_name, market_key, side, side_book, bias,
                                     )
                         if edge_result['is_playable']:
+                            edge_result['edge_source'] = edge_source
                             candidates.append((
                                 edge_result['ev'], line, side, side_book,
                                 odds_val, edge_result, sharp_book,
@@ -347,8 +385,8 @@ async def scan_props(force: bool = False, game_ids: list = None):
                          bookmaker, odds, sharp_book, anchor_line, truth_prob,
                          model_prob, open_devig_prob, edge_pct, ev,
                          kelly_fraction, recommended_stake, steam_detected,
-                         created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         edge_source, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(game_id, player_name, market, line, side, bookmaker)
                         DO UPDATE SET
                             odds=excluded.odds,
@@ -360,6 +398,7 @@ async def scan_props(force: bool = False, game_ids: list = None):
                             kelly_fraction=excluded.kelly_fraction,
                             recommended_stake=excluded.recommended_stake,
                             steam_detected=excluded.steam_detected,
+                            edge_source=excluded.edge_source,
                             created_at=excluded.created_at
                     ''', (
                         game_id, projection.get('player_id'), player_name,
@@ -370,12 +409,19 @@ async def scan_props(force: bool = False, game_ids: list = None):
                         edge_result['kelly']['kelly_fraction'],
                         edge_result['kelly']['recommended_stake'],
                         int(edge_result.get('steam_detected', False)),
+                        edge_result.get('edge_source'),
                         timestamp,
                     ))
 
                 if winners:
                     ctx = dict(projection.get('context', {}))
                     ctx['sample_size'] = projection.get('sample_size', 0)
+                    # Carry dispersion params so the alert can show an honest
+                    # ± band instead of a bare point estimate. Only when present
+                    # (keeps the heuristic/mock context shape unchanged).
+                    for k in ('alpha', 'sigma', 'pi0'):
+                        if projection.get(k) is not None:
+                            ctx[k] = projection[k]
                     context_json = json.dumps(ctx)
                     conn.execute('''
                         INSERT INTO projections
@@ -408,6 +454,43 @@ async def scan_props(force: bool = False, game_ids: list = None):
     else:
         skip_str = f"skipped {skipped_total} games"
     logger.info(f"Scan complete. Found {total_edges} playable edges; {skip_str}.")
+
+    # Surface silent model degradation: a loaded GLM that failed feature-build or
+    # predict fell back to the crude heuristic (no Statcast). This is invisible
+    # per-prop; aggregate it so a broken model/feature pipeline doesn't quietly
+    # downgrade the whole slate.
+    from src.models.projections import pop_glm_degradations
+    degradations = pop_glm_degradations()
+    if degradations:
+        logger.warning(
+            "GLM degraded to heuristic on %d projection(s) this scan: %s",
+            sum(degradations.values()), degradations,
+        )
+
+
+def _shift_anchor_truth(sharp_over: float, sharp_under: float,
+                        model_anchor_over: float, model_alt_over: float):
+    """Translate the devigged SHARP probability from the anchor line to an
+    alt-line along the model's CDF, keeping sharp as the basis.
+
+    The old code used the raw model probability as 'truth' at alt-lines, which
+    let the model grade its own homework: the edge became (model - book) and the
+    model/sharp agreement gate compared the model against itself. Here the sharp
+    anchor probability is scaled by the model's relative CDF movement
+    (odds-ratio style) and renormalized, so the edge stays tethered to the sharp
+    market while the model only supplies the *shape* between lines.
+
+    Returns (truth_over, truth_under), or (None, None) when the anchor model
+    probability is degenerate (can't form a ratio) — caller should skip the line.
+    """
+    if not (0.0 < model_anchor_over < 1.0):
+        return None, None
+    over = sharp_over * (model_alt_over / model_anchor_over)
+    under = sharp_under * ((1.0 - model_alt_over) / (1.0 - model_anchor_over))
+    total = over + under
+    if total <= 0:
+        return None, None
+    return over / total, under / total
 
 
 def _parse_iso(ts: str):
@@ -668,18 +751,22 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
                       bdl_market: dict = None) -> dict:
     """Build a projection for a player+market by looking up their stats in the DB."""
     with get_db_connection() as conn:
-        # Find the player
+        # Resolve the player deterministically (cache -> exact -> accent/suffix-
+        # normalized unique). The old `name LIKE '%X%'` first-row match could pull
+        # an entirely different player's logs on duplicate MLB names (two Will
+        # Smiths, multiple José Ramírez). We never project a bet on a guess: an
+        # ambiguous or unresolved name skips the prop.
+        from src.data.player_resolver import resolve_player_id
+        pid, method = resolve_player_id(conn, player_name)
+        if pid is None:
+            logger.info(
+                "Skipping %s %s: name unresolved (%s) — refusing to project on a guess.",
+                player_name, market_key, method,
+            )
+            return None
         player = conn.execute(
-            "SELECT * FROM players WHERE name = ? COLLATE NOCASE", (player_name,)
+            "SELECT * FROM players WHERE player_id = ?", (pid,)
         ).fetchone()
-
-        if not player:
-            # Try partial match
-            player = conn.execute(
-                "SELECT * FROM players WHERE name LIKE ? COLLATE NOCASE",
-                (f"%{player_name}%",)
-            ).fetchone()
-
         if not player:
             return None
 
@@ -689,12 +776,11 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
         bats = player['bats'] or ''
         throws = player['throws'] or ''
         
-        # Determine opposing team ID
-        home = conn.execute("SELECT team_id FROM teams WHERE name LIKE ? COLLATE NOCASE", (f"%{home_team}%",)).fetchone()
-        away = conn.execute("SELECT team_id FROM teams WHERE name LIKE ? COLLATE NOCASE", (f"%{away_team}%",)).fetchone()
-        
-        home_id = home['team_id'] if home else None
-        away_id = away['team_id'] if away else None
+        # Determine opposing team ID. Resolve via the exact Odds-API->abbrev map
+        # rather than `name LIKE '%City%'`, which collides on "Chicago"
+        # (Cubs/White Sox) and "Los Angeles" (Angels/Dodgers).
+        home_id = _resolve_team_id(conn, home_team)
+        away_id = _resolve_team_id(conn, away_team)
         opp_team_id = away_id if team_id == home_id else home_id
 
         # Check injury status
@@ -706,6 +792,20 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
         injury_status = injury['status'] if injury else 'Healthy'
 
         if injury_status in ('IL', 'Out'):
+            return None
+
+        # Confirmed-starter gate (pitcher markets). Bet the listed probable
+        # pitcher only — never a pitcher who isn't confirmed to start (an
+        # unconfirmed/scratched arm would otherwise project off stale logs and
+        # only void post-hoc). Batter lineup confirmation is enforced in the
+        # batter branch where the lineup slot is looked up.
+        if (REQUIRE_CONFIRMED_LINEUP
+                and market_key in ('pitcher_strikeouts', 'pitcher_earned_runs')
+                and not _is_confirmed_starter(conn, game_id, player_id)):
+            logger.info(
+                "Skipping %s %s: starting pitcher not confirmed for game %s.",
+                player_name, market_key, game_id,
+            )
             return None
 
         # LLM injury signal (optional): a tightening-only gate. When the player
@@ -807,8 +907,26 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
             # Get opposing pitcher's throwing hand from probable pitchers
             pitcher_hand = _get_opposing_pitcher_hand(conn, game_id, home_team, away_team, player)
 
-            # Look up today's lineup position for PA projection
+            # Look up today's lineup position for PA projection (by id when the
+            # name lookup misses — the resolver gave us a trustworthy player_id).
             lineup_position = _get_lineup_position(conn, player_name, game_id)
+            if lineup_position is None and player_id:
+                row = conn.execute(
+                    "SELECT lineup_position FROM daily_lineups WHERE game_id = ? AND player_id = ?",
+                    (game_id, player_id),
+                ).fetchone()
+                if row and row['lineup_position']:
+                    lineup_position = int(row['lineup_position'])
+
+            # Confirmed-lineup gate (batter markets): a batter not in today's
+            # posted lineup would otherwise project off DEFAULT_PROJECTED_PA and
+            # only void post-hoc if they sit. Skip rather than guess.
+            if REQUIRE_CONFIRMED_LINEUP and lineup_position is None:
+                logger.info(
+                    "Skipping %s %s: batter not in confirmed lineup for game %s.",
+                    player_name, market_key, game_id,
+                )
+                return None
 
             # Materialize platoon rate here while conn is alive so the feature
             # builder doesn't need to reach back into the DB after this block.
@@ -850,6 +968,55 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
     return None
 
 
+def _is_confirmed_starter(conn, game_id: str, player_id: int) -> bool:
+    """True iff this player is the confirmed probable starter for this game.
+
+    probable_pitchers is populated by sync_lineups from BDL's /lineups feed; a
+    row keyed to this (game_id, player_id) is our 'starter confirmed' signal.
+    """
+    if not player_id:
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM probable_pitchers WHERE game_id = ? AND player_id = ? LIMIT 1",
+        (game_id, player_id),
+    ).fetchone()
+    return row is not None
+
+
+def _resolve_team_id(conn, team_name: str):
+    """Resolve an Odds-API team name to a BDL team_id without LIKE collisions.
+
+    Priority: exact Odds-API->abbreviation map (config) joined on teams.abbreviation,
+    then exact name match, then a logged fuzzy LIKE as a last resort. Returns the
+    team_id or None. The abbreviation path is what disambiguates "Chicago" and
+    "Los Angeles", which `name LIKE '%City%'` cannot.
+    """
+    if not team_name:
+        return None
+    from src.config import ODDS_API_TEAM_ABBREV
+    abbrev = ODDS_API_TEAM_ABBREV.get(team_name)
+    if abbrev:
+        row = conn.execute(
+            "SELECT team_id FROM teams WHERE abbreviation = ? COLLATE NOCASE",
+            (abbrev,),
+        ).fetchone()
+        if row:
+            return row['team_id']
+    row = conn.execute(
+        "SELECT team_id FROM teams WHERE name = ? COLLATE NOCASE", (team_name,)
+    ).fetchone()
+    if row:
+        return row['team_id']
+    row = conn.execute(
+        "SELECT team_id FROM teams WHERE name LIKE ? COLLATE NOCASE",
+        (f"%{team_name}%",),
+    ).fetchone()
+    if row:
+        logger.debug("Team '%s' resolved via fuzzy LIKE — verify abbrev map.", team_name)
+        return row['team_id']
+    return None
+
+
 def _get_team_stats_by_id(conn, team_id) -> dict:
     """Pre-calculated team offensive stats (calculate_team_stats pipeline),
     looked up directly by BDL team_id. Returns {} when unknown so callers
@@ -887,26 +1054,21 @@ def _get_team_stats(conn, team_name: str) -> dict:
 
 def _get_opposing_pitcher_hand(conn, game_id: str, home_team: str, away_team: str, batter_player) -> str:
     """
-    Look up the opposing probable pitcher's throwing hand.
+    Look up the opposing probable pitcher's throwing hand from the confirmed
+    probable_pitchers table (BDL /lineups). Returns '' (neutral) when no
+    confirmed starter exists.
 
-    Priority:
-    1. probable_pitchers table (from BDL /lineups endpoint) — the correct answer
-    2. Fallback: most recent pitcher on opposing team from game logs (old heuristic)
+    The previous "most recent pitcher on the opposing team" fallback guessed a
+    hand from an unrelated pitcher's game log — that silently applied the WRONG
+    platoon split. A wrong platoon adjustment is worse than none, so when the
+    starter isn't confirmed we return '' and the platoon multiplier stays 1.0.
     """
     batter_team_id = batter_player['team_id']
 
-    # Determine which team the batter is on to find the opposing team
-    home = conn.execute(
-        "SELECT team_id FROM teams WHERE name LIKE ? COLLATE NOCASE",
-        (f"%{home_team}%",)
-    ).fetchone()
+    # Determine which team the batter is on to find the opposing team.
+    home_id = _resolve_team_id(conn, home_team)
+    opp_team_name = away_team if (home_id is not None and batter_team_id == home_id) else home_team
 
-    if home and batter_team_id == home['team_id']:
-        opp_team_name = away_team
-    else:
-        opp_team_name = home_team
-
-    # --- Primary: look up probable pitcher from today's lineup sync ---
     pitcher = conn.execute(
         "SELECT throws FROM probable_pitchers WHERE game_id = ? AND team LIKE ? COLLATE NOCASE",
         (game_id, f"%{opp_team_name}%")
@@ -915,25 +1077,11 @@ def _get_opposing_pitcher_hand(conn, game_id: str, home_team: str, away_team: st
     if pitcher and pitcher['throws']:
         return pitcher['throws']
 
-    # --- Fallback: most recent pitcher on opposing team (old heuristic) ---
-    logger.debug(f"No probable pitcher for {opp_team_name} in game {game_id}, using fallback")
-
-    opp_team = conn.execute(
-        "SELECT team_id FROM teams WHERE name LIKE ? COLLATE NOCASE",
-        (f"%{opp_team_name}%",)
-    ).fetchone()
-
-    if not opp_team:
-        return 'R'
-
-    pitcher = conn.execute('''
-        SELECT p.throws FROM players p
-        JOIN pitcher_game_logs pgl ON p.player_id = pgl.player_id
-        WHERE p.team_id = ? AND p.position = 'P'
-        ORDER BY pgl.date DESC LIMIT 1
-    ''', (opp_team['team_id'],)).fetchone()
-
-    return pitcher['throws'] if pitcher and pitcher['throws'] else 'R'
+    logger.debug(
+        "No confirmed probable pitcher for %s in game %s — neutral platoon (no guess).",
+        opp_team_name, game_id,
+    )
+    return ''
 
 
 def _get_ump_k_factor(game_id: str) -> float:

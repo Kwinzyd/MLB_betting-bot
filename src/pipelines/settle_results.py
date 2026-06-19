@@ -69,8 +69,8 @@ def settle_results():
                 with get_db_connection() as conn:
                     conn.execute('''
                         INSERT INTO bet_results
-                        (alert_id, actual_value, result, profit, closing_odds, clv)
-                        VALUES (?, NULL, 'VOID', 0.0, ?, ?)
+                        (alert_id, actual_value, result, profit, closing_odds, clv, settled_at)
+                        VALUES (?, NULL, 'VOID', 0.0, ?, ?, datetime('now'))
                     ''', (alert_id, odds, clv))
                     conn.commit()
                 settled_count += 1
@@ -114,8 +114,9 @@ def settle_results():
 
         with get_db_connection() as conn:
             conn.execute('''
-                INSERT INTO bet_results (alert_id, actual_value, result, profit, closing_odds, clv)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO bet_results
+                (alert_id, actual_value, result, profit, closing_odds, clv, settled_at)
+                VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
             ''', (alert_id, actual, result, round(profit, 2), odds, clv))
             if result in ('WIN', 'LOSS'):
                 _write_calibration_log(conn, alert_id, market, side, result,
@@ -130,10 +131,20 @@ def settle_results():
             f"Actual: {actual} | {result} | P&L: ${profit:+.2f} | CLV: {clv:+.3f}"
         )
 
+    # Void (refund) open singles on postponed games before parlay settlement so
+    # capital isn't left tied up in a bet that can never resolve.
+    postponed_voided = _void_postponed_singles()
+    settled_count += postponed_voided
+
     # Settle SGP tickets (handles void recalculation across legs).
     sgp_settled, sgp_profit = _settle_sgps()
     settled_count += sgp_settled
     total_profit += sgp_profit
+
+    # Settle cross-game parlay tickets (each leg graded against its own game).
+    parlay_settled, parlay_profit = _settle_parlays()
+    settled_count += parlay_settled
+    total_profit += parlay_profit
 
     # Log summary and update bankroll snapshot
     if settled_count > 0:
@@ -219,6 +230,46 @@ def _lookup_player_id(conn, player_name: str):
     return None
 
 
+def _is_postponed(game_id: str) -> bool:
+    """True iff this game is marked POSTPONED (set by sync_stats)."""
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT status FROM games WHERE game_id = ?", (game_id,)
+        ).fetchone()
+    return bool(row and row['status'] == 'POSTPONED')
+
+
+def _void_postponed_singles() -> int:
+    """Void (refund, profit 0) open single-bet alerts on postponed games.
+
+    A postponed game never reaches COMPLETED, so its bets would otherwise sit
+    PENDING forever and tie up modeled exposure. Books void unplayed props.
+    """
+    voided = 0
+    with get_db_connection() as conn:
+        rows = conn.execute('''
+            SELECT a.alert_id, a.odds
+            FROM alerts_sent a
+            JOIN games g ON a.game_id = g.game_id
+            WHERE g.status = 'POSTPONED'
+              AND a.alert_id NOT IN (
+                  SELECT alert_id FROM bet_results WHERE alert_id IS NOT NULL
+              )
+        ''').fetchall()
+        for r in rows:
+            conn.execute('''
+                INSERT INTO bet_results
+                (alert_id, actual_value, result, profit, closing_odds, clv, settled_at)
+                VALUES (?, NULL, 'VOID', 0.0, ?, 0.0, datetime('now'))
+            ''', (r['alert_id'], r['odds']))
+            voided += 1
+        if voided:
+            conn.commit()
+    if voided:
+        logger.info("Voided %d single bet(s) on postponed games (refund).", voided)
+    return voided
+
+
 def _settle_sgps():
     """
     Grade SGP tickets, recalculating payout when legs void/push.
@@ -240,7 +291,7 @@ def _settle_sgps():
                    s.naive_parlay_odds
             FROM sgp_candidates s
             JOIN games g ON s.game_id = g.game_id
-            WHERE g.status = 'COMPLETED'
+            WHERE g.status IN ('COMPLETED', 'POSTPONED')
               AND s.kelly_stake IS NOT NULL
               AND s.kelly_stake > 0
               AND s.id NOT IN (
@@ -316,12 +367,119 @@ def _settle_sgps():
     return settled, total_profit
 
 
+def _settle_parlays():
+    """
+    Grade cross-game parlay tickets (find_parlays.py), recalculating payout
+    when legs void/push. Same ticket logic as _settle_sgps, but each leg is
+    graded against its OWN game_id (the legs span different games), so a ticket
+    only settles once every one of its games' box scores is in.
+
+    Per-leg outcomes: WIN, LOSS, PUSH, VOID, PENDING (box score not in).
+    Ticket logic:
+      - any PENDING leg (or a leg missing its game_id) -> defer
+      - any surviving LOSS leg -> ticket loses, profit = -stake
+      - all legs VOID/PUSH     -> full refund, profit = 0
+      - all survivors WIN      -> profit = stake * (recalc_odds - 1),
+        where recalc_odds = product of surviving legs' decimal odds
+    """
+    settled = 0
+    total_profit = 0.0
+    with get_db_connection() as conn:
+        rows = conn.execute('''
+            SELECT id, legs_json, kelly_stake, parlay_odds
+            FROM parlays
+            WHERE kelly_stake IS NOT NULL
+              AND kelly_stake > 0
+              AND id NOT IN (
+                  SELECT parlay_id FROM parlay_results
+                  WHERE parlay_id IS NOT NULL
+              )
+        ''').fetchall()
+
+    for row in rows:
+        try:
+            legs = json.loads(row['legs_json'])
+        except (TypeError, ValueError):
+            logger.warning(f"Parlay {row['id']}: malformed legs_json, skipping.")
+            continue
+
+        leg_results = []
+        defer = False
+        for leg in legs:
+            game_id = leg.get('game_id')
+            if not game_id:
+                # Without a game_id we can't grade this leg; defer rather than
+                # silently mis-settle. (find_parlays always writes game_id.)
+                logger.warning(f"Parlay {row['id']}: leg missing game_id, deferring.")
+                defer = True
+                break
+            outcome = _grade_leg(leg, game_id)
+            if outcome == 'PENDING':
+                defer = True
+                break
+            leg_results.append(outcome)
+
+        if defer:
+            logger.debug(f"Parlay {row['id']}: legs pending, deferring settlement.")
+            continue
+
+        stake = float(row['kelly_stake'])
+        voided_idx = [i for i, r in enumerate(leg_results) if r in ('VOID', 'PUSH')]
+        survivors = [
+            (legs[i], leg_results[i]) for i in range(len(legs))
+            if i not in voided_idx
+        ]
+
+        if any(r == 'LOSS' for _, r in survivors):
+            ticket_result = 'LOSS'
+            recalc_odds = float(row['parlay_odds'] or 0.0)
+            profit = -stake
+        elif not survivors:
+            ticket_result = 'VOID'
+            recalc_odds = 1.0
+            profit = 0.0
+        else:
+            recalc_odds = 1.0
+            for leg, _ in survivors:
+                recalc_odds *= float(leg['odds'])
+            ticket_result = 'WIN'
+            profit = stake * (recalc_odds - 1.0)
+
+        with get_db_connection() as conn:
+            conn.execute('''
+                INSERT INTO parlay_results
+                (parlay_id, leg_results_json, voided_legs_json,
+                 surviving_legs, recalc_odds, result, profit, settled_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ''', (
+                row['id'], json.dumps(leg_results), json.dumps(voided_idx),
+                len(survivors), round(recalc_odds, 4),
+                ticket_result, round(profit, 2),
+            ))
+            conn.commit()
+
+        settled += 1
+        total_profit += profit
+        logger.info(
+            f"PARLAY SETTLED: id={row['id']} legs={leg_results} "
+            f"voided={voided_idx} -> {ticket_result} @ {recalc_odds:.2f} "
+            f"| P&L: ${profit:+.2f}"
+        )
+
+    return settled, total_profit
+
+
 def _grade_leg(leg: dict, game_id: str) -> str:
-    """Grade a single SGP leg. Returns WIN/LOSS/PUSH/VOID/PENDING."""
+    """Grade a single SGP/parlay leg. Returns WIN/LOSS/PUSH/VOID/PENDING."""
     player = leg.get('player_name')
     market = leg.get('market')
     line = float(leg.get('line'))
     side = leg.get('side')
+
+    # A postponed game's leg can never resolve — void it so the ticket reprices
+    # on the surviving legs (cross-game parlay) or refunds (all-postponed SGP).
+    if _is_postponed(game_id):
+        return 'VOID'
 
     actual = _get_actual_stat(player, market, game_id)
     if actual is None:
@@ -569,23 +727,33 @@ def _update_bankroll_snapshot(session_profit: float) -> None:
 
     with get_db_connection() as conn:
         try:
+            # Daily stop-loss keys on SETTLEMENT date, not placement date: a bet
+            # placed for a night game settles after the next UTC midnight, so a
+            # placement-dated sum couldn't see the slate it was meant to protect
+            # (and would charge the loss to the wrong day).
             daily_row = conn.execute(
-                """SELECT COALESCE(SUM(br.profit), 0.0) AS daily_pnl
-                   FROM bet_results br
-                   JOIN alerts_sent a ON br.alert_id = a.alert_id
-                   WHERE date(a.timestamp) = ?""",
+                """SELECT COALESCE(SUM(profit), 0.0) AS daily_pnl
+                   FROM bet_results
+                   WHERE date(settled_at) = ?""",
                 (today,),
             ).fetchone()
             daily_pnl = float(daily_row['daily_pnl']) if daily_row else 0.0
-            # SGP P&L counts toward the same daily-loss breaker.
+            # SGP P&L counts toward the same daily-loss breaker (by settlement date).
             sgp_daily = conn.execute(
-                """SELECT COALESCE(SUM(sr.profit), 0.0) AS pnl
-                   FROM sgp_results sr
-                   JOIN sgp_candidates sc ON sr.sgp_candidate_id = sc.id
-                   WHERE date(sc.timestamp) = ?""",
+                """SELECT COALESCE(SUM(profit), 0.0) AS pnl
+                   FROM sgp_results
+                   WHERE date(settled_at) = ?""",
                 (today,),
             ).fetchone()
             daily_pnl += float(sgp_daily['pnl'] or 0.0) if sgp_daily else 0.0
+            # Cross-game parlay P&L counts toward the same daily-loss breaker.
+            parlay_daily = conn.execute(
+                """SELECT COALESCE(SUM(profit), 0.0) AS pnl
+                   FROM parlay_results
+                   WHERE date(settled_at) = ?""",
+                (today,),
+            ).fetchone()
+            daily_pnl += float(parlay_daily['pnl'] or 0.0) if parlay_daily else 0.0
         except Exception:
             daily_pnl = session_profit
 
@@ -609,6 +777,16 @@ def _update_bankroll_snapshot(session_profit: float) -> None:
             if sgp_roll:
                 rolling_7d_pnl += float(sgp_roll['pnl'] or 0.0)
                 staked_7d += float(sgp_roll['staked'] or 0.0)
+            parlay_roll = conn.execute(
+                """SELECT COALESCE(SUM(pr.profit), 0.0) AS pnl,
+                          COALESCE(SUM(p.kelly_stake), 0.0) AS staked
+                   FROM parlay_results pr
+                   JOIN parlays p ON pr.parlay_id = p.id
+                   WHERE date(p.timestamp) >= date('now', '-7 days')""",
+            ).fetchone()
+            if parlay_roll:
+                rolling_7d_pnl += float(parlay_roll['pnl'] or 0.0)
+                staked_7d += float(parlay_roll['staked'] or 0.0)
             rolling_7d_roi = rolling_7d_pnl / staked_7d if staked_7d > 0 else 0.0
         except Exception:
             rolling_7d_pnl = 0.0

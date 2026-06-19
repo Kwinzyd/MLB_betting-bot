@@ -610,7 +610,11 @@ def build_batter_features(batter_logs: List[Dict],
     if batter_hand and pitcher_hand and not is_switch:
         same_hand = 1 if batter_hand.upper() == pitcher_hand.upper() else 0
 
-    park_key_map = {"batter_hits": "hits", "batter_home_runs": "hr", "batter_total_bases": "hr"}
+    # TB uses the blended 'tb' factor (singles/doubles-weighted), not pure 'hr'.
+    # Train and serve share this builder, so the next retrain reconciles the
+    # GLM to the corrected feature; the transient shift is small (tb≈hr at most
+    # parks) and bounded by the champion/challenger promotion gate.
+    park_key_map = {"batter_hits": "hits", "batter_home_runs": "hr", "batter_total_bases": "tb"}
     park_key = park_key_map.get(market, "runs")
     park_adj = get_park_factor(venue, weather=weather).get(park_key, 1.0) if venue else 1.0
 

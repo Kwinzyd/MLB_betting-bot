@@ -2,6 +2,7 @@ import json
 import math
 import os
 import time
+from collections import Counter
 from typing import List, Dict, Any, Optional
 from src.utils.logging_utils import get_logger
 from src.models.distributions import (
@@ -56,6 +57,19 @@ def _compute_hr_pi0(market, batter_logs, park_hr_factor, extra_features, weather
     )
 
 logger = get_logger(__name__)
+
+# Per-market count of GLM->heuristic fallbacks caused by a feature-build/predict
+# FAILURE (not by an absent model). Lets scan_props surface silent degradation
+# instead of quietly serving the crude ERA/K9 heuristic with no Statcast.
+_glm_degradations: Counter = Counter()
+
+
+def pop_glm_degradations() -> dict:
+    """Return and clear the GLM-degradation counts since the last call."""
+    global _glm_degradations
+    snapshot = dict(_glm_degradations)
+    _glm_degradations = Counter()
+    return snapshot
 
 
 def _scale_pa_for_game_total(base_pa: float, game_total: float | None) -> float:
@@ -226,6 +240,19 @@ class ProjectionModel:
     def _finalize(self, result: Dict | None) -> Dict | None:
         """Apply (or skip) probability calibration per this model's config."""
         return _calibrate_result(result, enabled=self._apply_calibration)
+
+    def calibrate_over(self, prob_over: float, market: str) -> float:
+        """Apply this model's active probability calibration to an OVER prob.
+
+        Mirrors _finalize so alt-line reprices share the SAME calibrated basis
+        the anchor projection was built on (the anchor prob is calibrated; the
+        alt-line reprice was not, so the agreement gate and truth-shift compared
+        a calibrated number against raw ones). Identity when calibration is
+        disabled for this model or no params exist for the market.
+        """
+        if not self._apply_calibration:
+            return prob_over
+        return max(0.0, min(1.0, _apply_calibration(prob_over, market)))
 
     def _load_glm_models(self):
         """Load any serialized PoissonGLM models from disk; silently skip missing ones."""
@@ -623,12 +650,14 @@ class ProjectionModel:
             )
         except Exception as e:
             logger.warning(f"GLM feature build failed for {market}: {e}; falling back.")
+            _glm_degradations[market] += 1
             return None
 
         try:
             projected_mean = glm.predict_mean(features, exposure=ip_result['proj_ip'])
         except Exception as e:
             logger.warning(f"GLM predict failed for {market}: {e}; falling back.")
+            _glm_degradations[market] += 1
             return None
 
         # Analytic NB/Poisson CDF — Monte Carlo at n=1000 carries ~1.6pp of
@@ -697,12 +726,14 @@ class ProjectionModel:
             )
         except Exception as e:
             logger.warning(f"GLM feature build failed for {market}: {e}; falling back.")
+            _glm_degradations[market] += 1
             return None
 
         try:
             projected_mean = glm.predict_mean(features, exposure=projected_pa)
         except Exception as e:
             logger.warning(f"GLM predict failed for {market}: {e}; falling back.")
+            _glm_degradations[market] += 1
             return None
 
         park_hr_factor = get_park_factor(venue, weather=weather).get("hr", 1.0)
@@ -780,7 +811,10 @@ class ProjectionModel:
     def _stat_to_park_key(self, stat_type: str) -> str:
         mapping = {
             "hits": "hits",
-            "total_bases": "hr",  # TB heavily influenced by HR factor
+            # TB is ~60% singles/doubles; a pure HR factor mis-prices
+            # doubles-friendly, HR-suppressing parks (e.g. Fenway). Use the
+            # blended 'tb' factor (0.45*hr + 0.55*hits) from get_park_factor.
+            "total_bases": "tb",
             "home_runs": "hr",
         }
         return mapping.get(stat_type, "runs")
@@ -795,13 +829,17 @@ class ProjectionModel:
 
     def _project_innings(self, logs: List[Dict]) -> Dict:
         """
-        Estimate today's projected innings from pitch efficiency.
+        Estimate today's projected innings from pitch efficiency and role.
 
-        Pulls recent pitches-per-inning from the last 5 starts, anchors the
-        starter pitch limit at DEFAULT_PITCH_LIMIT (+10 if a pitcher has been
-        running deeper than that), and divides to get projected IP.
+        Pulls recent pitches-per-inning from the last 5 starts and anchors a
+        pitch budget. Established starters anchor at DEFAULT_PITCH_LIMIT (+10 if
+        they've been running deeper). Short-role arms (openers / piggyback /
+        bullpen games — recent avg IP < 4 or avg pitches < 60) are anchored to
+        THEIR OWN recent workload instead: the old 100-pitch floor ballooned a
+        2-IP opener to a ~6 IP projection and badly over-stated K/ER.
         """
         recent = logs[:5] if logs else []
+        n = len(recent)
 
         total_ip = sum(l.get('innings_pitched') or 0 for l in recent)
         total_pitches = sum(l.get('pitches_thrown') or 0 for l in recent)
@@ -811,18 +849,27 @@ class ProjectionModel:
         else:
             pitches_per_ip = LEAGUE_AVG_PITCHES_PER_IP
 
-        # Allow a small bump for pitchers who've been averaging more pitches
-        # than the league standard starter budget.
-        if recent:
-            recent_pitch_counts = [l.get('pitches_thrown') or 0 for l in recent]
-            avg_pitches = sum(recent_pitch_counts) / len(recent_pitch_counts) if recent_pitch_counts else 0
-            est_pitch_limit = int(min(110, max(DEFAULT_PITCH_LIMIT, avg_pitches + 10)))
-        else:
+        avg_ip = (total_ip / n) if n else 0.0
+        avg_pitches = (total_pitches / n) if n else 0.0
+
+        # Short-role detection: consistently low IP or low pitch counts.
+        is_short_role = n > 0 and ((0 < avg_ip < 4.0) or (0 < avg_pitches < 60.0))
+
+        if not recent:
             est_pitch_limit = DEFAULT_PITCH_LIMIT
+            ip_floor = 3.0
+        elif is_short_role:
+            # Anchor to the pitcher's own budget; no starter floor. Floor IP at
+            # 0.5 so an opener can project well under 3 innings.
+            est_pitch_limit = int(max(15, min(80, avg_pitches + 5)))
+            ip_floor = 0.5
+        else:
+            est_pitch_limit = int(min(110, max(DEFAULT_PITCH_LIMIT, avg_pitches + 10)))
+            ip_floor = 3.0
 
         proj_ip = est_pitch_limit / pitches_per_ip if pitches_per_ip > 0 else 5.5
-        # Safety clamp: starters almost never exceed 8 IP or go under 3 IP in a projection
-        proj_ip = max(3.0, min(8.0, proj_ip))
+        # Safety clamp: full-game starters rarely exceed 8 IP; openers can go low.
+        proj_ip = max(ip_floor, min(8.0, proj_ip))
 
         return {
             "proj_ip": proj_ip,

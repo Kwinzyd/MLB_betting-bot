@@ -214,7 +214,7 @@ CREATE TABLE IF NOT EXISTS bet_candidates (
     odds REAL NOT NULL,
     sharp_book TEXT,
     anchor_line REAL,
-    truth_prob REAL,        -- edge basis: sharp devig at anchor, model at alt-lines
+    truth_prob REAL,        -- edge basis: sharp devig at anchor, sharp shifted to alt-lines
     model_prob REAL,        -- model probability for this side at this line
     open_devig_prob REAL,   -- devigged prob of our side at placement (CLV open)
     edge_pct REAL,
@@ -222,6 +222,7 @@ CREATE TABLE IF NOT EXISTS bet_candidates (
     kelly_fraction REAL,
     recommended_stake REAL,
     steam_detected INTEGER DEFAULT 0,
+    edge_source TEXT,       -- 'sharp_anchor' | 'model_altline' (sharp shifted along model CDF)
     created_at TEXT NOT NULL,
     UNIQUE(game_id, player_name, market, line, side, bookmaker)
 );
@@ -259,6 +260,7 @@ CREATE TABLE IF NOT EXISTS bet_results (
     profit REAL,
     closing_odds REAL,
     clv REAL,
+    settled_at TEXT,   -- when this bet was graded; daily stop-loss keys on this
     FOREIGN KEY(alert_id) REFERENCES alerts_sent(alert_id)
 );
 
@@ -330,6 +332,44 @@ CREATE TABLE IF NOT EXISTS sgp_results (
     profit REAL,
     settled_at TEXT,
     FOREIGN KEY(sgp_candidate_id) REFERENCES sgp_candidates(id)
+);
+
+-- Cross-game multi-leg parlays (2/4/8 legs) built by find_parlays.py. Unlike
+-- sgp_candidates these span DIFFERENT games (one leg per game), so legs are
+-- statistically independent: joint_prob = product(leg_prob), parlay_odds =
+-- product(leg_odds), no correlation adjustment. legs_json carries each leg's
+-- own game_id so settlement can grade it against its own box score. legs_json
+-- is UNIQUE so a re-run with the same top legs alerts only once.
+CREATE TABLE IF NOT EXISTS parlays (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    num_legs INTEGER,
+    legs_json TEXT,
+    joint_prob REAL,
+    parlay_odds REAL,
+    fair_odds REAL,
+    ev REAL,
+    kelly_stake REAL,
+    bookmakers TEXT,
+    timestamp TEXT,
+    UNIQUE(legs_json)
+);
+CREATE INDEX IF NOT EXISTS idx_parlays_timestamp ON parlays(timestamp);
+
+-- Settled cross-game parlay tickets. Mirrors sgp_results: recalc_odds is the
+-- payout odds after dropping VOID/PUSH legs (those legs are refunded and the
+-- survivors reprice as a smaller parlay). voided_legs_json is the JSON list of
+-- voided leg indices so the recalculation is auditable.
+CREATE TABLE IF NOT EXISTS parlay_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    parlay_id INTEGER UNIQUE,
+    leg_results_json TEXT,
+    voided_legs_json TEXT,
+    surviving_legs INTEGER,
+    recalc_odds REAL,
+    result TEXT,
+    profit REAL,
+    settled_at TEXT,
+    FOREIGN KEY(parlay_id) REFERENCES parlays(id)
 );
 
 -- Per-scan game-total snapshots. Trigger watch reads the latest row as the

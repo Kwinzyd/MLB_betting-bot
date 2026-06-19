@@ -110,6 +110,12 @@ def test_healthy_player_not_gated_despite_pessimistic_signal():
     conn = _gate_db()
     conn.execute("UPDATE injury_reports SET status='Healthy' WHERE player_name='Gerrit Cole'")
     conn.execute("INSERT INTO teams (team_id, abbreviation, name) VALUES (2,'BOS','Boston Red Sox')")
+    # Confirmed-starter gate requires a probable_pitchers row to reach projection.
+    conn.execute(
+        "INSERT INTO probable_pitchers (game_id, team, player_name, player_id, throws, date) "
+        "VALUES ('g1','New York Yankees','Gerrit Cole',101,'R',?)",
+        (TODAY,),
+    )
     # Seed enough pitcher logs for a real projection.
     conn.executemany(
         "INSERT INTO pitcher_game_logs (game_id, player_id, date, innings_pitched, "

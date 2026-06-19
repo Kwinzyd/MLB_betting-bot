@@ -26,6 +26,7 @@ def init_db():
         _migrate_alerts_sent_unique(conn)
         _migrate_alerts_delivery_cols(conn)
         _migrate_bet_candidates(conn)
+        _migrate_bet_results_settled_at(conn)
         _migrate_player_injury_signals(conn)
         _migrate_player_name_resolutions(conn)
         _migrate_missing_indexes(conn)
@@ -207,6 +208,20 @@ def _migrate_bet_candidates(conn):
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_bet_candidates_created ON bet_candidates(created_at)"
     )
+    # edge_source labels whether the edge was measured at the sharp anchor or
+    # shifted to an alt-line along the model CDF (added after the original table).
+    existing = {row['name'] for row in conn.execute("PRAGMA table_info(bet_candidates)").fetchall()}
+    if 'edge_source' not in existing:
+        conn.execute("ALTER TABLE bet_candidates ADD COLUMN edge_source TEXT")
+
+
+def _migrate_bet_results_settled_at(conn):
+    """Add settled_at to bet_results so the daily stop-loss breaker can key on
+    grading time, not bet placement time (night-game results land after UTC
+    midnight, so placement-dated P&L can't protect the slate that produced it)."""
+    existing = {row['name'] for row in conn.execute("PRAGMA table_info(bet_results)").fetchall()}
+    if 'settled_at' not in existing:
+        conn.execute("ALTER TABLE bet_results ADD COLUMN settled_at TEXT")
 
 
 def _migrate_player_injury_signals(conn):
