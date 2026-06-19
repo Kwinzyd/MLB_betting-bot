@@ -26,6 +26,7 @@ def init_db():
         _migrate_alerts_sent_unique(conn)
         _migrate_alerts_delivery_cols(conn)
         _migrate_bet_candidates(conn)
+        _migrate_game_bet_candidates(conn)
         _migrate_bet_results_settled_at(conn)
         _migrate_player_injury_signals(conn)
         _migrate_player_name_resolutions(conn)
@@ -213,6 +214,35 @@ def _migrate_bet_candidates(conn):
     existing = {row['name'] for row in conn.execute("PRAGMA table_info(bet_candidates)").fetchall()}
     if 'edge_source' not in existing:
         conn.execute("ALTER TABLE bet_candidates ADD COLUMN edge_source TEXT")
+
+
+def _migrate_game_bet_candidates(conn):
+    """Create the game-market scan-output table on DBs that predate game markets."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS game_bet_candidates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            game_id TEXT NOT NULL,
+            market TEXT NOT NULL,
+            side TEXT NOT NULL,
+            line REAL NOT NULL,
+            vendor TEXT NOT NULL,
+            odds REAL NOT NULL,
+            model_prob REAL,
+            book_implied REAL,
+            edge_pct REAL,
+            ev REAL,
+            kelly_fraction REAL,
+            recommended_stake REAL,
+            lam_home REAL,
+            lam_away REAL,
+            created_at TEXT NOT NULL,
+            UNIQUE(game_id, market, side)
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_game_bet_candidates_created "
+        "ON game_bet_candidates(created_at)"
+    )
 
 
 def _migrate_bet_results_settled_at(conn):

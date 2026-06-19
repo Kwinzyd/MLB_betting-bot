@@ -10,6 +10,42 @@ from src.utils.logging_utils import get_logger
 # Markets that resolve from pitcher_game_logs vs. batter_game_logs.
 _PITCHER_MARKETS = {'pitcher_strikeouts', 'pitcher_earned_runs'}
 _BATTER_MARKETS = {'batter_hits', 'batter_total_bases', 'batter_home_runs'}
+# Game markets resolve from final scores (games.home_score/away_score).
+_GAME_MARKETS = {'moneyline', 'game_total', 'run_line'}
+
+
+def _grade_game_market(market: str, side: str, line: float, game_id: str):
+    """Grade a game-market bet from final scores.
+
+    Returns (result, actual_value) where result is WIN/LOSS/PUSH, or
+    (None, None) when scores aren't synced yet (defer). `line` for run_line is
+    the signed line for the bet side (home -1.5 / away +1.5).
+    """
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT home_score, away_score FROM games WHERE game_id = ?", (game_id,)
+        ).fetchone()
+    if not row or row['home_score'] is None or row['away_score'] is None:
+        return None, None
+    h, a = float(row['home_score']), float(row['away_score'])
+
+    if market == 'moneyline':
+        win = (h > a) if side == 'home' else (a > h)  # MLB has no ties
+        return ('WIN' if win else 'LOSS'), (h - a)
+    if market == 'game_total':
+        total = h + a
+        if total == line:
+            return 'PUSH', total
+        over = total > line
+        win = over if side == 'over' else not over
+        return ('WIN' if win else 'LOSS'), total
+    if market == 'run_line':
+        margin = h - a if side == 'home' else a - h  # this side's margin
+        adj = margin + line                          # >0 cover, ==0 push, <0 loss
+        if adj == 0:
+            return 'PUSH', (h - a)
+        return ('WIN' if adj > 0 else 'LOSS'), (h - a)
+    return None, None
 
 logger = get_logger(__name__)
 
@@ -52,6 +88,29 @@ def settle_results():
         stake = alert['kelly_stake']
         player_id = alert['player_id']
         open_devig_prob = alert['open_devig_prob']
+
+        # Game markets (moneyline/total/run line) grade from final scores, not
+        # player box scores, and have no sharp close (clv=0).
+        if market in _GAME_MARKETS:
+            result, actual = _grade_game_market(market, side, line, alert['game_id'])
+            if result is None:
+                logger.debug("Game scores not synced for %s %s — skipping.",
+                             player_name, alert['game_id'])
+                continue
+            profit = stake * (odds - 1) if result == 'WIN' else (0.0 if result == 'PUSH' else -stake)
+            with get_db_connection() as conn:
+                conn.execute('''
+                    INSERT INTO bet_results
+                    (alert_id, actual_value, result, profit, closing_odds, clv, settled_at)
+                    VALUES (?, ?, ?, ?, ?, 0.0, datetime('now'))
+                ''', (alert_id, actual, result, round(profit, 2), odds))
+                conn.commit()
+            total_profit += profit
+            settled_count += 1
+            settled_game_ids.add(alert['game_id'])
+            logger.info("SETTLED (game): %s %s %s — %s | P&L: $%+.2f",
+                        player_name, market, line, result, profit)
+            continue
 
         # Get actual stat value — graded by player_id when the alert carries
         # one (name lookups can hit the wrong player on duplicate MLB names).

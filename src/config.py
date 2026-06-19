@@ -310,6 +310,34 @@ LIVE_MIN_EV = float(os.getenv("LIVE_MIN_EV", "0.08"))   # 8% EV default
 # Seconds between BDL live-game polls. 20s is safe for BDL free tier.
 LIVE_POLL_INTERVAL_SECONDS = int(os.getenv("LIVE_POLL_INTERVAL_SECONDS", "20"))
 
+# --- Game markets (moneyline / total / run line) ---
+# Sourced from BDL game odds (free, soft vendors only — NO sharp anchor), so
+# these are MODEL-DRIVEN: a team Poisson run model vs the best BDL vendor's
+# devigged price. Because there's no sharp validation, game bets get a higher
+# edge bar and a Kelly haircut, and require confirmed starting pitchers.
+GAME_MARKETS_ENABLED = os.getenv("GAME_MARKETS_ENABLED", "false").lower() in ("1", "true", "yes")
+# Minimum model-vs-book edge (in %) to flag a game-market bet. Higher than the
+# prop bar (EDGE_MIN) because there's no sharp anchor to validate the model.
+GAME_EDGE_MIN = float(os.getenv("GAME_EDGE_MIN", "3.5"))
+# Effective Kelly = KELLY_FRACTION * this. Halved by default: a model-driven
+# edge with no sharp confirmation deserves a smaller stake.
+GAME_KELLY_FRACTION_MULT = float(os.getenv("GAME_KELLY_FRACTION_MULT", "0.5"))
+GAME_MAX_BETS_PER_GAME = int(os.getenv("GAME_MAX_BETS_PER_GAME", "2"))
+# Standard MLB run line.
+RUN_LINE_VALUE = float(os.getenv("RUN_LINE_VALUE", "1.5"))
+# Guard: the model's per-team expected runs (lambda) may deviate from the book's
+# implied team total by at most this many runs. Keeps a broken projection from
+# manufacturing a huge phantom edge against the market.
+GAME_LAMBDA_GUARD_RUNS = float(os.getenv("GAME_LAMBDA_GUARD_RUNS", "1.5"))
+# Home team's share of the extra-innings (tie) probability mass. MLB home teams
+# win ~52% of games that reach a tie at the end of 9.
+GAME_HOME_TIE_SPLIT = float(os.getenv("GAME_HOME_TIE_SPLIT", "0.52"))
+# Require both probable starters confirmed before projecting a game (the run
+# model leans heavily on starter quality). Off => fall back to team-only lambda.
+GAME_REQUIRE_CONFIRMED_STARTERS = os.getenv("GAME_REQUIRE_CONFIRMED_STARTERS", "true").lower() in ("1", "true", "yes")
+# send_game_alerts only consumes game_bet_candidates younger than this.
+GAME_CANDIDATE_MAX_AGE_MINUTES = int(os.getenv("GAME_CANDIDATE_MAX_AGE_MINUTES", "15"))
+
 # Fail fast at import time if critical keys are missing rather than crashing
 # deep inside an HTTP call with a confusing error.
 _REQUIRED_ENV_VARS = ["ODDS_API_KEY", "BDL_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]

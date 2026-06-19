@@ -20,6 +20,8 @@ Modular pipeline architecture mirroring the NBA prop bot pattern:
 - `python main.py scan` - Scan live odds and find edges
 - `python main.py run` - Full pipeline (sync + scan + alerts)
 - `python main.py settle` - Post-game settlement with CLV tracking
+- `python main.py sgp` - Find/alert same-game parlays (correlated legs, one game)
+- `python main.py parlay` - Find/alert cross-game 2/4/8-leg parlays (independent legs)
 - `python main.py ask "<question>"` - LLM research agent over the BDL data
 - `python main.py enrich` - LLM-normalize injury reports into availability signals
 - `python main.py reconcile` - LLM-resolve unmatched prop player names

@@ -139,6 +139,7 @@ async def _dispatch(command: str) -> None:
     from src.pipelines.scan_props import scan_props
     from src.pipelines.send_alerts import send_alerts
     from src.pipelines.find_sgp import find_and_alert_sgps
+    from src.pipelines.find_parlays import find_and_alert_parlays
     from src.pipelines.trigger_watch import run_trigger_watch
     from src.pipelines.settle_results import settle_results
 
@@ -154,6 +155,12 @@ async def _dispatch(command: str) -> None:
         await scan_props(force=False)
         await send_alerts()
         await find_and_alert_sgps()
+        await find_and_alert_parlays()
+        # Game markets (no-op unless GAME_MARKETS_ENABLED).
+        from src.pipelines.scan_game_markets import scan_game_markets
+        from src.pipelines.send_game_alerts import send_game_alerts
+        await scan_game_markets()
+        await send_game_alerts()
     elif command == "trigger":
         await run_trigger_watch()
     elif command == "settle":

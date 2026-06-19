@@ -62,11 +62,22 @@ async def enrich_injuries(client: OpenRouterClient = None) -> dict:
                FROM injury_reports ir WHERE ir.date = ?""",
             (today,),
         ).fetchall()]
+        existing = {
+            r["player_id"]: r["source_status"]
+            for r in conn.execute(
+                "SELECT player_id, source_status FROM player_injury_signals WHERE date = ?",
+                (today,),
+            ).fetchall()
+        }
 
     enriched = 0
+    skipped = 0
     for r in rows:
         if r["player_id"] is None:
             continue  # can't key a signal without a player_id
+        if existing.get(r["player_id"]) == r["status"]:
+            skipped += 1
+            continue  # already enriched this status today
         signal = await client.complete_json(
             _SYSTEM, _build_prompt(r["player_name"], r["status"], r["injury_type"]),
         )
@@ -104,8 +115,8 @@ async def enrich_injuries(client: OpenRouterClient = None) -> dict:
             conn.commit()
         enriched += 1
 
-    logger.info("Injury enrichment complete: %d signals written for %s.", enriched, today)
-    return {"enriched": enriched, "date": today}
+    logger.info("Injury enrichment complete: %d signals written, %d skipped for %s.", enriched, skipped, today)
+    return {"enriched": enriched, "skipped": skipped, "date": today}
 
 
 def get_injury_signal(conn, player_id: int, date: str) -> dict | None:

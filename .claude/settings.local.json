@@ -5,7 +5,27 @@
       "Read(//c/Users/louis/.gemini/**)",
       "Bash(pip install:*)",
       "Bash(python -m pytest tests/ -v)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(python -m pytest tests/test_send_alerts.py tests/test_send_alerts_correlation.py tests/test_db_errors.py tests/test_settle_results.py tests/test_settle_clv_sharp.py tests/test_bet_filters.py tests/test_best_line.py tests/test_sharp_shop.py tests/test_find_sgp.py -q)",
+      "Bash(python -m pytest tests/test_altline_truth_and_wind.py -q)",
+      "Bash(python -m pytest tests/test_altline_truth_and_wind.py tests/test_scan_props.py tests/test_weather.py -q)",
+      "Bash(python -m pytest tests/ -q --ignore=tests/integration)",
+      "Bash(SHARP_MODEL_AGREEMENT_TOL=0.05 MIN_ODDS=1.70 MIN_MODEL_PROB=0.55 PREGAME_WINDOW_MINUTES=120 EDGE_MIN=5.0 python -m pytest tests/test_line_shopping.py tests/test_scan_gate.py tests/test_bet_filters.py tests/test_audit_fixes.py -q)",
+      "Bash(git stash *)",
+      "Bash(python -m pytest tests/test_send_alerts.py::test_send_alerts_paper_exchange_records_filled_order)",
+      "Bash(python -m pytest tests/test_projections.py tests/test_enrich_injuries.py tests/test_settle_results.py tests/test_settle_clv_sharp.py tests/test_crash_alert.py tests/test_weather.py tests/test_scan_props.py -q)",
+      "Bash(python -m pytest tests/ -q --ignore=tests/integration -p no:randomly)",
+      "Bash(SHARP_MODEL_AGREEMENT_TOL=0.05 MIN_ODDS=1.70 MIN_MODEL_PROB=0.55 PREGAME_WINDOW_MINUTES=120 EDGE_MIN=5.0 python -m pytest tests/test_bet_filters.py tests/test_line_shopping.py tests/test_scan_gate.py tests/test_projections.py tests/test_enrich_injuries.py tests/test_settle_results.py tests/test_altline_truth_and_wind.py -q)",
+      "Bash(python -m pytest tests/test_scan_props.py tests/test_line_shopping.py tests/test_settle_results.py tests/test_send_alerts.py tests/test_send_alerts_correlation.py tests/test_projections.py tests/test_enrich_injuries.py tests/test_find_sgp.py tests/test_altline_truth_and_wind.py -q)",
+      "Bash(SHARP_MODEL_AGREEMENT_TOL=0.05 MIN_ODDS=1.70 MIN_MODEL_PROB=0.55 PREGAME_WINDOW_MINUTES=120 EDGE_MIN=5.0 python -m pytest tests/test_line_shopping.py tests/test_scan_props.py tests/test_settle_results.py tests/test_send_alerts.py -q)",
+      "Bash(python -m pytest tests/test_p2_postponement_output.py -q)",
+      "Bash(git commit *)",
+      "Bash(python -m pytest tests/test_game_model.py -q)",
+      "Bash(python -c ' *)",
+      "Bash(python -m pytest tests/test_game_markets.py tests/test_game_model.py -q)",
+      "Bash(python -m pytest tests/test_game_markets.py -q)",
+      "Bash(python main.py --help)",
+      "Bash(echo \"exit: $?\")"
     ]
   }
 }

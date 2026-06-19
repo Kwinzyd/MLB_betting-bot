@@ -227,6 +227,13 @@ async def sync_stats():
         if g.get('id') is not None and g.get('status') in _COMPLETED_STATUSES
     ]
     if completed_bdl_ids:
+        # Final scores, needed to settle game markets (moneyline/total/run line).
+        # BDL games payload carries home_team_score / visitor_team_score.
+        scores_by_bdl = {
+            g['id']: (g.get('home_team_score'), g.get('visitor_team_score'))
+            for g in all_recent_games
+            if g.get('id') in set(completed_bdl_ids)
+        }
         with get_db_connection() as conn:
             placeholders = ",".join("?" for _ in completed_bdl_ids)
             cur = conn.execute(
@@ -234,6 +241,13 @@ async def sync_stats():
                 f"WHERE bdl_game_id IN ({placeholders}) AND status != 'COMPLETED'",
                 completed_bdl_ids,
             )
+            for bdl_id, (hs, vs) in scores_by_bdl.items():
+                if hs is None or vs is None:
+                    continue
+                conn.execute(
+                    "UPDATE games SET home_score=?, away_score=? WHERE bdl_game_id=?",
+                    (int(hs), int(vs), bdl_id),
+                )
             conn.commit()
         if cur.rowcount:
             logger.info(f"Marked {cur.rowcount} finished games COMPLETED.")

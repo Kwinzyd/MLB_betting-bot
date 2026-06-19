@@ -84,6 +84,38 @@ class TelegramVenue(ExecutionVenue):
         }
 
 
+def format_game_alert_message(label, market, side, line, odds, vendor, edge,
+                              projection, home_team, away_team):
+    """Format a game-market (ML/total/run-line) Telegram alert.
+
+    Game markets are model-driven off soft BDL odds (no sharp anchor), so the
+    message says so and shows the projected score behind the pick.
+    """
+    if odds >= 2.0:
+        american = f"+{int((odds - 1) * 100)}"
+    else:
+        american = f"-{int(100 / (odds - 1))}"
+    market_display = {
+        "moneyline": "Moneyline", "game_total": "Game Total", "run_line": "Run Line",
+    }.get(market, market.replace('_', ' ').title())
+    lam_home = projection.get('lam_home')
+    lam_away = projection.get('lam_away')
+    msg = (
+        f"<b>MLB GAME ALERT</b>\n"
+        f"{'=' * 30}\n"
+        f"<b>{label}</b> — {market_display}\n"
+        f"Book: {str(vendor).title()} @ {odds:.2f} ({american})\n"
+        f"Edge: <b>{edge['edge_pct']:.1f}%</b> | EV: {edge['ev']:+.3f}\n"
+        f"Model: {edge['model_prob']:.1%} | Book: {edge['book_implied']:.1%}\n"
+        f"Kelly Stake: <b>${edge['kelly']['recommended_stake']:.2f}</b>\n\n"
+        f"Matchup: {away_team} @ {home_team}\n"
+    )
+    if lam_home is not None and lam_away is not None:
+        msg += f"Projected score: {away_team} {lam_away:.1f} – {lam_home:.1f} {home_team}\n"
+    msg += "\n<i>⚠️ model-driven (BDL soft odds, no sharp anchor) — lower confidence</i>"
+    return msg
+
+
 def _format_projection(market: str, mean, context: dict) -> str:
     """'6.42 ± 1.85 (n=24)' — point estimate, ±1σ band, and sample size.
 

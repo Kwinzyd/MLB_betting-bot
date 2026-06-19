@@ -8,13 +8,14 @@ logger = get_logger(__name__)
 
 
 def get_current_bankroll() -> float:
-    """Starting bankroll plus cumulative settled P&L (singles + SGPs).
+    """Starting bankroll plus cumulative settled P&L (singles + SGPs + parlays).
 
     `bet_results.profit` is the per-bet ledger written by settle_results;
-    `sgp_results.profit` is the parlay ledger. Summing both gives net realized
-    P&L since inception. Adding the configured starting bankroll yields the
-    amount Kelly should size against today, floored at 0 so a deep drawdown
-    can never produce negative stakes.
+    `sgp_results.profit` is the same-game parlay ledger and `parlay_results.profit`
+    the cross-game parlay ledger. Summing all three gives net realized P&L since
+    inception. Adding the configured starting bankroll yields the amount Kelly
+    should size against today, floored at 0 so a deep drawdown can never produce
+    negative stakes.
 
     Falls back to the static `BANKROLL` on any DB error (fresh install, table
     missing, file locked) so the pipeline never sizes against zero.
@@ -25,13 +26,15 @@ def get_current_bankroll() -> float:
                 "SELECT COALESCE(SUM(profit), 0.0) AS total FROM bet_results"
             ).fetchone()
             settled_pnl = float(row['total'] or 0.0) if row else 0.0
-            try:
-                sgp_row = conn.execute(
-                    "SELECT COALESCE(SUM(profit), 0.0) AS total FROM sgp_results"
-                ).fetchone()
-                settled_pnl += float(sgp_row['total'] or 0.0) if sgp_row else 0.0
-            except sqlite3.Error:
-                pass  # sgp_results may not exist on old DBs
+            # Parlay ledgers may not exist on old DBs; tolerate each independently.
+            for table in ("sgp_results", "parlay_results"):
+                try:
+                    prow = conn.execute(
+                        f"SELECT COALESCE(SUM(profit), 0.0) AS total FROM {table}"
+                    ).fetchone()
+                    settled_pnl += float(prow['total'] or 0.0) if prow else 0.0
+                except sqlite3.Error:
+                    pass
         return max(0.0, BANKROLL + settled_pnl)
     except sqlite3.Error as e:
         logger.debug(

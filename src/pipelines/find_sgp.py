@@ -305,7 +305,7 @@ async def _persist_and_alert(candidates):
         for c in candidates:
             legs_json = json.dumps(c['legs'])
             books = ','.join(sorted({leg['bookmaker'] for leg in c['legs']}))
-            conn.execute('''
+            cur = conn.execute('''
                 INSERT INTO sgp_candidates
                 (game_id, legs_json, joint_prob, naive_parlay_odds,
                  fair_odds, edge_vs_naive, kelly_stake, bookmakers, timestamp)
@@ -316,16 +316,19 @@ async def _persist_and_alert(candidates):
                 c['naive_parlay_odds'], c['fair_odds'], c['edge_vs_naive'],
                 c.get('kelly_stake'), books, utcnow().isoformat(),
             ))
-            try:
-                await bot.send_message(_format_sgp_message(c))
-                logger.info(
-                    f"SGP alerted: {c['matchup']} | "
-                    f"joint {c['joint_prob']:.3f} | "
-                    f"fair {c['fair_odds']:.2f} vs naive {c['naive_parlay_odds']:.2f} | "
-                    f"edge {c['edge_vs_naive']*100:.1f}%"
-                )
-            except Exception as e:
-                logger.error(f"Failed to send SGP alert: {e}")
+            if cur.rowcount > 0:
+                try:
+                    await bot.send_message(_format_sgp_message(c))
+                    logger.info(
+                        f"SGP alerted: {c['matchup']} | "
+                        f"joint {c['joint_prob']:.3f} | "
+                        f"fair {c['fair_odds']:.2f} vs naive {c['naive_parlay_odds']:.2f} | "
+                        f"edge {c['edge_vs_naive']*100:.1f}%"
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send SGP alert: {e}")
+            else:
+                logger.debug(f"SGP skipped (already alerted): {c['matchup']}")
         conn.commit()
 
 

@@ -7,7 +7,10 @@ from src.pipelines.sync_injuries import sync_injuries
 from src.pipelines.sync_stats import sync_stats
 from src.pipelines.scan_props import scan_props
 from src.pipelines.send_alerts import send_alerts
+from src.pipelines.scan_game_markets import scan_game_markets
+from src.pipelines.send_game_alerts import send_game_alerts
 from src.pipelines.find_sgp import find_and_alert_sgps
+from src.pipelines.find_parlays import find_and_alert_parlays
 from src.pipelines.trigger_watch import run_trigger_watch
 from src.pipelines.sync_lineups import sync_lineups
 from src.pipelines.sync_umpires import sync_umpires
@@ -35,6 +38,10 @@ def main():
     run_parser.add_argument('--force', action='store_true',
                             help="Bypass the quota gate and scan every active game")
 
+    # scan-games (game markets: moneyline / total / run line, off BDL odds)
+    subparsers.add_parser('scan-games',
+                          help="Scan game markets (moneyline/total/run line) and alert")
+
     # settle, prune, sgp, trigger, fit-dispersion
     subparsers.add_parser('settle', help="Sync stats and settle completed bets")
     subparsers.add_parser('prune', help="Prune old database records")
@@ -45,6 +52,7 @@ def main():
                                help="Also restore missing historical games rows from BDL "
                                     "/games (no stats calls) before the date backfill")
     subparsers.add_parser('sgp', help="Find and alert Same Game Parlays (SGPs)")
+    subparsers.add_parser('parlay', help="Find and alert cross-game 2/4/8-leg parlays")
     subparsers.add_parser('trigger', help="Run trigger watch for weather and umpires")
     subparsers.add_parser('fit-dispersion', help="Fit dispersion models for projections")
     subparsers.add_parser('enrich', help="LLM-normalize today's injury reports into availability signals")
@@ -162,10 +170,23 @@ def main():
             asyncio.run(scan_props(force=args.force))
             asyncio.run(send_alerts())
             asyncio.run(find_and_alert_sgps())
+            asyncio.run(find_and_alert_parlays())
+            # Game markets (no-op unless GAME_MARKETS_ENABLED).
+            asyncio.run(scan_game_markets())
+            asyncio.run(send_game_alerts())
+
+        elif args.command == 'scan-games':
+            logger.info("Running SCAN-GAMES mode (moneyline / total / run line)...")
+            asyncio.run(scan_game_markets())
+            asyncio.run(send_game_alerts())
 
         elif args.command == 'sgp':
             logger.info("Running SGP mode...")
             asyncio.run(find_and_alert_sgps())
+
+        elif args.command == 'parlay':
+            logger.info("Running PARLAY mode...")
+            asyncio.run(find_and_alert_parlays())
 
         elif args.command == 'trigger':
             logger.info("Running TRIGGER WATCH mode...")

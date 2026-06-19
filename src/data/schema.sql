@@ -228,6 +228,32 @@ CREATE TABLE IF NOT EXISTS bet_candidates (
 );
 CREATE INDEX IF NOT EXISTS idx_bet_candidates_created ON bet_candidates(created_at);
 
+-- Game-market (moneyline / total / run line) scan output. Parallel to
+-- bet_candidates but team-level and model-driven (no sharp anchor): the edge is
+-- the team run model probability vs the best BDL vendor's devigged price. Picked
+-- up by send_game_alerts, which records winners into the shared alerts_sent
+-- ledger so game P&L flows through the same bankroll + circuit breakers.
+CREATE TABLE IF NOT EXISTS game_bet_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    game_id TEXT NOT NULL,
+    market TEXT NOT NULL,          -- moneyline | game_total | run_line
+    side TEXT NOT NULL,            -- home | away | over | under
+    line REAL NOT NULL,            -- 0 for ML, total line, or signed run line (±1.5)
+    vendor TEXT NOT NULL,          -- BDL vendor offering the best price
+    odds REAL NOT NULL,            -- decimal odds of the bet
+    model_prob REAL,               -- team-model probability for this side
+    book_implied REAL,             -- devigged (or -110-assumed) book probability
+    edge_pct REAL,
+    ev REAL,
+    kelly_fraction REAL,
+    recommended_stake REAL,
+    lam_home REAL,                 -- projected home runs (audit trail)
+    lam_away REAL,
+    created_at TEXT NOT NULL,
+    UNIQUE(game_id, market, side)
+);
+CREATE INDEX IF NOT EXISTS idx_game_bet_candidates_created ON game_bet_candidates(created_at);
+
 CREATE TABLE IF NOT EXISTS orders (
     order_id INTEGER PRIMARY KEY AUTOINCREMENT,
     venue TEXT NOT NULL,
