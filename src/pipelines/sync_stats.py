@@ -33,7 +33,7 @@ def _upsert_teams(conn, teams):
         ''', (
             team.get('id'),
             team.get('abbreviation', ''),
-            team.get('full_name', ''),
+            team.get('display_name', ''),
             team.get('league', ''),
             team.get('division', ''),
         ))
