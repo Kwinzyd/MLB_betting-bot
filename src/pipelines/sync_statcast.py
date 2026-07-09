@@ -109,10 +109,20 @@ async def sync_statcast(season: int = None) -> None:
     )
 
     # Derive platoon splits from game logs (no additional API call required).
+    # This is a proxy — it credits every PA in a game to that game's starter.
     with get_db_connection() as conn:
         split_count = _compute_and_upsert_platoon_splits(conn, season)
         conn.commit()
-    logger.info("sync_statcast: upserted %d batter platoon split rows", split_count)
+    logger.info("sync_statcast: upserted %d batter platoon split rows (log proxy)", split_count)
+
+    # Overwrite with BDL's official vs-LHP/RHP splits where available (each PA
+    # attributed to the actual pitcher hand, full season). Fail-safe: on any
+    # failure the log-derived proxy above stands.
+    try:
+        bdl_count = await sync_bdl_platoon_splits(season)
+        logger.info("sync_statcast: refined %d split rows from BDL official splits", bdl_count)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("sync_statcast: BDL official splits step failed (proxy retained): %s", e)
 
 
 _SPLIT_MARKETS = {
@@ -191,6 +201,118 @@ def _compute_and_upsert_platoon_splits(conn: Any, season: int) -> int:
             count += 1
 
     return count
+
+
+# ---------------------------------------------------------------------------
+# BDL official platoon splits (authoritative; overwrites the log-derived proxy)
+# ---------------------------------------------------------------------------
+
+# byBreakdown split_name -> pitcher hand faced.
+_BDL_HAND_SPLITS = {"vs. Left": "L", "vs. Right": "R"}
+
+
+def _rates_from_split_row(row: dict) -> Optional[dict]:
+    """Per-PA hits/HR/TB rates and PA count from one BDL split stat line.
+
+    PA ≈ AB + BB + HBP (sac flies/bunts aren't in the splits payload; this
+    matches the intent of the log-derived denominator, which uses PA-or-AB).
+    TB = singles + 2·2B + 3·3B + 4·HR = H + 2B + 2·3B + 3·HR.
+    Returns None when there are no plate appearances to rate.
+    """
+    ab = int(row.get("at_bats") or 0)
+    bb = int(row.get("walks") or 0)
+    hbp = int(row.get("hit_by_pitch") or 0)
+    pa = ab + bb + hbp
+    if pa <= 0:
+        return None
+    h = int(row.get("hits") or 0)
+    d2 = int(row.get("doubles") or 0)
+    d3 = int(row.get("triples") or 0)
+    hr = int(row.get("home_runs") or 0)
+    tb = h + d2 + (2 * d3) + (3 * hr)
+    return {
+        "n_pa": pa,
+        "batter_hits": h / pa,
+        "batter_home_runs": hr / pa,
+        "batter_total_bases": tb / pa,
+    }
+
+
+def _parse_bdl_platoon_splits(splits_data: dict) -> dict:
+    """Extract vs-LHP/RHP per-PA rates from a /players/splits payload.
+
+    Returns {vs_hand: {market: rate, 'n_pa': n}} for whichever of L/R the
+    player has plate appearances against. Empty dict when the handedness
+    breakdown is absent (e.g. pitchers, or players with no PAs).
+    """
+    out: dict = {}
+    for row in (splits_data or {}).get("byBreakdown", []) or []:
+        hand = _BDL_HAND_SPLITS.get(row.get("split_name"))
+        if not hand:
+            continue
+        rates = _rates_from_split_row(row)
+        if rates:
+            out[hand] = rates
+    return out
+
+
+async def sync_bdl_platoon_splits(season: int, player_ids=None, client=None) -> int:
+    """Fetch official BDL vs-LHP/RHP splits and upsert into batter_platoon_splits.
+
+    Authoritative source: each PA is attributed to the actual pitcher hand
+    faced, over the full season — unlike the log-derived proxy which credits
+    every PA in a game to that game's starter. Runs after the proxy so it
+    overwrites the same (player, season, hand, market) rows where BDL has data;
+    players BDL doesn't cover keep the proxy value.
+
+    Scope: `player_ids` (defaults to every batter with a game log this season).
+    One API call per player — fine on the Goat tier's 600 req/min, cached 6h.
+    Fail-safe: a per-player error is logged and skipped, never aborts the batch.
+    """
+    from src.clients.mlb_stats import MLBStatsClient
+    client = client or MLBStatsClient()
+    now = get_utc_now_iso()
+
+    if player_ids is None:
+        with get_db_connection() as conn:
+            rows = conn.execute(
+                """SELECT DISTINCT bgl.player_id
+                   FROM batter_game_logs bgl
+                   WHERE bgl.date LIKE ?""",
+                (f"{season}-%",),
+            ).fetchall()
+        player_ids = [r["player_id"] for r in rows]
+
+    if not player_ids:
+        return 0
+
+    upserted = 0
+    with get_db_connection() as conn:
+        for pid in player_ids:
+            try:
+                data = await client.get_player_splits(pid, season)
+            except Exception as e:  # noqa: BLE001 — one bad player must not abort the batch
+                logger.debug("BDL splits fetch failed for player %s: %s", pid, e)
+                continue
+            by_hand = _parse_bdl_platoon_splits(data)
+            for vs_hand, rates in by_hand.items():
+                n_pa = rates["n_pa"]
+                for market in ("batter_hits", "batter_home_runs", "batter_total_bases"):
+                    conn.execute(
+                        """INSERT INTO batter_platoon_splits
+                           (player_id, season, vs_hand, market, rate_per_pa, n_pa, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(player_id, season, vs_hand, market) DO UPDATE SET
+                               rate_per_pa = excluded.rate_per_pa,
+                               n_pa        = excluded.n_pa,
+                               updated_at  = excluded.updated_at""",
+                        (pid, season, vs_hand, market, round(rates[market], 6), n_pa, now),
+                    )
+                    upserted += 1
+        conn.commit()
+
+    logger.info("sync_bdl_platoon_splits: upserted %d rows from BDL official splits", upserted)
+    return upserted
 
 
 def _upsert_pitcher_stats(

@@ -231,10 +231,10 @@ class MLBStatsClient:
     async def get_odds(self, game_ids=None, dates=None):
         """Fetch BDL game-level betting odds (moneyline / run line / total).
 
-        BDL provides GAME odds only (no player props), across several books.
         Used as a free, unlimited backup/supplement for the game total and as
         the moneyline source for implied-team-total tilting. One of game_ids or
-        dates is required by the API.
+        dates is required by the API. Player props live on a separate endpoint
+        (see get_player_props).
         """
         params = {}
         if game_ids is not None:
@@ -245,6 +245,103 @@ class MLBStatsClient:
             return []
         cache_key = f"bdl_mlb_odds_{game_ids}_{dates}"
         return await self._get("odds", params=params, cache_key=cache_key, cache_ttl=300)
+
+    async def get_player_props(self, game_id, bust_cache=False):
+        """Fetch live player-prop odds for one game from /odds/player_props.
+
+        Returns raw prop records: {game_id, player_id, vendor, prop_type,
+        line_value, market: {type, over_odds, under_odds, odds}, updated_at}.
+        Vendors are US soft books (draftkings, fanduel, betmgm, betrivers,
+        caesars, fanatics). The endpoint returns everything in one response
+        (no pagination) and only carries props while books quote them — near
+        game end it may be empty. Cached 5 min to match the odds TTL.
+        """
+        if not game_id:
+            return []
+        cache_key = f"bdl_mlb_player_props_{game_id}"
+        if bust_cache:
+            cache.delete(cache_key)
+        return await self._get(
+            "odds/player_props",
+            params={"game_id": game_id},
+            cache_key=cache_key,
+            cache_ttl=300,
+        )
+
+    @async_bdl_circuit_breaker
+    async def get_player_splits(self, player_id, season=None):
+        """Fetch a player's season splits, grouped by split_category.
+
+        Unlike other endpoints, /players/splits returns `data` as an OBJECT
+        keyed by split_category ('split', 'byBreakdown', 'bySituation', ...),
+        not a list — so the generic paginated _get (which flattens list data)
+        can't be used. This does a single GET and returns the raw data dict.
+
+        The vs-LHP/RHP platoon rows live under 'byBreakdown' as split_name
+        'vs. Left' / 'vs. Right'. Returns {} on any error or empty payload.
+        """
+        if not player_id:
+            return {}
+        season = season or MLB_SEASON
+        cache_key = f"bdl_mlb_splits_{player_id}_{season}"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        await self.limiter.wait()
+        url = f"{self.base_url}/players/splits"
+        params = {"player_id": player_id, "season": season}
+        for attempt in range(6):
+            resp = await self.client.get(url, params=params)
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("Retry-After")
+                backoff = float(retry_after) if retry_after and retry_after.isdigit() else min(2 ** attempt * 5.0, 60.0)
+                logger.warning(f"🚨 Rate Limit (/players/splits). Waiting {backoff:.1f}s ({attempt+1}/6)...")
+                await asyncio.sleep(backoff)
+                continue
+            resp.raise_for_status()
+            break
+        else:
+            return {}
+
+        data = resp.json().get("data", {}) or {}
+        if data:
+            cache.set(cache_key, data, ttl_seconds=21600)  # 6h — season splits move slowly
+        return data
+
+    async def get_player_versus(self, player_id, opponent_team_id):
+        """Head-to-head batting line for a batter vs every pitcher on a team.
+
+        Returns one row per opposing pitcher: {opponent_player: {...}, at_bats,
+        hits, doubles, triples, home_runs, walks, strikeouts, avg, ...}. `data`
+        is a list, so the generic _get works. Cached 6h — career BvP lines only
+        change by one game's worth per day. Both params are required by the API.
+        """
+        if not player_id or not opponent_team_id:
+            return []
+        cache_key = f"bdl_mlb_versus_{player_id}_{opponent_team_id}"
+        return await self._get(
+            "players/versus",
+            params={"player_id": player_id, "opponent_team_id": opponent_team_id},
+            cache_key=cache_key, cache_ttl=21600,
+        )
+
+    async def get_pitch_type_season_stats(self, role, season=None):
+        """Bulk-fetch season pitch-type stats for all pitchers or hitters.
+
+        role: 'pitcher' or 'hitter' — selects the endpoint. Returns one row per
+        (player_id, pitch_type) with usage %, whiff/contact %, xwoba, and PA/K
+        counts. `data` is a list here, so the generic paginated _get works.
+        Cached 24h (season-level pitch mix moves slowly). Big-ish payload
+        (~thousands of rows), pulled once per nightly sync.
+        """
+        season = season or MLB_SEASON
+        endpoint = ("pitcher_pitch_type_season_stats" if role == "pitcher"
+                    else "hitter_pitch_type_season_stats")
+        cache_key = f"bdl_mlb_{endpoint}_{season}"
+        return await self._get(
+            endpoint, params={"season": season}, cache_key=cache_key, cache_ttl=86400
+        )
 
     async def get_season_averages(self, player_ids, season=None):
         """Fetch season averages for one or more players."""

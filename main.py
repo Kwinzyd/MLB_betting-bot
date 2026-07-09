@@ -126,6 +126,16 @@ def main():
         '--season', type=int, default=None,
         help="Season year to sync (default: current year)"
     )
+    pitchtypes_parser = subparsers.add_parser(
+        'sync-pitch-types', help="Sync BDL pitch-type season stats (arsenal matchup)"
+    )
+    pitchtypes_parser.add_argument(
+        '--season', type=int, default=None,
+        help="Season year to sync (default: current year)"
+    )
+    subparsers.add_parser(
+        'sync-bvp', help="Sync batter-vs-pitcher head-to-head for today's matchups"
+    )
     ask_parser = subparsers.add_parser(
         'ask', help="Ask the LLM research agent a natural-language question over the BDL data")
     ask_parser.add_argument('question', nargs='+', help="The question, e.g. ask how has Cole trended")
@@ -153,6 +163,10 @@ def main():
             sync_umpires()
             from src.pipelines.sync_statcast import sync_statcast
             asyncio.run(sync_statcast())
+            from src.pipelines.sync_pitch_types import sync_pitch_types
+            asyncio.run(sync_pitch_types())
+            from src.pipelines.sync_bvp import sync_bvp
+            asyncio.run(sync_bvp())
 
         elif args.command == 'scan':
             logger.info("Running SCAN mode...")
@@ -275,6 +289,17 @@ def main():
             season = args.season or datetime.now().year
             logger.info(f"Running STATCAST sync for season {season}...")
             asyncio.run(sync_statcast(season=season))
+
+        elif args.command == 'sync-pitch-types':
+            from src.pipelines.sync_pitch_types import sync_pitch_types
+            season = args.season or datetime.now().year
+            logger.info(f"Running PITCH-TYPE sync for season {season}...")
+            asyncio.run(sync_pitch_types(season=season))
+
+        elif args.command == 'sync-bvp':
+            from src.pipelines.sync_bvp import sync_bvp
+            logger.info("Running BvP sync for today's matchups...")
+            asyncio.run(sync_bvp())
 
         elif args.command == 'ask':
             from src.pipelines.research_agent import ask

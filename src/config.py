@@ -6,6 +6,7 @@ load_dotenv()
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")  # OpenWeatherMap (free tier)
 BDL_API_KEY = os.getenv("BDL_API_KEY")
+SPORTSDATAIO_API_KEY = os.getenv("SPORTSDATAIO_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -42,8 +43,16 @@ POLYMARKET_SECRET = os.getenv("POLYMARKET_SECRET")
 POLYMARKET_PASSPHRASE = os.getenv("POLYMARKET_PASSPHRASE")
 POLYMARKET_PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY")
 EDGE_MIN = float(os.getenv("EDGE_MIN", "5.0"))
+# Sanity ceiling on claimed edge (pct points). Settled-bet analysis (through
+# 2026-07-02) showed claimed edges of 15-42% won no more often than 5-10% ones:
+# a huge model-vs-book gap is model error, not free money. Skip, don't bet bigger.
+EDGE_MAX = float(os.getenv("EDGE_MAX", "15.0"))
 KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))
 BANKROLL = float(os.getenv("BANKROLL", "1000.0"))
+# Count settled SGP/parlay ticket P&L in the Kelly bankroll ledger. Off by
+# default: tickets are Telegram suggestions that may never have been placed,
+# and one paper longshot win can inflate the ledger by thousands.
+BANKROLL_INCLUDE_PARLAYS = os.getenv("BANKROLL_INCLUDE_PARLAYS", "false").lower() in ("1", "true", "yes")
 # Global kill switch. When False, send_alerts still computes edges and logs them
 # but skips Telegram delivery and does not record alerts_sent rows. Flip to True
 # only after a paper-trading validation window.
@@ -52,6 +61,11 @@ TELEGRAM_VENUE_ENABLED = os.getenv("TELEGRAM_VENUE_ENABLED", "true").lower() in 
 PAPER_EXCHANGE_ENABLED = os.getenv("PAPER_EXCHANGE_ENABLED", "false").lower() in ("1", "true", "yes")
 POLYMARKET_ENABLED = os.getenv("POLYMARKET_ENABLED", "false").lower() in ("1", "true", "yes")
 MIN_ODDS = float(os.getenv("MIN_ODDS", "1.70"))
+# Longshot cap. Settled bets through 2026-07-02: odds < 2.0 were +$123 while
+# odds >= 2.0 were -$226 (overs at plus money were the single biggest leak).
+# The Poisson/NB tails are overconfident on longshots; cap until calibration
+# proves otherwise.
+MAX_ODDS = float(os.getenv("MAX_ODDS", "2.20"))
 MIN_MODEL_PROB = float(os.getenv("MIN_MODEL_PROB", "0.55"))
 MIN_SAMPLE_SIZE = int(os.getenv("MIN_SAMPLE_SIZE", "10"))
 MAX_BETS_PER_GAME = int(os.getenv("MAX_BETS_PER_GAME", "3"))
@@ -117,6 +131,14 @@ TRIGGER_TOTAL_MIN_HISTORY_MINUTES = int(os.getenv("TRIGGER_TOTAL_MIN_HISTORY_MIN
 # tails are well-behaved.
 ALT_LINE_MAX_DISTANCE = float(os.getenv("ALT_LINE_MAX_DISTANCE", "1.0"))
 
+# Weight given to the books' own devigged consensus at an alt-line when forming
+# the truth probability there (the remainder comes from the sharp anchor shifted
+# along the model CDF — see _shift_anchor_truth). Settled-bet calibration showed
+# the model's tail shape is its weakest part, and alt-line tails are exactly
+# where it priced the losing longshot overs. 0.0 = trust the shifted anchor
+# fully (old behavior); 1.0 = trust the quoted market fully (no alt-line edges).
+ALT_LINE_MARKET_SHRINK = float(os.getenv("ALT_LINE_MARKET_SHRINK", "0.7"))
+
 # send_alerts only consumes bet_candidates younger than this. Candidates are
 # written by scan_props; anything older reflects odds that have likely moved.
 ALERT_CANDIDATE_MAX_AGE_MINUTES = int(os.getenv("ALERT_CANDIDATE_MAX_AGE_MINUTES", "15"))
@@ -174,6 +196,60 @@ DISPERSION_MIN_OBS = int(os.getenv("DISPERSION_MIN_OBS", "10"))
 DISPERSION_PRIOR_K = int(os.getenv("DISPERSION_PRIOR_K", "30"))
 DISPERSION_ALPHA_CAP = float(os.getenv("DISPERSION_ALPHA_CAP", "2.0"))
 
+# Model-Only Mode: When True, bypasses the sharp-book validation requirement.
+# Treats the model projection as absolute truth and computes edges against the quoted lines.
+# Default OFF: settled-bet calibration (model 0.4 → 16.7% realized, 0.8 → 63.2%)
+# shows the model cannot be its own truth source. Only enable if no sharp-book
+# odds source is available, and expect overstated edges.
+MODEL_AS_TRUTH_MODE = os.getenv("MODEL_AS_TRUTH_MODE", "false").lower() in ("1", "true", "yes")
+MODEL_ONLY_KELLY_MULT = float(os.getenv("MODEL_ONLY_KELLY_MULT", "0.5"))
+
+# Pitch-type arsenal matchup multiplier (pitch_matchup.py). Applied as a bounded
+# post-model adjustment to the projected mean — pitcher K vs the opposing
+# lineup's per-pitch whiff, and batters vs the starter's arsenal (weighted xwoba).
+# It is NOT a GLM feature: training has no per-game opposing-pitcher identity, so
+# a matchup feature would be constant in train / variable at serve (skew). The
+# factor isolates the matchup DEVIATION from each player's own baseline, so it
+# doesn't double-count overall skill the model already prices.
+PITCH_MATCHUP_ENABLED = os.getenv("PITCH_MATCHUP_ENABLED", "true").lower() in ("1", "true", "yes")
+# Sensitivity exponent (<1 dampens): factor = clamp((matchup/baseline)**sens, lo, hi).
+PITCH_MATCHUP_SENS = float(os.getenv("PITCH_MATCHUP_SENS", "0.5"))
+PITCH_MATCHUP_MIN = float(os.getenv("PITCH_MATCHUP_MIN", "0.90"))
+PITCH_MATCHUP_MAX = float(os.getenv("PITCH_MATCHUP_MAX", "1.10"))
+# Per-pitch sample floor: ignore a pitch type whose count is below this (noisy).
+PITCH_MATCHUP_MIN_PITCHES = int(os.getenv("PITCH_MATCHUP_MIN_PITCHES", "20"))
+# Minimum share of the pitcher's arsenal (by usage) that must have opponent data
+# for the factor to be trusted; below this the matchup returns neutral 1.0.
+PITCH_MATCHUP_MIN_COVERAGE = float(os.getenv("PITCH_MATCHUP_MIN_COVERAGE", "0.5"))
+
+# Batter-vs-pitcher head-to-head multiplier (bvp.py). BvP is a notoriously weak,
+# small-sample signal, so it is heavily shrunk toward the batter's own baseline
+# (BVP_PRIOR_PA pseudo-PA) and tightly bounded. Default ON but conservative; set
+# BVP_ENABLED=false to disable. It partially overlaps the pitch-type arsenal
+# factor (both describe this batter vs this pitcher), which is why the bounds
+# here are tighter than the arsenal factor's.
+BVP_ENABLED = os.getenv("BVP_ENABLED", "true").lower() in ("1", "true", "yes")
+BVP_PRIOR_PA = float(os.getenv("BVP_PRIOR_PA", "40"))   # shrinkage strength (pseudo-PA)
+BVP_MIN_AB = int(os.getenv("BVP_MIN_AB", "10"))          # below this sample, stay neutral
+BVP_MIN = float(os.getenv("BVP_MIN", "0.95"))
+BVP_MAX = float(os.getenv("BVP_MAX", "1.05"))
+
+# SportsDataIO consensus player props. Merged into the scan as an extra book
+# keyed 'sportsdataio'. Requires SPORTSDATAIO_API_KEY; auto-disabled without one.
+SPORTSDATAIO_ENABLED = (
+    bool(SPORTSDATAIO_API_KEY)
+    and os.getenv("SPORTSDATAIO_ENABLED", "true").lower() in ("1", "true", "yes")
+)
+# Use SDIO's devigged consensus as a FALLBACK truth anchor for a (player, market)
+# only when no true sharp book (Pinnacle/Circa) quotes it — the Odds API rarely
+# carries sharp MLB player props, so this recovers props that would otherwise be
+# skipped. Consensus is softer than a true sharp line, so consensus-anchored bets
+# are tagged edge_source='sportsdataio_consensus'. Set false to require a real
+# sharp anchor always.
+SPORTSDATAIO_ANCHOR_FALLBACK = os.getenv(
+    "SPORTSDATAIO_ANCHOR_FALLBACK", "true"
+).lower() in ("1", "true", "yes")
+
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 DB_PATH = os.getenv("DB_PATH", "data.db")
 
@@ -221,6 +297,16 @@ MARKETS_MAPPING = {
     "batter_home_runs": "batter_home_runs",
     "pitcher_earned_runs": "pitcher_earned_runs",
 }
+
+# Market+side combinations to never bet on.
+# Populated from diagnostic analysis. Format: (market, side) tuples.
+MARKET_SIDE_BLACKLIST = [
+    # pitcher_strikeouts OVERs: 5 bets, 40% win, -$102.05. Disabled 2026-06-28.
+    # Kept until post-calibration data clears it; K projections graded biased high.
+    ("pitcher_strikeouts", "over"),
+    # batter_home_runs OVER ban removed 2026-07-06: n=2 is noise, and the real
+    # longshot leak is now handled structurally by MAX_ODDS.
+]
 
 # League average constants for adjustment calculations
 LEAGUE_AVG_K_RATE = 0.225       # ~22.5% strikeout rate

@@ -1,10 +1,18 @@
-"""Consensus game-level odds from BallDontLie (free, unlimited on Goat tier).
+"""Betting odds from BallDontLie (free, unlimited on Goat tier).
 
-BDL has GAME odds only — moneyline, run line, and total — across several books;
-it has NO player props. This module condenses the per-vendor rows into one
-consensus quote per game, used to (a) back up the game total when the Odds API
-is unavailable and (b) supply moneylines for moneyline-tilted implied team
-totals in PA scaling. It never sources player-prop prices.
+Two feeds:
+
+1. GAME odds (/odds) — moneyline, run line, total — condensed into one
+   consensus quote per game, used to (a) back up the game total when the Odds
+   API is unavailable and (b) supply moneylines for moneyline-tilted implied
+   team totals in PA scaling.
+
+2. PLAYER PROP odds (/odds/player_props) — live over/under quotes from six US
+   soft books (draftkings, fanduel, betmgm, betrivers, caesars, fanatics).
+   get_player_prop_odds() translates them into the Odds API event-odds shape
+   so scan_props can merge them into its line shop. Vendor keys are prefixed
+   'bdl_' to keep the two feeds attributable and collision-free; none of them
+   are sharp books, so the sharp anchor still comes from the Odds API.
 """
 from __future__ import annotations
 
@@ -16,6 +24,20 @@ from src.models.devig import devig_multiplicative
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
+# BDL prop_type -> our market key (only markets the model prices).
+PROP_TYPE_TO_MARKET = {
+    "hits": "batter_hits",
+    "home_runs": "batter_home_runs",
+    "total_bases": "batter_total_bases",
+    "pitcher_strikeouts": "pitcher_strikeouts",
+    "pitcher_earned_runs": "pitcher_earned_runs",
+}
+
+# Prefix for BDL-sourced bookmaker keys ('bdl_draftkings', ...). Keeps them
+# out of SHARP_BOOKMAKERS and separates their CLV/bias attribution from the
+# same books' Odds API quotes.
+BDL_BOOK_PREFIX = "bdl_"
 
 # Standard -110 both ways -> decimal 1.909; devigs to 50/50. Used when a vendor
 # (or the whole feed) doesn't expose the side juice for totals / run lines.
@@ -188,3 +210,114 @@ async def get_game_quotes(bdl_game_id, client: MLBStatsClient = None) -> Optiona
         "home_is_ml_favorite": home_is_fav,
         "markets": markets,
     }
+
+
+def _load_player_names(player_ids) -> dict:
+    """Map BDL player_id -> canonical name from the local players table.
+
+    players.player_id IS the BDL id (sync_stats upserts player.get('id')),
+    so no crosswalk is needed. Unknown ids simply drop out of the shop —
+    a player we've never synced has no stats to project anyway.
+    """
+    if not player_ids:
+        return {}
+    from src.data.db import get_db_connection
+    ids = list(player_ids)
+    placeholders = ",".join("?" for _ in ids)
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            f"SELECT player_id, name FROM players WHERE player_id IN ({placeholders})",
+            tuple(ids),
+        ).fetchall()
+    return {r["player_id"]: r["name"] for r in rows if r["name"]}
+
+
+async def get_player_prop_odds(
+    bdl_game_id,
+    client: MLBStatsClient = None,
+    bust_cache: bool = False,
+    name_map: dict = None,
+) -> Optional[dict]:
+    """Live BDL player props for a game, in Odds API event-odds shape.
+
+    Returns {'bookmakers': [{'key': 'bdl_<vendor>', 'markets': [{'key':
+    <market>, 'outcomes': [{'name': 'Over'|'Under', 'point': line, 'price':
+    decimal, 'description': player_name}]}]}]} — directly mergeable into the
+    Odds API response consumed by scan_props._parse_odds_by_player.
+
+    Only over_under markets on the five modeled prop types are kept
+    (milestone markets have no line to price). Fail-safe: returns None on any
+    error or when nothing translates, so the scan proceeds on Odds API alone.
+
+    name_map: optional {bdl_player_id: name} override for tests; by default
+    names resolve from the local players table.
+    """
+    if not bdl_game_id:
+        return None
+    client = client or MLBStatsClient()
+    try:
+        records = await client.get_player_props(bdl_game_id, bust_cache=bust_cache)
+    except Exception as e:  # noqa: BLE001 — supplemental source must never raise
+        logger.debug("BDL player props fetch failed for game %s: %s", bdl_game_id, e)
+        return None
+    if not records:
+        return None
+
+    if name_map is None:
+        try:
+            name_map = _load_player_names({r.get("player_id") for r in records})
+        except Exception as e:  # noqa: BLE001
+            logger.debug("BDL player-name lookup failed: %s", e)
+            return None
+
+    # vendor -> market_key -> list of outcomes
+    by_vendor: dict = {}
+    for r in records:
+        market_key = PROP_TYPE_TO_MARKET.get(r.get("prop_type"))
+        if not market_key:
+            continue
+        market = r.get("market") or {}
+        if market.get("type") != "over_under":
+            continue  # milestone props have no over/under line
+        player_name = name_map.get(r.get("player_id"))
+        if not player_name:
+            continue
+        try:
+            line = float(r.get("line_value"))
+        except (TypeError, ValueError):
+            continue
+        vendor = r.get("vendor")
+        if not vendor:
+            continue
+
+        outcomes = []
+        for side, odds_key in (("Over", "over_odds"), ("Under", "under_odds")):
+            dec = american_to_decimal(market.get(odds_key))
+            if dec is not None and dec > 1.0:
+                outcomes.append({
+                    "name": side,
+                    "point": line,
+                    "price": dec,
+                    "description": player_name,
+                })
+        if outcomes:
+            by_vendor.setdefault(vendor, {}).setdefault(market_key, []).extend(outcomes)
+
+    if not by_vendor:
+        return None
+
+    bookmakers = [
+        {
+            "key": f"{BDL_BOOK_PREFIX}{vendor}",
+            "markets": [
+                {"key": mk, "outcomes": outs} for mk, outs in markets_map.items()
+            ],
+        }
+        for vendor, markets_map in by_vendor.items()
+    ]
+    n_quotes = sum(len(o) for mm in by_vendor.values() for o in mm.values())
+    logger.debug(
+        "BDL player props for game %s: %d quotes across %d book(s).",
+        bdl_game_id, n_quotes, len(bookmakers),
+    )
+    return {"bookmakers": bookmakers}

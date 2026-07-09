@@ -589,6 +589,46 @@ CREATE TABLE IF NOT EXISTS batter_platoon_splits (
     PRIMARY KEY (player_id, season, vs_hand, market)
 );
 
+-- Per-(player, pitch_type) season pitch-type stats from BDL. role='pitcher'
+-- stores what the pitcher throws (usage) and how it plays (whiff); role='hitter'
+-- stores how the batter fares against each pitch type (whiff/xwoba). Read by
+-- pitch_matchup.py to build arsenal-weighted matchup multipliers.
+CREATE TABLE IF NOT EXISTS pitch_type_stats (
+    player_id   INTEGER NOT NULL,
+    season      INTEGER NOT NULL,
+    role        TEXT    NOT NULL,  -- 'pitcher' | 'hitter'
+    pitch_type  TEXT    NOT NULL,  -- short code: FF, SL, CH, SI, ...
+    pitch_count INTEGER,
+    usage_pct   REAL,
+    whiff_pct   REAL,
+    contact_pct REAL,
+    xwoba       REAL,
+    pa_count    INTEGER,
+    strikeout_count INTEGER,
+    updated_at  TEXT,
+    PRIMARY KEY (player_id, season, role, pitch_type)
+);
+CREATE INDEX IF NOT EXISTS idx_pitch_type_stats_player
+    ON pitch_type_stats(player_id, season, role);
+
+-- Batter-vs-pitcher career head-to-head lines from BDL /players/versus.
+-- Populated by sync_bvp for today's matchups; read by bvp.py to build a
+-- heavily-shrunk, tightly-bounded matchup multiplier. Small samples are the
+-- norm (often <15 AB), hence the Bayesian shrinkage in the reader.
+CREATE TABLE IF NOT EXISTS bvp_stats (
+    batter_id    INTEGER NOT NULL,
+    pitcher_id   INTEGER NOT NULL,
+    ab           INTEGER,
+    pa           INTEGER,
+    hits         INTEGER,
+    total_bases  INTEGER,
+    home_runs    INTEGER,
+    strikeouts   INTEGER,
+    walks        INTEGER,
+    updated_at   TEXT,
+    PRIMARY KEY (batter_id, pitcher_id)
+);
+
 -- Empirically fitted portfolio correlation parameters.
 -- Written by fit_correlations.py after ≥100 pairs per type accumulate.
 -- Falls back to config constants when no is_active=1 row exists.

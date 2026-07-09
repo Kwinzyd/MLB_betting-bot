@@ -241,6 +241,25 @@ class ProjectionModel:
         """Apply (or skip) probability calibration per this model's config."""
         return _calibrate_result(result, enabled=self._apply_calibration)
 
+    def _rescale_projection(self, result: Dict | None, factor: float) -> Dict | None:
+        """Multiply a projection's mean by a matchup factor and recompute its
+        (uncalibrated) probabilities from the same distribution family. Called
+        BEFORE _finalize so calibration still runs on the adjusted probs.
+        No-op when factor is ~1.0 or the result is missing."""
+        if not result or factor is None or abs(factor - 1.0) < 1e-9:
+            return result
+        mean = max(0.0, result["projected_mean"] * factor)
+        prob_over, prob_under = get_probabilities(
+            mean, result["line"], result["market"],
+            alpha=result.get("alpha"), sigma=result.get("sigma"),
+            pi0=result.get("pi0"),
+        )
+        result["projected_mean"] = round(mean, 3)
+        result["prob_over"] = prob_over
+        result["prob_under"] = prob_under
+        result.setdefault("context", {})["pitch_matchup_factor"] = round(factor, 4)
+        return result
+
     def calibrate_over(self, prob_over: float, market: str) -> float:
         """Apply this model's active probability calibration to an OVER prob.
 
@@ -276,7 +295,8 @@ class ProjectionModel:
                                    weather: dict = None,
                                    ump_k_factor: float = 1.0,
                                    extra_features: dict = None,
-                                   player_id: int = None) -> Optional[Dict]:
+                                   player_id: int = None,
+                                   matchup_factor: float = 1.0) -> Optional[Dict]:
         """
         Project pitcher strikeouts for a game.
 
@@ -304,7 +324,7 @@ class ProjectionModel:
             dispersion=disp,
         )
         if glm_result is not None:
-            return self._finalize(glm_result)
+            return self._finalize(self._rescale_projection(glm_result, matchup_factor))
 
         # Sort by date descending
         logs = sorted(pitcher_logs, key=lambda x: x['date'], reverse=True)
@@ -341,7 +361,9 @@ class ProjectionModel:
 
         # Final projection — ump_k_factor multiplies the raw K projection directly.
         # A large-zone umpire (factor > 1) boosts Ks; a tight zone (factor < 1) suppresses.
-        projected_k = max(0.0, (blended_k_per_9 / 9.0) * proj_ip * opp_adj * park_adj * ump_k_factor)
+        # matchup_factor tilts for the pitcher's arsenal vs this lineup's per-pitch whiff.
+        projected_k = max(0.0, (blended_k_per_9 / 9.0) * proj_ip * opp_adj * park_adj
+                          * ump_k_factor * matchup_factor)
 
         prob_over, prob_under = get_probabilities(
             projected_k, line, "pitcher_strikeouts", alpha=disp.get("alpha"),
@@ -366,6 +388,7 @@ class ProjectionModel:
                 "opp_adj": round(opp_adj, 3),
                 "park_adj": round(park_adj, 3),
                 "ump_k_factor": round(ump_k_factor, 3),
+                "pitch_matchup_factor": round(matchup_factor, 4),
                 "proj_ip": round(proj_ip, 2),
                 "pitches_per_ip": ip_result['pitches_per_ip'],
                 "est_pitch_limit": ip_result['est_pitch_limit'],
@@ -485,7 +508,8 @@ class ProjectionModel:
                             player_id: int = None,
                             game_total: float = None,
                             bp_weight: float = 0.10,
-                            implied_team_total_override: float = None) -> Optional[Dict]:
+                            implied_team_total_override: float = None,
+                            matchup_factor: float = 1.0) -> Optional[Dict]:
         """
         Project a batter stat (hits, total_bases, home_runs).
 
@@ -522,7 +546,7 @@ class ProjectionModel:
             implied_team_total_override=implied_team_total_override,
         )
         if glm_result is not None:
-            return self._finalize(glm_result)
+            return self._finalize(self._rescale_projection(glm_result, matchup_factor))
 
         # --- Per-PA rates (not per-game) ---
         # Season per-PA rate
@@ -568,15 +592,17 @@ class ProjectionModel:
         opp_bullpen_era = extra_features.get('opp_bullpen_era', LEAGUE_AVG_RUNS_PER_GAME) if extra_features else LEAGUE_AVG_RUNS_PER_GAME
         bp_adj = (1.0 + ((opp_bullpen_era / LEAGUE_AVG_RUNS_PER_GAME) - 1.0) * bp_weight) if LEAGUE_AVG_RUNS_PER_GAME > 0 else 1.0
 
-        # Final projection: rate * opportunities * adjustments
-        projected = max(0.0, blended_per_pa * projected_pa * platoon_adj * park_adj * bp_adj)
+        # Final projection: rate * opportunities * adjustments.
+        # matchup_factor tilts for the batter's per-pitch xwoba vs the starter's arsenal.
+        projected = max(0.0, blended_per_pa * projected_pa * platoon_adj * park_adj
+                        * bp_adj * matchup_factor)
 
         market_key = self._stat_type_to_market(stat_type)
         pi0 = _compute_hr_pi0(market_key, logs, park_adj, extra_features, weather)
         if pa_dist is not None:
             prob_over, prob_under = get_probabilities_mixture(
                 blended_per_pa, line, market_key, pa_dist,
-                adjustments=platoon_adj * park_adj * bp_adj,
+                adjustments=platoon_adj * park_adj * bp_adj * matchup_factor,
                 alpha=disp.get("alpha"), sigma=disp.get("sigma"),
                 pi0=pi0,
             )
@@ -613,6 +639,7 @@ class ProjectionModel:
                 "platoon_adj": round(platoon_adj, 3),
                 "park_adj": round(park_adj, 3),
                 "bp_adj": round(bp_adj, 3),
+                "pitch_matchup_factor": round(matchup_factor, 4),
                 "hr_pi0": pi0,
                 "batter_hand": batter_hand,
                 "pitcher_hand": pitcher_hand,

@@ -9,11 +9,16 @@ from src.config import (
     PREGAME_RESCAN_MINUTES,
     SHARP_BOOKMAKERS, ALT_LINE_MAX_DISTANCE, MAX_BETS_PER_PLAYER,
     SHARP_MODEL_AGREEMENT_TOL, BOOKMAKER_BIAS_THRESHOLD, EDGE_MIN,
-    REQUIRE_CONFIRMED_LINEUP,
+    REQUIRE_CONFIRMED_LINEUP, MODEL_AS_TRUTH_MODE, MODEL_ONLY_KELLY_MULT,
+    MARKET_SIDE_BLACKLIST, ALT_LINE_MARKET_SHRINK,
+    PITCH_MATCHUP_ENABLED, MLB_SEASON, BVP_ENABLED,
+    SPORTSDATAIO_ENABLED, SPORTSDATAIO_ANCHOR_FALLBACK,
 )
+from src.models.pitch_matchup import batter_arsenal_factor_db, pitcher_k_factor_db
+from src.models.bvp import bvp_factor_db
 from src.models.distributions import get_probabilities
 from src.clients.odds_api import OddsAPIClient
-from src.clients.bdl_odds import get_game_market
+from src.clients.bdl_odds import get_game_market, get_player_prop_odds
 from src.clients.weather import WeatherClient
 from src.data.db import get_db_connection
 from src.data.park_factors import get_stadium_meta
@@ -86,6 +91,13 @@ async def scan_props(force: bool = False, game_ids: list = None):
     proj_model = ProjectionModel()
     bias_map = _load_bookmaker_bias()
 
+    # SportsDataIO consensus props (optional). One PlayerPropsByDate pull per day
+    # is cached on the instance, so reuse a single client across all games.
+    sdio_client = None
+    if SPORTSDATAIO_ENABLED:
+        from src.clients.sportsdataio import SportsDataIOClient
+        sdio_client = SportsDataIOClient()
+
     force = force or os.getenv("ODDS_SCAN_FORCE", "").lower() in ("1", "true", "yes")
     targeted = bool(game_ids)
     if targeted:
@@ -147,13 +159,54 @@ async def scan_props(force: bool = False, game_ids: list = None):
         # Umpire K factor — looked up once per game, applied to all pitcher props
         ump_k_factor = _get_ump_k_factor(game_id)
 
+        odds_event_id = dict(game).get('odds_api_event_id')
+        if not odds_event_id:
+            skip_reasons['no_odds_api_event_id'] += 1
+            logger.debug(f"Skipping {away_team} @ {home_team} ({game_id}): no Odds API event linked (run sync first).")
+            continue
+
         try:
-            event_odds = await odds_client.get_event_odds(game_id, api_markets, bust_cache=targeted)
+            event_odds = await odds_client.get_event_odds(
+                odds_event_id, api_markets, bust_cache=targeted
+            )
         except Exception as e:
             logger.error(f"Failed to fetch odds for {game_id}: {e}")
             continue
 
-        if not event_odds:
+        # Merge supplemental books into the Odds API payload before parsing:
+        #   - BDL live player props (free; six US soft books, keys 'bdl_*').
+        #   - SportsDataIO consensus props (key 'sportsdataio'), which can serve
+        #     as a fallback truth anchor when no sharp book quotes a prop.
+        # Neither is in SHARP_BOOKMAKERS, so the primary sharp anchor is unchanged.
+        extra_books = []
+        bdl_props = await get_player_prop_odds(
+            dict(game).get('bdl_game_id'), bust_cache=targeted
+        )
+        if bdl_props:
+            extra_books.extend(bdl_props['bookmakers'])
+
+        if sdio_client is not None:
+            try:
+                sdio_odds = await sdio_client.get_event_odds(
+                    game_id, markets, bust_cache=targeted,
+                    home_team_full=home_team, away_team_full=away_team,
+                )
+            except Exception as e:  # noqa: BLE001 — supplemental source must never raise
+                logger.debug("SportsDataIO odds fetch failed for %s: %s", game_id, e)
+                sdio_odds = None
+            if sdio_odds and sdio_odds.get('bookmakers'):
+                extra_books.extend(sdio_odds['bookmakers'])
+
+        if extra_books:
+            # Copy before merging — event_odds may be the odds client's cached
+            # object, and mutating it would re-append books every rescan inside
+            # the cache TTL.
+            event_odds = dict(event_odds or {})
+            event_odds['bookmakers'] = (
+                list(event_odds.get('bookmakers', [])) + extra_books
+            )
+
+        if not event_odds or not event_odds.get('bookmakers'):
             continue
 
         # 2. Parse odds and group by player+market(+line) for devigging
@@ -163,7 +216,8 @@ async def scan_props(force: bool = False, game_ids: list = None):
 
         # BDL game-level odds (free, unlimited): back up a missing Odds API
         # total and supply moneylines for moneyline-tilted implied team totals.
-        # BDL has no player props, so this only touches the game-total feature.
+        # (Player props come from get_player_prop_odds above; this is the
+        # separate game-total/moneyline feed.)
         bdl_market = await get_game_market(dict(game).get('bdl_game_id'))
         if game_total is None and bdl_market and bdl_market.get('total') is not None:
             game_total = bdl_market['total']
@@ -181,15 +235,41 @@ async def scan_props(force: bool = False, game_ids: list = None):
         #        against the best soft offer at that line.
         #    (d) Keep up to MAX_BETS_PER_PLAYER highest-EV winners per player.
         for (player_name, market_key), lines_for_market in player_market_groups.items():
-            anchor = _pick_anchor_line(lines_for_market, SHARP_BOOKMAKERS)
-            if anchor is None:
-                continue
-            anchor_line, sharp_over_odds, sharp_under_odds, sharp_book = anchor
-            sharp_prob_over_anchor, sharp_prob_under_anchor = devig_multiplicative(
-                sharp_over_odds, sharp_under_odds
-            )
-            if sharp_prob_over_anchor is None:
-                continue
+            if MODEL_AS_TRUTH_MODE:
+                if not lines_for_market:
+                    continue
+                anchor_line = list(lines_for_market.keys())[0]
+                book_data = lines_for_market[anchor_line]
+                if 'sportsdataio' in book_data:
+                    sharp_book = 'sportsdataio'
+                    sharp_over_odds = book_data['sportsdataio'].get('over')
+                    sharp_under_odds = book_data['sportsdataio'].get('under')
+                else:
+                    sharp_book = list(book_data.keys())[0]
+                    sharp_over_odds = book_data[sharp_book].get('over')
+                    sharp_under_odds = book_data[sharp_book].get('under')
+                sharp_prob_over_anchor = None
+                sharp_prob_under_anchor = None
+            else:
+                anchor = _pick_anchor_line(lines_for_market, SHARP_BOOKMAKERS)
+                consensus_anchor = False
+                if anchor is None and SPORTSDATAIO_ANCHOR_FALLBACK:
+                    # No sharp book quotes this prop — fall back to SDIO consensus
+                    # so it isn't skipped outright. Softer truth, tagged below.
+                    anchor = _pick_anchor_line(lines_for_market, ['sportsdataio'])
+                    consensus_anchor = anchor is not None
+                if anchor is None:
+                    continue
+                anchor_line, sharp_over_odds, sharp_under_odds, sharp_book = anchor
+                sharp_prob_over_anchor, sharp_prob_under_anchor = devig_multiplicative(
+                    sharp_over_odds, sharp_under_odds
+                )
+                if sharp_prob_over_anchor is None:
+                    continue
+                # Exclude the anchoring book from its own soft-line shop (a true
+                # sharp book is already in SHARP_BOOKMAKERS; SDIO as fallback is not).
+                soft_exclude = (SHARP_BOOKMAKERS if sharp_book in SHARP_BOOKMAKERS
+                                else SHARP_BOOKMAKERS + [sharp_book])
 
             projection = _build_projection(
                 proj_model, player_name, market_key, anchor_line,
@@ -204,11 +284,12 @@ async def scan_props(force: bool = False, game_ids: list = None):
             # Anchor-level agreement gate. If model and sharp disagree at the
             # consensus line, we don't trust the model anywhere — bail on this
             # (player, market) before evaluating any alt-lines.
-            disagreement = abs(projection['prob_over'] - sharp_prob_over_anchor)
-            if disagreement > SHARP_MODEL_AGREEMENT_TOL:
-                logger.debug("Skipped %s %s: model_prob=%.3f, sharp_prob=%.3f (diff=%.3f)", 
-                             player_name, market_key, projection['prob_over'], sharp_prob_over_anchor, disagreement)
-                continue
+            if not MODEL_AS_TRUTH_MODE:
+                disagreement = abs(projection['prob_over'] - sharp_prob_over_anchor)
+                if disagreement > SHARP_MODEL_AGREEMENT_TOL:
+                    logger.debug("Skipped %s %s: model_prob=%.3f, sharp_prob=%.3f (diff=%.3f)", 
+                                 player_name, market_key, projection['prob_over'], sharp_prob_over_anchor, disagreement)
+                    continue
 
             timestamp = utcnow().isoformat()
 
@@ -233,7 +314,10 @@ async def scan_props(force: bool = False, game_ids: list = None):
                     if abs(line - anchor_line) > ALT_LINE_MAX_DISTANCE:
                         continue
 
-                    soft_best = _pick_best_soft_line(line_data, SHARP_BOOKMAKERS)
+                    if MODEL_AS_TRUTH_MODE:
+                        soft_best = _pick_best_line(line_data)
+                    else:
+                        soft_best = _pick_best_soft_line(line_data, soft_exclude)
                     over_odds, over_book = soft_best['over']
                     under_odds, under_book = soft_best['under']
 
@@ -269,14 +353,19 @@ async def scan_props(force: bool = False, game_ids: list = None):
                     steam_under = _detect_steam_in_soft_books(conn, game_id, player_name, market_key, line, 'under', line_data, SHARP_BOOKMAKERS)
 
                     # Snapshot every book at this line — schema unchanged.
+                    # Also collect every two-sided devig for the alt-line
+                    # market-consensus shrink below.
+                    alt_line_devigs = []
                     for book, pair in line_data.items():
                         o_odds = pair.get('over')
                         u_odds = pair.get('under')
                         if not o_odds or not u_odds or o_odds <= 1.0 or u_odds <= 1.0:
                             continue
-                        dev_o, dev_u = None, None
-                        if book in SHARP_BOOKMAKERS:
-                            dev_o, dev_u = devig_multiplicative(o_odds, u_odds)
+                        dev_o, dev_u = devig_multiplicative(o_odds, u_odds)
+                        if dev_o is not None:
+                            alt_line_devigs.append(dev_o)
+                        if book not in SHARP_BOOKMAKERS:
+                            dev_o, dev_u = None, None
                         conn.execute('''
                             INSERT INTO prop_snapshots
                             (snapshot_id, game_id, player_name, market, line,
@@ -297,10 +386,14 @@ async def scan_props(force: bool = False, game_ids: list = None):
                     #                 Using the raw model prob as truth here would
                     #                 let the model grade itself and defeat the
                     #                 agreement gate — see _shift_anchor_truth.
-                    if line == anchor_line:
+                    if MODEL_AS_TRUTH_MODE:
+                        truth_over = prob_over_line
+                        truth_under = prob_under_line
+                        edge_source = 'model_only'
+                    elif line == anchor_line:
                         truth_over = sharp_prob_over_anchor
                         truth_under = sharp_prob_under_anchor
-                        edge_source = 'sharp_anchor'
+                        edge_source = 'consensus_anchor' if consensus_anchor else 'sharp_anchor'
                     else:
                         truth_over, truth_under = _shift_anchor_truth(
                             sharp_prob_over_anchor, sharp_prob_under_anchor,
@@ -308,11 +401,24 @@ async def scan_props(force: bool = False, game_ids: list = None):
                         )
                         if truth_over is None:
                             continue  # degenerate anchor prob — can't shift safely
-                        edge_source = 'model_altline'
+                        # Shrink toward the books' devigged consensus at THIS
+                        # line: the CDF shift borrows the model's tail shape,
+                        # which settled-bet calibration showed is overconfident
+                        # exactly at alt-line tails.
+                        if alt_line_devigs and ALT_LINE_MARKET_SHRINK > 0:
+                            consensus_over = sum(alt_line_devigs) / len(alt_line_devigs)
+                            w = min(1.0, max(0.0, ALT_LINE_MARKET_SHRINK))
+                            truth_over = w * consensus_over + (1.0 - w) * truth_over
+                            truth_under = 1.0 - truth_over
+                        edge_source = ('model_altline_consensus' if consensus_anchor
+                                       else 'model_altline')
                     for side, odds_val, side_book, sharp_prob, is_steam in [
                         ('over', over_odds, over_book, truth_over, steam_over),
                         ('under', under_odds, under_book, truth_under, steam_under),
                     ]:
+                        # Skip blacklisted market+side combos
+                        if (market_key, side) in MARKET_SIDE_BLACKLIST:
+                            continue
                         if not odds_val or odds_val <= 1.0:
                             continue
                         opening_prob = opening_row[f'devigged_{side}'] if opening_row else None
@@ -320,6 +426,9 @@ async def scan_props(force: bool = False, game_ids: list = None):
                             line_proj, odds_val, side, sharp_prob,
                             opening_prob=opening_prob, steam_detected=is_steam,
                         )
+                        if MODEL_AS_TRUTH_MODE and edge_result.get('kelly'):
+                            edge_result['kelly']['kelly_fraction'] = round(edge_result['kelly']['kelly_fraction'] * MODEL_ONLY_KELLY_MULT, 4)
+                            edge_result['kelly']['recommended_stake'] = round(edge_result['kelly']['recommended_stake'] * MODEL_ONLY_KELLY_MULT, 2)
                         # Bookmaker bias boost: if this book systematically
                         # underprices this (market, side) vs sharp, add a small
                         # edge credit and re-flag as playable if it crosses the bar.
@@ -446,6 +555,9 @@ async def scan_props(force: bool = False, game_ids: list = None):
                     (now_utc.isoformat(), game_id),
                 )
                 conn.commit()
+
+    if sdio_client is not None:
+        await sdio_client.close()
 
     skipped_total = sum(skip_reasons.values())
     if skip_reasons:
@@ -858,9 +970,26 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
             opp_team_stats = _get_team_stats_by_id(conn, opp_team_id)
             opp_k_rate = opp_team_stats.get('k_rate') or LEAGUE_AVG_K_RATE
 
+            # Arsenal matchup: this pitcher's pitch mix vs the opposing lineup's
+            # per-pitch whiff. Bounded multiplier, neutral 1.0 when data is thin.
+            matchup_factor = 1.0
+            if PITCH_MATCHUP_ENABLED:
+                opp_batter_ids = [
+                    r['player_id'] for r in conn.execute(
+                        "SELECT dl.player_id FROM daily_lineups dl "
+                        "JOIN players p ON p.player_id = dl.player_id "
+                        "WHERE dl.game_id = ? AND p.team_id = ?",
+                        (game_id, opp_team_id),
+                    ).fetchall() if r['player_id']
+                ]
+                matchup_factor = pitcher_k_factor_db(
+                    conn, player_id, opp_batter_ids, MLB_SEASON
+                )
+
             proj = proj_model.project_pitcher_strikeouts(
                 logs, opp_k_rate, venue, line, weather=weather, ump_k_factor=ump_k_factor,
                 extra_features=extra_features, player_id=player_id,
+                matchup_factor=matchup_factor,
             )
             if proj:
                 proj['injury_status'] = injury_status
@@ -949,6 +1078,35 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
                     side=batter_side,
                 )
 
+            # Matchup multipliers vs the opposing starter (resolved once).
+            # Both are bounded and neutral 1.0 when data is thin:
+            #   - arsenal: batter's per-pitch xwoba vs the starter's pitch mix.
+            #   - BvP: batter's shrunk career line vs this exact pitcher.
+            matchup_factor = 1.0
+            if PITCH_MATCHUP_ENABLED or BVP_ENABLED:
+                opp_pitcher = conn.execute(
+                    "SELECT pp.player_id FROM probable_pitchers pp "
+                    "JOIN players p ON p.player_id = pp.player_id "
+                    "WHERE pp.game_id = ? AND p.team_id = ? LIMIT 1",
+                    (game_id, opp_team_id),
+                ).fetchone()
+                opp_pitcher_id = opp_pitcher['player_id'] if opp_pitcher else None
+                if opp_pitcher_id:
+                    if PITCH_MATCHUP_ENABLED:
+                        matchup_factor *= batter_arsenal_factor_db(
+                            conn, player_id, opp_pitcher_id, MLB_SEASON
+                        )
+                    if BVP_ENABLED:
+                        total_stat = sum(l.get(stat_type, 0) or 0 for l in logs)
+                        total_pa = sum(
+                            (l.get('plate_appearances') or l.get('at_bats') or 0)
+                            for l in logs
+                        )
+                        baseline = (total_stat / total_pa) if total_pa > 0 else 0.0
+                        matchup_factor *= bvp_factor_db(
+                            conn, player_id, opp_pitcher_id, market_key, baseline
+                        )
+
             proj = proj_model.project_batter_stat(
                 logs, stat_type, pitcher_hand, bats, venue, line,
                 lineup_position=lineup_position,
@@ -957,6 +1115,7 @@ def _build_projection(proj_model: ProjectionModel, player_name: str,
                 player_id=player_id,
                 game_total=game_total,
                 implied_team_total_override=itt_override,
+                matchup_factor=matchup_factor,
             )
             if proj:
                 proj['injury_status'] = injury_status
